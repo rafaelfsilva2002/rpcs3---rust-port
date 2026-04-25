@@ -24,7 +24,7 @@
 /CMakeLists.txt
 /CMakePresets.json
 /BUILDING.md
-/README.md
+/README-rpcs3-upstream.md
 /.cargo/
 /.ci/
 /.clang-format
