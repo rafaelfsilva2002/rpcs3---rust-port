@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-hle-sys-ppu-thread-user"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Cell/Modules/sys_ppu_thread_.cpp — PS3 PPU thread user-mode HLE (TLS + atexit + once)."
+
+[lib]
+name = "rpcs3_hle_sys_ppu_thread_user"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+
+[lints]
+workspace = true

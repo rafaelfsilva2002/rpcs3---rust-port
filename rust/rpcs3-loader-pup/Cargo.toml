@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-loader-pup"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Loader/PUP.{h,cpp} — PS3 firmware PUP container parser with SHA-1 hash validation."
+
+[lib]
+name = "rpcs3_loader_pup"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-crypto = { path = "../rpcs3-crypto" }
+
+[lints]
+workspace = true

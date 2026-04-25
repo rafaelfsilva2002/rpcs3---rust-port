@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-loader-tar"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Loader/TAR.cpp — POSIX ustar archive parser used by RPCS3's PUP installer."
+
+[lib]
+name = "rpcs3_loader_tar"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

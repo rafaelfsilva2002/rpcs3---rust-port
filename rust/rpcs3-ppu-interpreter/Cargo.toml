@@ -1,0 +1,21 @@
+[package]
+name = "rpcs3-ppu-interpreter"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Cell/PPUInterpreter.cpp — instruction interpreter. Iteration 1: arithmetic/logic integer subset. Expands opcode-by-opcode."
+
+[lib]
+name = "rpcs3_ppu_interpreter"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-ppu-opcodes = { path = "../rpcs3-ppu-opcodes" }
+rpcs3-ppu-thread = { path = "../rpcs3-ppu-thread" }
+rpcs3-memory = { path = "../rpcs3-memory" }
+rpcs3-memory-backing = { path = "../rpcs3-memory-backing" }
+
+[lints]
+workspace = true

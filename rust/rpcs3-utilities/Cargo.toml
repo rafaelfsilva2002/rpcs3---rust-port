@@ -1,0 +1,21 @@
+[package]
+name = "rpcs3-utilities"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of RPCS3 Utilities/ leaf helpers (Phase 0)."
+
+[lib]
+name = "rpcs3_utilities"
+# staticlib: CMake/corrosion linka dentro do binário rpcs3.
+# rlib:     necessário para `cargo test` e para outras crates Rust consumirem.
+crate-type = ["staticlib", "rlib"]
+
+[dev-dependencies]
+# Property-based testing against the C++ oracle implementation.
+proptest = "1.5"
+
+[lints]
+workspace = true

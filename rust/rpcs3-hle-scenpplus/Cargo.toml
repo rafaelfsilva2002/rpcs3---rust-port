@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-hle-scenpplus"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Cell/Modules/sceNpPlus.cpp — PS3 PlayStation Plus / NP manager subscription check (1 entry)."
+
+[lib]
+name = "rpcs3_hle_scenpplus"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+
+[lints]
+workspace = true

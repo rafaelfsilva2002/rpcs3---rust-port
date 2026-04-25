@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-hle-cellfs-sdata"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of cellFsSdataOpen / cellFsSdataOpenByFd / cellFsSdataOpenWithVersion from rpcs3/Emu/Cell/Modules/cellFs.cpp — SDATA encrypted file wrapper HLE."
+
+[lib]
+name = "rpcs3_hle_cellfs_sdata"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+
+[lints]
+workspace = true

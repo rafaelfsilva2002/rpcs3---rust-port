@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-system-config-random"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/system_config.cpp — random system name + PSID generators."
+
+[lib]
+name = "rpcs3_system_config_random"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

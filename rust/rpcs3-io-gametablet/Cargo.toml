@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-io-gametablet"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Io/GameTablet.cpp — THQ uDraw Game Tablet USB descriptor + report layout."
+
+[lib]
+name = "rpcs3_io_gametablet"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

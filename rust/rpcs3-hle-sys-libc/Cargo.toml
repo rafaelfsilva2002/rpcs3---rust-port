@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-hle-sys-libc"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Cell/Modules/sys_libc{,_}.cpp — PS3 libc-style HLE primitives."
+
+[lib]
+name = "rpcs3_hle_sys_libc"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+
+[lints]
+workspace = true

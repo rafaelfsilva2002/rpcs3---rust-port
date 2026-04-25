@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-io-interception"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Io/interception.cpp — global input-interception state (pads/kb/mice intercepted, active M+KB device)."
+
+[lib]
+name = "rpcs3_io_interception"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

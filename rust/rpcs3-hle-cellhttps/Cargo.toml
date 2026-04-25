@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-hle-cellhttps"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of the HTTPS/TLS subset from rpcs3/Emu/Cell/Modules/cellHttp.h (cellSsl + cellHttps error codes + cert/context mgmt)."
+
+[lib]
+name = "rpcs3_hle_cellhttps"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+
+[lints]
+workspace = true

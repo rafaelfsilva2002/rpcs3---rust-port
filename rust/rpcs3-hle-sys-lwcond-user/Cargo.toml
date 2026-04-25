@@ -1,0 +1,19 @@
+[package]
+name = "rpcs3-hle-sys-lwcond-user"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Cell/Modules/sys_lwcond_.cpp — PS3 lightweight condition variable user-mode HLE."
+
+[lib]
+name = "rpcs3_hle_sys_lwcond_user"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+rpcs3-hle-sys-lwmutex-user = { path = "../rpcs3-hle-sys-lwmutex-user" }
+
+[lints]
+workspace = true

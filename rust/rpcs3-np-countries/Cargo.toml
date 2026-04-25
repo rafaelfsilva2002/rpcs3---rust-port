@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-np-countries"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/NP/rpcn_countries.cpp — 72-country PSN region table."
+
+[lib]
+name = "rpcs3_np_countries"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-rsx-vertex-data"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/RSX/rsx_vertex_data.cpp — push-buffer vertex helpers + vertex_base_type discriminants."
+
+[lib]
+name = "rpcs3_rsx_vertex_data"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

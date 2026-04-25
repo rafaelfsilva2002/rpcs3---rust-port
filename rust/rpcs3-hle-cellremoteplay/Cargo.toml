@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-hle-cellremoteplay"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Cell/Modules/cellRemotePlay.cpp — PS3 Remote Play / PSP companion HLE."
+
+[lib]
+name = "rpcs3_hle_cellremoteplay"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+
+[lints]
+workspace = true

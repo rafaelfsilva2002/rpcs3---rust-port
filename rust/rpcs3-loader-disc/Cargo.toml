@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-loader-disc"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Loader/disc.cpp — SYSTEM.CNF parser + disc_type detection (PS1/PS2/PS3)."
+
+[lib]
+name = "rpcs3_loader_disc"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

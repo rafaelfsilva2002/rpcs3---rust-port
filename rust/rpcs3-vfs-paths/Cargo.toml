@@ -1,0 +1,15 @@
+[package]
+name = "rpcs3-vfs-paths"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of PS3 VFS path canonicalization (lv2_fs_object::get_path_root_and_trail). Foundation for rpcs3-lv2-fs."
+
+[lib]
+name = "rpcs3_vfs_paths"
+crate-type = ["staticlib", "rlib"]
+
+[lints]
+workspace = true

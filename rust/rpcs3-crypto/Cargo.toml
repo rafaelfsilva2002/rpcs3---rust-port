@@ -1,0 +1,32 @@
+[package]
+name = "rpcs3-crypto"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of RPCS3 Crypto/ primitives (AES, SHA-1, HMAC). Behavior-equivalent to PolarSSL as embedded in rpcs3/Crypto/."
+
+[lib]
+name = "rpcs3_crypto"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# RustCrypto: pure-Rust, audited, cross-platform (no windows-sys dep).
+aes  = "0.8"
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+hmac = "0.12"
+ctr  = "0.9"
+cmac = "0.7"
+# Low-level traits for block cipher ECB. cbc/ecb higher-level crates
+# exist but we implement CBC by hand to preserve PolarSSL's IV-update
+# semantics (the C++ code relies on IV being updated in-place).
+cipher = "0.4"
+
+[dev-dependencies]
+hex = "0.4"
+
+[lints]
+workspace = true

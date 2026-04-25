@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-io-guncon3"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Io/GunCon3.cpp — GunCon 3 light-gun USB descriptor, report layout, and encryption encoder."
+
+[lib]
+name = "rpcs3_io_guncon3"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

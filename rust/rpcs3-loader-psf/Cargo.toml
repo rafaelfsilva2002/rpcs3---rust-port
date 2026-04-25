@@ -1,0 +1,20 @@
+[package]
+name = "rpcs3-loader-psf"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Loader/PSF.{h,cpp} — PARAM.SFO parser/emitter with byte-exact behavior parity."
+
+[lib]
+name = "rpcs3_loader_psf"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# No external deps: PSF parsing is byte-level little-endian with
+# tiny struct layouts — manual parsing is clearer than pulling in
+# binrw/nom for this scope.
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-lv2-process"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Cell/lv2/sys_process.cpp — process-level syscalls (getpid, getppid, exit, get_sdk_version, object counting)."
+
+[lib]
+name = "rpcs3_lv2_process"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+
+[lints]
+workspace = true

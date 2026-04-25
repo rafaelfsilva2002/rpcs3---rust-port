@@ -1,0 +1,29 @@
+[package]
+name = "rpcs3-emu-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Integration crate: wires PPU interpreter + lv2 syscalls + memory backing + ELF loader into an executable runner. Can boot a PPU ELF and run until process exit."
+
+[lib]
+name = "rpcs3_emu_core"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-emu-types        = { path = "../rpcs3-emu-types" }
+rpcs3-memory           = { path = "../rpcs3-memory" }
+rpcs3-memory-backing   = { path = "../rpcs3-memory-backing" }
+rpcs3-ppu-thread       = { path = "../rpcs3-ppu-thread" }
+rpcs3-ppu-interpreter  = { path = "../rpcs3-ppu-interpreter" }
+rpcs3-loader-elf-self  = { path = "../rpcs3-loader-elf-self" }
+rpcs3-lv2-process      = { path = "../rpcs3-lv2-process" }
+rpcs3-lv2-ppu-thread   = { path = "../rpcs3-lv2-ppu-thread" }
+rpcs3-spu-thread       = { path = "../rpcs3-spu-thread" }
+rpcs3-spu-interpreter  = { path = "../rpcs3-spu-interpreter" }
+rpcs3-lv2-spu-group    = { path = "../rpcs3-lv2-spu-group" }
+rpcs3-lv2-spu-image    = { path = "../rpcs3-lv2-spu-image" }
+
+[lints]
+workspace = true

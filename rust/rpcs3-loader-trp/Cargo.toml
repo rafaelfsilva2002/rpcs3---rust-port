@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-loader-trp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Loader/TRP.cpp — Trophy (TRP) archive header parser + entry manipulation."
+
+[lib]
+name = "rpcs3_loader_trp"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-lv2-spu-image"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of sys_spu_image — SPU ELF image loader + segment layout."
+
+[lib]
+name = "rpcs3_lv2_spu_image"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+
+[lints]
+workspace = true

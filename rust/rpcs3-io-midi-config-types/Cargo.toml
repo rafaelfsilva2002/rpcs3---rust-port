@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-io-midi-config-types"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Io/midi_config_types.cpp — MIDI device-type enum + triple-sharp separator parsing."
+
+[lib]
+name = "rpcs3_io_midi_config_types"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

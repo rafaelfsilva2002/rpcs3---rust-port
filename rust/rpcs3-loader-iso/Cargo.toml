@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-loader-iso"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Loader/ISO.cpp — ISO 9660 magic, sector math, IV derivation for PS3 3k3y/Redump ISOs."
+
+[lib]
+name = "rpcs3_loader_iso"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

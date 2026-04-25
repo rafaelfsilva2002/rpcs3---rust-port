@@ -1,0 +1,19 @@
+[package]
+name = "rpcs3-config"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of RPCS3 config parsers/emitters (games.yml first). Byte-exact round-trip with yaml-cpp output."
+
+[lib]
+name = "rpcs3_config"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Pure-Rust YAML parser. No windows-sys dep → works on GNU toolchain.
+yaml-rust2 = "0.10"
+
+[lints]
+workspace = true

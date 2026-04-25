@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-rsx-surface-store"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/RSX/Common/surface_store.cpp — MRT target enumeration + pitch alignment math."
+
+[lib]
+name = "rpcs3_rsx_surface_store"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

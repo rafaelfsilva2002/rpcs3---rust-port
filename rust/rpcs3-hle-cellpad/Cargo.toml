@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-hle-cellpad"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Cell/Modules/cellPad.cpp — controller input HLE layer."
+
+[lib]
+name = "rpcs3_hle_cellpad"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-loader-tropusr"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Loader/TROPUSR.cpp — TROPUSR.DAT layout (header/table/entry4/entry6) + unlock/lock queries."
+
+[lib]
+name = "rpcs3_loader_tropusr"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

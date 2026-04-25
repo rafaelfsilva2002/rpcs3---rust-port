@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-io-camera-config"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Io/camera_config.cpp — CameraSetting 6-field CSV serialization + map-key format."
+
+[lib]
+name = "rpcs3_io_camera_config"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

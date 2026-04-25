@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-rsx-vk-decompiler"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/RSX/VK/VKCommonDecompiler.cpp — Vulkan varying register table + texture name→index extractor."
+
+[lib]
+name = "rpcs3_rsx_vk_decompiler"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-ipc-config"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/IPC_config.cpp — IPC server config (port clamp 1025..=65535, default 28012)."
+
+[lib]
+name = "rpcs3_ipc_config"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-util-cheat-info"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Utilities/cheat_info.cpp — CheatType enum + @@@-separator serialization."
+
+[lib]
+name = "rpcs3_util_cheat_info"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

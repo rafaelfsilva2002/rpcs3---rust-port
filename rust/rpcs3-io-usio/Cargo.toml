@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-io-usio"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Io/usio.cpp — v406 USIO arcade I/O board emulator (Taiko / Tekken input packing, canned reader responses, SRAM layout)."
+
+[lib]
+name = "rpcs3_io_usio"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "rpcs3-hle-cellfs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Cell/Modules/cellFs.cpp — game-facing filesystem HLE wrapper."
+
+[lib]
+name = "rpcs3_hle_cellfs"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+rpcs3-lv2-fs = { path = "../rpcs3-lv2-fs" }
+
+[lints]
+workspace = true

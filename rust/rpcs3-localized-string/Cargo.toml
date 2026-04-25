@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-localized-string"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/localized_string.cpp + localized_string_id.h — 315 UI string IDs used by the overlay/emu layer."
+
+[lib]
+name = "rpcs3_localized_string"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

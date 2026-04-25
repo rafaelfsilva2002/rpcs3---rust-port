@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-audio-device-enumerator"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of audio_device_enumerator.h + Cubeb/FAudio enumerator post-processing (device filter, fallback names, sort-by-name)."
+
+[lib]
+name = "rpcs3_audio_device_enumerator"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

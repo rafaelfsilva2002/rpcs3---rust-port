@@ -1,0 +1,5 @@
+target/
+Cargo.lock
+
+# Keep generated headers out of git; regenerate with cbindgen.
+# (Phase 0 header is hand-written, so include/ stays committed.)

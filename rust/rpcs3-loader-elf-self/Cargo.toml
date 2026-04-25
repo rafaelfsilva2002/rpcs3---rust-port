@@ -1,0 +1,20 @@
+[package]
+name = "rpcs3-loader-elf-self"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Loader/ELF.h + rpcs3/Crypto/unself.h header parsing. Decryption lives in rpcs3-loader-self-decrypt (Wave 2c)."
+
+[lib]
+name = "rpcs3_loader_elf_self"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# goblin is the de-facto Rust crate for ELF parsing. We only use its
+# ELF64 parser; pe/mach are disabled to keep dep tree small.
+goblin = { version = "0.9", default-features = false, features = ["std", "elf64", "elf32", "endian_fd"] }
+
+[lints]
+workspace = true

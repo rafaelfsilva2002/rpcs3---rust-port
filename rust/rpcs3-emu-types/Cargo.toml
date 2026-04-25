@@ -1,0 +1,15 @@
+[package]
+name = "rpcs3-emu-types"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of RPCS3 observable ABI enums (game_boot_result, system_state, cpu_flag, Cell errno). Frozen ordinals matching rpcs3/Emu/System.h and rpcs3/Emu/CPU/CPUThread.h."
+
+[lib]
+name = "rpcs3_emu_types"
+crate-type = ["staticlib", "rlib"]
+
+[lints]
+workspace = true

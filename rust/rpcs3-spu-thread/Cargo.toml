@@ -1,0 +1,19 @@
+[package]
+name = "rpcs3-spu-thread"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Cell/SPUThread.h + MFC.h — SPU register file, Local Store, MFC commands."
+
+[lib]
+name = "rpcs3_spu_thread"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-cpu-thread = { path = "../rpcs3-cpu-thread" }
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+
+[lints]
+workspace = true

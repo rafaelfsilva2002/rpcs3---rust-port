@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-io-usb-vfs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Io/usb_vfs.cpp — USB mass-storage (SMI USB DISK) descriptor layout."
+
+[lib]
+name = "rpcs3_io_usb_vfs"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

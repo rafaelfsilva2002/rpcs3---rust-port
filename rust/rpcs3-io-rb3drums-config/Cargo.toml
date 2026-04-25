@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-io-rb3drums-config"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Io/rb3drums_config.cpp — Rock Band 3 drum-kit MIDI mapper defaults and bounds."
+
+[lib]
+name = "rpcs3_io_rb3drums_config"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

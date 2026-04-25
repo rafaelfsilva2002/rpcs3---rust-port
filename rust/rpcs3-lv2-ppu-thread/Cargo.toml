@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-lv2-ppu-thread"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Cell/lv2/sys_ppu_thread.cpp — PPU thread lifecycle syscalls (exit, yield, join, detach, priority)."
+
+[lib]
+name = "rpcs3_lv2_ppu_thread"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+
+[lints]
+workspace = true

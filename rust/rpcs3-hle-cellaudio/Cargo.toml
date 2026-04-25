@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-hle-cellaudio"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Cell/Modules/cellAudio.cpp — audio port HLE layer with 256-sample ring buffers."
+
+[lib]
+name = "rpcs3_hle_cellaudio"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-version"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/rpcs3_version.cpp — version parsing + branch detection helpers."
+
+[lib]
+name = "rpcs3_version"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-util-console"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/util/console.cpp — console stream flag bits + stderr output helpers."
+
+[lib]
+name = "rpcs3_util_console"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

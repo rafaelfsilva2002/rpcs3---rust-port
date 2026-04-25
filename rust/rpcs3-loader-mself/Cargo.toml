@@ -1,0 +1,15 @@
+[package]
+name = "rpcs3-loader-mself"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Loader/mself.hpp — MSELF (multi-SELF) container parser."
+
+[lib]
+name = "rpcs3_loader_mself"
+crate-type = ["staticlib", "rlib"]
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-perf-monitor"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/perf_monitor.cpp — log interval decisions + CPU/RAM message formatter."
+
+[lib]
+name = "rpcs3_perf_monitor"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-spu-mfc"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Cell/MFC.cpp — SPU MFC DMA command opcodes, feature masks, and format helpers."
+
+[lib]
+name = "rpcs3_spu_mfc"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

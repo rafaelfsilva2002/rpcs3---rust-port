@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-io-ghltar"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Io/GHLtar.cpp — Guitar Hero Live controller USB descriptors + input bit packing."
+
+[lib]
+name = "rpcs3_io_ghltar"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

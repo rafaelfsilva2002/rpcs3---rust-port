@@ -1,0 +1,19 @@
+[package]
+name = "rpcs3-ppu-thread"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Cell/PPUThread.h — PPU register file + auxiliary state. No execution loop here; that's rpcs3-ppu-interpreter."
+
+[lib]
+name = "rpcs3_ppu_thread"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-cpu-thread = { path = "../rpcs3-cpu-thread" }
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+
+[lints]
+workspace = true

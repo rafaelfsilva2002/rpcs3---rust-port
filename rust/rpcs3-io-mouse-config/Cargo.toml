@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-io-mouse-config"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Io/mouse_config.cpp — 8-button mouse binding config."
+
+[lib]
+name = "rpcs3_io_mouse_config"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

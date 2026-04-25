@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-audio-backend"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Audio/AudioBackend.cpp — DSP helpers (volume ramp, f32→s16, soft-clip, channel layouts)."
+
+[lib]
+name = "rpcs3_audio_backend"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-audio-resampler = { path = "../rpcs3-audio-resampler" }
+
+[lints]
+workspace = true

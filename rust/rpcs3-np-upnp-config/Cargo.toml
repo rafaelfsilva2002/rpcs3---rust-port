@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-np-upnp-config"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/NP/upnp_config.cpp — persisted DeviceUrl for UPnP port mapping."
+
+[lib]
+name = "rpcs3_np_upnp_config"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "rpcs3-loader-pkg"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Crypto/unpkg.{h,cpp} — PKG header parsing and file-entry enumeration. Decryption/extraction lives in a future wave."
+
+[lib]
+name = "rpcs3_loader_pkg"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# No crypto here yet — we only parse the plaintext header portion.
+# When extraction lands, we depend on rpcs3-crypto for AES-CTR.
+
+[lints]
+workspace = true

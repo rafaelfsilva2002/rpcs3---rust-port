@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-lv2-raw-spu"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of sys_raw_spu_* syscalls — standalone SPU threads (up to 5 per process) used by games that bypass SPURS."
+
+[lib]
+name = "rpcs3_lv2_raw_spu"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+
+[lints]
+workspace = true

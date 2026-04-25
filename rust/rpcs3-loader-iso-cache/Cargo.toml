@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-loader-iso-cache"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Loader/iso_cache.cpp — FNV-64 cache stem derivation + mtime freshness check for ISO metadata."
+
+[lib]
+name = "rpcs3_loader_iso_cache"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

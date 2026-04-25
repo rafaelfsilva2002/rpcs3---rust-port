@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-lv2-event-flag"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Cell/lv2/sys_event_flag.cpp — 64-bit bitmask event flags with AND/OR wait modes."
+
+[lib]
+name = "rpcs3_lv2_event_flag"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-io-infinity"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Io/Infinity.cpp — Disney Infinity Base with SHA1+AES key derivation, scramble/descramble, custom Jenkins RNG."
+
+[lib]
+name = "rpcs3_io_infinity"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

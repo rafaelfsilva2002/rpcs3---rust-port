@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-io-pad-config-types"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Io/pad_config_types.cpp — pad_handler enum, mouse_movement_mode, PadInfo struct."
+
+[lib]
+name = "rpcs3_io_pad_config_types"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

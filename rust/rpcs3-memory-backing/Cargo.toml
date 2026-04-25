@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-memory-backing"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Memory/vm.cpp — Wave 4b: page table, backing storage (sparse), read/write, check_addr, reservation. JIT/linear backing lives in Wave 4c."
+
+[lib]
+name = "rpcs3_memory_backing"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-memory = { path = "../rpcs3-memory" }
+
+[lints]
+workspace = true

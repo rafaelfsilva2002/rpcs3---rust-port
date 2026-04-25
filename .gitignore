@@ -1,0 +1,157 @@
+# =============================================================================
+# Rust port — strategy B: track only our Rust port + behavior-freeze docs.
+# RPCS3 upstream source ignored (kept locally as reference snapshot).
+# =============================================================================
+/rpcs3/
+/3rdparty/
+/Utilities/
+/bin/
+/buildfiles/
+/darwin/
+/build-rust-smoke/
+/build-rust-debug/
+
+# Rust build artifacts
+**/target/
+**/Cargo.lock.bak
+
+# Misc upstream files we don't author
+/git-clang-format
+/objdump.cpp
+/pre-commit.readme
+/rpcs3.sln
+/usertype.dat
+/CMakeLists.txt
+/CMakePresets.json
+/BUILDING.md
+/README.md
+/.cargo/
+/.ci/
+/.clang-format
+/.clangd
+/.editorconfig
+/.gdbinit
+/.github/
+/.gitmodules
+
+# Local tooling state (not part of repo)
+/.claude/
+/.serena/
+
+# =============================================================================
+# Original upstream .gitignore patterns below
+# =============================================================================
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+
+# Compiled Dynamic libraries
+*.so
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.opensdf
+*.sdf
+*.suo
+*.tlog
+*.idb
+*.pdb
+*.obj
+*.ilk
+*.pch
+
+*.log
+*.exe
+*.dll
+*.elf
+*.lastbuildstate
+*.unsuccessfulbuild
+*.res
+*.dump
+*.wav
+
+/build
+/build-*
+/lib
+/tmp
+/ipch
+/packages
+/rpcs3/Debug
+/rpcs3/Release
+
+# /bin/ is fully ignored in our Rust-port repo (upstream-only artifacts).
+
+# Visual Studio Files
+.vs/*
+.vscode/*
+*.ipch
+*.vspx
+*.psess
+*.VC.*
+*.vcxproj.user
+enc_temp_folder/*
+CMakeSettings.json
+*PVS-Studio*
+PVS/*
+
+# Zed Editor files
+.zed/*
+
+# Ignore other system generated files
+x64/*
+rpcs3/x64/*
+rpcs3/git-version.h
+
+# cmake
+Makefile
+*CMakeFiles*
+CMakeCache.txt
+*cmake_install.cmake*
+CPackConfig.cmake
+CPackSourceConfig.cmake
+compile_commands.json
+
+# cotire
+rpcs3/cotire/*
+rpcs3/rpcs3_*_cotire.cmake
+rpcs3/Emu/rpcs3_emu_CXX_Release_cotire.cmake
+rpcs3/Emu/rpcs3_emu_CXX_cotire.cmake
+
+# kdevelop
+*.kdev4
+.kdev4/*
+
+# Qt
+moc_*.cpp
+qrc_*.cpp
+rpcs3_automoc.cpp
+ui_*.h
+rpcs3/rpcs3_autogen/*
+
+# QtCreator
+CMakeLists.txt.user
+*.autosave
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# CLion
+/.idea/*
+/cmake-build-*/
+
+# macOS
+.DS_Store
+
+# yaml-cpp
+yaml-cpp.pc
+
+_ReSharper.*/
+CMakeUserPresets.json
+
+.cache/
+.lldbinit

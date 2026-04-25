@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-hle-cellsheap"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Cell/Modules/cellSheap.cpp — PS3 shared heap + key-addressed sync primitives HLE."
+
+[lib]
+name = "rpcs3_hle_cellsheap"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+
+[lints]
+workspace = true

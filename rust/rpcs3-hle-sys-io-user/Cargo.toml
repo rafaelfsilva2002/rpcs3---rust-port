@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-hle-sys-io-user"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Cell/Modules/sys_io_.cpp — PS3 I/O subsystem user-mode HLE (sys_config_* + libio_sys_config)."
+
+[lib]
+name = "rpcs3_hle_sys_io_user"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+
+[lints]
+workspace = true

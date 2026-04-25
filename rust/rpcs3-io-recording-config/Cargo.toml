@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-io-recording-config"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Io/recording_config.cpp — video/audio recording config defaults and bounds."
+
+[lib]
+name = "rpcs3_io_recording_config"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

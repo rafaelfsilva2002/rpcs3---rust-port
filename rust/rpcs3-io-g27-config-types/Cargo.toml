@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-io-g27-config-types"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Io/LogitechG27Config.{h,cpp} — SDL mapping types + emulated G27 device-type-id packing."
+
+[lib]
+name = "rpcs3_io_g27_config_types"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

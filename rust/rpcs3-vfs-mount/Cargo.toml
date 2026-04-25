@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-vfs-mount"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/vfs_config.h — mount table (/dev_hdd0, /dev_bdvd, /app_home, dev_usb*) and path resolution."
+
+[lib]
+name = "rpcs3_vfs_mount"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-vfs-paths = { path = "../rpcs3-vfs-paths" }
+
+[lints]
+workspace = true

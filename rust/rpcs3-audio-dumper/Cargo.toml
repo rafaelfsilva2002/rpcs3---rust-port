@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-audio-dumper"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Audio/AudioDumper.cpp — WAV file header layout + sample bookkeeping for audio dumps."
+
+[lib]
+name = "rpcs3_audio_dumper"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-audio-resampler = { path = "../rpcs3-audio-resampler" }
+
+[lints]
+workspace = true

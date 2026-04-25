@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-hle-cellcamera"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Cell/Modules/cellCamera.cpp — PlayStation Eye / EyeToy camera HLE."
+
+[lib]
+name = "rpcs3_hle_cellcamera"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "rpcs3-ppu-opcodes"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Cell/PPUOpcodes.h — PowerPC 64 instruction format decoder (bitfields, ppu_decode, ppu_rotate_mask)."
+
+[lib]
+name = "rpcs3_ppu_opcodes"
+crate-type = ["staticlib", "rlib"]
+
+[lints]
+workspace = true

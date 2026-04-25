@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-rsx-gl-decompiler"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/RSX/GL/GLCommonDecompiler.cpp — RSX varying register name-to-location table."
+
+[lib]
+name = "rpcs3_rsx_gl_decompiler"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

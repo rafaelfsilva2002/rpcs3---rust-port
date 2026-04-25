@@ -1,0 +1,15 @@
+[package]
+name = "rpcs3-lv2-syscall-table"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Frozen PS3 LV2 syscall table — 1024 slots mirrored from rpcs3/Emu/Cell/lv2/lv2.cpp:141-965. This is an ABI contract: any reordering breaks every game."
+
+[lib]
+name = "rpcs3_lv2_syscall_table"
+crate-type = ["staticlib", "rlib"]
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-hle-cellphotodecode"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Cell/Modules/cellPhotoDecode.cpp — PS3 photo decoder HLE stubs."
+
+[lib]
+name = "rpcs3_hle_cellphotodecode"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+
+[lints]
+workspace = true

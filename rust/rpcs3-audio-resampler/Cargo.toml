@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-audio-resampler"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Audio/audio_resampler.cpp — SoundTouch wrapper parameters + AudioFreq/Channel/SampleSize enums."
+
+[lib]
+name = "rpcs3_audio_resampler"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

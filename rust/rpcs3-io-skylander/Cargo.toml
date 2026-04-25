@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-io-skylander"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Io/Skylander.cpp — Skylanders PortalMaster with 8 slots, status packing, Q/W/A/C/M/R command protocol."
+
+[lib]
+name = "rpcs3_io_skylander"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

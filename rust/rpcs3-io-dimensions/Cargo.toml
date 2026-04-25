@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-io-dimensions"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/Io/Dimensions.cpp — LEGO Dimensions toypad with TEA cipher, RNG, figure-key derivation."
+
+[lib]
+name = "rpcs3_io_dimensions"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true
