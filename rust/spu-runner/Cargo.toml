@@ -1,0 +1,21 @@
+[package]
+name = "spu-runner"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Standalone runner: load a SPU ELF, execute it on rpcs3-spu-interpreter, dump final state. Used by behavior-freeze/harness/spu_homebrew_runner.py for differential testing against RPCS3 C++."
+
+[[bin]]
+name = "spu-runner"
+path = "src/main.rs"
+
+[dependencies]
+rpcs3-loader-elf-self = { path = "../rpcs3-loader-elf-self" }
+rpcs3-spu-thread = { path = "../rpcs3-spu-thread" }
+rpcs3-spu-differential = { path = "../rpcs3-spu-differential" }
+rpcs3-spu-recompiler = { path = "../rpcs3-spu-recompiler" }
+
+[lints]
+workspace = true

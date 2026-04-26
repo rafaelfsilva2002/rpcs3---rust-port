@@ -1,6 +1,6 @@
 # Rust workspace — Phase 0 scaffolding
 
-Esta pasta é o ponto de entrada do porte gradual do RPCS3 para Rust, conforme descrito em [../behavior-freeze/docs/PORT_PLAN.md](../behavior-freeze/docs/PORT_PLAN.md).
+Esta pasta é o ponto de entrada do porte gradual do RPCS3 para Rust. Para o status autoritativo atual (testes verificados, fases R4a/R4b/R4c done, próxima fase recomendada), ver [../docs/PROJECT_STATUS.md](../docs/PROJECT_STATUS.md). O port plan original (decision matrix 8D) está preservado em [../historico/pre-r4b-2026-04-25/PORT_PLAN.md](../historico/pre-r4b-2026-04-25/PORT_PLAN.md).
 
 **Regra:** cada commit mantém o binário `rpcs3` funcional. Esta pasta é compilada **apenas** quando `-DUSE_RUST_CRATES=ON` é passado ao CMake. Sem esse flag, o build é idêntico ao anterior.
 
@@ -398,7 +398,7 @@ Próximas crates candidatas:
 - `rpcs3-ppu-opcodes` (tabela de decode de opcodes PPU — grande mas alto valor)
 - **Onda 4 (core)**: `rpcs3-cpu-thread` — `cpu_thread` base + `cpu_flag` bitset operations
 
-Ver `../behavior-freeze/docs/PORT_PLAN.md` para sequência completa.
+Ver `../historico/pre-r4b-2026-04-25/PORT_PLAN.md` para a sequência original de ondas (frozen baseline 2026-04-24); para o status atual, ver `../docs/PROJECT_STATUS.md`.
 
 ### Rodar só uma crate
 

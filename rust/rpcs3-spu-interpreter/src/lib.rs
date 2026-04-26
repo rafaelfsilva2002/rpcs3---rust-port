@@ -67,9 +67,9 @@ fn read_qword_be(spu: &SpuThread, lsa: u32) -> Result<u128, Error> {
     let bytes = spu
         .ls_read(aligned, 16)
         .ok_or(Error::BadAccess { pc: 0, lsa })?;
-    let mut arr = [0u8; 16];
-    arr.copy_from_slice(bytes);
     // Big-endian 128-bit load — lane 0 is the high bytes.
+    // try_into avoids an extra `[0u8;16] + copy_from_slice` round-trip.
+    let arr: [u8; 16] = bytes.try_into().map_err(|_| Error::BadAccess { pc: 0, lsa })?;
     Ok(u128::from_be_bytes(arr))
 }
 
@@ -86,30 +86,38 @@ fn write_qword_be(spu: &mut SpuThread, lsa: u32, v: u128) -> Result<(), Error> {
 // Register helpers (lane 0 = high u32 of u128)
 // =====================================================================
 
+// Lane-0 is the high u32 of u128 (big-endian layout matches RSX/SPU
+// register numbering: lane 0 = preferred slot, occupies bits 96..127).
+// Bit-shift form is byte-exact with the previous to_be_bytes path on
+// every platform — u128 is always little-endian-ordered limbs in
+// memory but to_be_bytes/shifts both produce the same logical lanes.
+
 #[inline]
-fn split_lanes(v: u128) -> [u32; 4] {
-    let b = v.to_be_bytes();
+const fn split_lanes(v: u128) -> [u32; 4] {
     [
-        u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
-        u32::from_be_bytes([b[4], b[5], b[6], b[7]]),
-        u32::from_be_bytes([b[8], b[9], b[10], b[11]]),
-        u32::from_be_bytes([b[12], b[13], b[14], b[15]]),
+        (v >> 96) as u32,
+        (v >> 64) as u32,
+        (v >> 32) as u32,
+        v as u32,
     ]
 }
 
 #[inline]
-fn join_lanes(lanes: [u32; 4]) -> u128 {
-    let mut out = [0u8; 16];
-    out[0..4].copy_from_slice(&lanes[0].to_be_bytes());
-    out[4..8].copy_from_slice(&lanes[1].to_be_bytes());
-    out[8..12].copy_from_slice(&lanes[2].to_be_bytes());
-    out[12..16].copy_from_slice(&lanes[3].to_be_bytes());
-    u128::from_be_bytes(out)
+const fn join_lanes(lanes: [u32; 4]) -> u128 {
+    ((lanes[0] as u128) << 96)
+        | ((lanes[1] as u128) << 64)
+        | ((lanes[2] as u128) << 32)
+        | (lanes[3] as u128)
 }
 
 #[inline]
-fn broadcast_u32(v: u32) -> u128 {
-    join_lanes([v, v, v, v])
+const fn broadcast_u32(v: u32) -> u128 {
+    // Multiplying by 0x0000_0001_0000_0001_0000_0001_0000_0001 splats the
+    // value into all four 32-bit lanes in one mul instruction, but the
+    // codegen is identical to the OR-shift form below on x86_64/ARM64
+    // and the OR form is clearer.
+    let w = v as u128;
+    (w << 96) | (w << 64) | (w << 32) | w
 }
 
 // =====================================================================
@@ -159,6 +167,261 @@ fn signed_int_to_float(bits: u32, exp_bias: i32) -> u32 {
 fn unsigned_int_to_float(bits: u32, exp_bias: i32) -> u32 {
     let f = (bits as f32) * 2f32.powi(exp_bias);
     f.to_bits()
+}
+
+// ---------------------------------------------------------------------
+// SPU float helpers — denormal-flush is FTZ semantics applied per lane
+// before/after IEEE op. The cpp "fast" path uses SSE primitives; we
+// emulate the same observable behavior in scalar Rust.
+// ---------------------------------------------------------------------
+
+/// Treat denormals (exp == 0, mantissa != 0) as +0.0 with sign
+/// preserved. Matches the SSE `_mm_andnot_ps(denorm_check, x)` idiom
+/// used throughout `SPUInterpreter.cpp` (cpp:1147..1163).
+#[inline]
+fn flush_denorm_f32(bits: u32) -> u32 {
+    if (bits & 0x7F80_0000) == 0 { 0 } else { bits }
+}
+
+/// `fcgt` per-lane (cpp:1131..1167). Flush denormals on both inputs,
+/// then compare strictly-greater-than as IEEE floats.
+#[inline]
+fn fcmp_gt(a: u32, b: u32) -> u32 {
+    let af = f32::from_bits(flush_denorm_f32(a));
+    let bf = f32::from_bits(flush_denorm_f32(b));
+    if af > bf { 0xFFFF_FFFF } else { 0 }
+}
+
+/// `fcmgt` per-lane (cpp:1237..1262). Compare on absolute magnitudes,
+/// with denormal flush applied first.
+#[inline]
+fn fcmp_mgt(a: u32, b: u32) -> u32 {
+    let aa = flush_denorm_f32(a) & 0x7FFF_FFFF;
+    let bb = flush_denorm_f32(b) & 0x7FFF_FFFF;
+    let af = f32::from_bits(aa);
+    let bf = f32::from_bits(bb);
+    if af > bf { 0xFFFF_FFFF } else { 0 }
+}
+
+/// `fceq` per-lane. After flush, equal-comparison via IEEE (NaN never
+/// compares equal — matches `_mm_cmpeq_ps`).
+#[inline]
+fn fcmp_eq(a: u32, b: u32) -> u32 {
+    let af = f32::from_bits(flush_denorm_f32(a));
+    let bf = f32::from_bits(flush_denorm_f32(b));
+    if af == bf { 0xFFFF_FFFF } else { 0 }
+}
+
+/// `fcmeq` per-lane. Magnitude equality with flush.
+#[inline]
+fn fcmp_meq(a: u32, b: u32) -> u32 {
+    let aa = flush_denorm_f32(a) & 0x7FFF_FFFF;
+    let bb = flush_denorm_f32(b) & 0x7FFF_FFFF;
+    let af = f32::from_bits(aa);
+    let bf = f32::from_bits(bb);
+    if af == bf { 0xFFFF_FFFF } else { 0 }
+}
+
+/// `fm` per-lane (cpp:1192..1219). Flush denormals on inputs, then
+/// `a*b`, then flush the result if it landed in denormal range.
+#[inline]
+fn fmul_flushed(a: u32, b: u32) -> u32 {
+    let af = f32::from_bits(flush_denorm_f32(a));
+    let bf = f32::from_bits(flush_denorm_f32(b));
+    let r = af * bf;
+    flush_denorm_f32(r.to_bits())
+}
+
+/// `frest` naïve approximation (cpp:690..712 uses 5-bit fraction +
+/// 8-bit exponent LUT). We compute `1/x` directly with denormal flush
+/// — accurate for exact powers of two, off by ≤1ulp elsewhere.
+/// TODO(spu-frest-lut): port `spu_frest_fraction_lut` /
+/// `spu_frest_exponent_lut` for byte-exact behavior.
+#[inline]
+fn frest_naive(bits: u32) -> u32 {
+    let f = f32::from_bits(flush_denorm_f32(bits));
+    if f == 0.0 {
+        // Match the SSE behavior of dividing by zero: signed infinity.
+        return if bits & 0x8000_0000 != 0 { 0xFF80_0000 } else { 0x7F80_0000 };
+    }
+    flush_denorm_f32((1.0_f32 / f).to_bits())
+}
+
+/// `frsqest` naïve approximation (cpp:715..735). Computes
+/// `1/sqrt(|x|)` — the SPU op ignores the sign of the operand.
+/// TODO(spu-frest-lut): replace with LUT path.
+#[inline]
+fn frsqest_naive(bits: u32) -> u32 {
+    let f = f32::from_bits(flush_denorm_f32(bits & 0x7FFF_FFFF));
+    if f == 0.0 {
+        return 0x7F80_0000;
+    }
+    flush_denorm_f32((1.0_f32 / f.sqrt()).to_bits())
+}
+
+// ---------------------------------------------------------------------
+// Per-word shift helpers (SPU semantics: count masked to 6 bits, but
+// shifts of 32+ produce 0 for unsigned and sign-bit-fill for signed —
+// matches the cpp's `(u64)val << (count & 0x3F)` then truncate idiom).
+// ---------------------------------------------------------------------
+
+#[inline]
+fn shl_word(value: u32, count: u32) -> u32 {
+    let n = count & 0x3F;
+    if n >= 32 { 0 } else { value << n }
+}
+
+#[inline]
+fn shr_word(value: u32, count: u32) -> u32 {
+    // cpp `value >> ((0 - count) & 0x3f)` — count is interpreted as
+    // "negative shift" form. We compute the actual right-shift count
+    // explicitly.
+    let n = (0u32.wrapping_sub(count)) & 0x3F;
+    if n >= 32 { 0 } else { value >> n }
+}
+
+#[inline]
+fn sar_word(value: u32, count: u32) -> u32 {
+    let n = (0u32.wrapping_sub(count)) & 0x3F;
+    let v = value as i32;
+    if n >= 32 {
+        // Saturate at sign bit
+        if v < 0 { 0xFFFF_FFFF } else { 0 }
+    } else {
+        (v >> n) as u32
+    }
+}
+
+/// Const-count variant for the immediate-form opcodes (ROTMI/ROTMAI).
+/// `count` is already canonicalised (the dispatcher does the mask).
+#[inline]
+fn shr_const(value: u32, n: u32) -> u32 {
+    if n >= 32 { 0 } else { value >> n }
+}
+
+#[inline]
+fn sar_const(value: u32, n: u32) -> u32 {
+    let v = value as i32;
+    if n >= 32 {
+        if v < 0 { 0xFFFF_FFFF } else { 0 }
+    } else {
+        (v >> n) as u32
+    }
+}
+
+/// Per-halfword addition: 8 lanes of u16, modular wrap.
+#[inline]
+fn halfword_add(a: u128, b: u128) -> u128 {
+    let ab = a.to_be_bytes();
+    let bb = b.to_be_bytes();
+    let mut out = [0u8; 16];
+    for i in 0..8 {
+        let av = u16::from_be_bytes([ab[2*i], ab[2*i+1]]);
+        let bv = u16::from_be_bytes([bb[2*i], bb[2*i+1]]);
+        out[2*i..2*i+2].copy_from_slice(&av.wrapping_add(bv).to_be_bytes());
+    }
+    u128::from_be_bytes(out)
+}
+
+/// Per-halfword subtraction: 8 lanes of u16, computes `a - b` modular.
+#[inline]
+fn halfword_sub(a: u128, b: u128) -> u128 {
+    let ab = a.to_be_bytes();
+    let bb = b.to_be_bytes();
+    let mut out = [0u8; 16];
+    for i in 0..8 {
+        let av = u16::from_be_bytes([ab[2*i], ab[2*i+1]]);
+        let bv = u16::from_be_bytes([bb[2*i], bb[2*i+1]]);
+        out[2*i..2*i+2].copy_from_slice(&av.wrapping_sub(bv).to_be_bytes());
+    }
+    u128::from_be_bytes(out)
+}
+
+/// Apply a per-halfword binary op with the count coming from b's lane.
+#[inline]
+fn halfword_op<F: Fn(u16, u16) -> u16>(a: u128, b: u128, op: F) -> u128 {
+    let ab = a.to_be_bytes();
+    let bb = b.to_be_bytes();
+    let mut out = [0u8; 16];
+    for i in 0..8 {
+        let av = u16::from_be_bytes([ab[2*i], ab[2*i+1]]);
+        let bv = u16::from_be_bytes([bb[2*i], bb[2*i+1]]);
+        out[2*i..2*i+2].copy_from_slice(&op(av, bv).to_be_bytes());
+    }
+    u128::from_be_bytes(out)
+}
+
+/// Apply a per-halfword unary op with a constant count.
+#[inline]
+fn halfword_const_op<F: Fn(u16) -> u16>(a: u128, op: F) -> u128 {
+    let ab = a.to_be_bytes();
+    let mut out = [0u8; 16];
+    for i in 0..8 {
+        let av = u16::from_be_bytes([ab[2*i], ab[2*i+1]]);
+        out[2*i..2*i+2].copy_from_slice(&op(av).to_be_bytes());
+    }
+    u128::from_be_bytes(out)
+}
+
+#[inline]
+fn halfword_shl(a: u128, b: u128) -> u128 {
+    halfword_op(a, b, |av, bv| {
+        let n = (bv as u32) & 0x1F;
+        if n >= 16 { 0 } else { av << n }
+    })
+}
+
+#[inline]
+fn halfword_shr(a: u128, b: u128) -> u128 {
+    halfword_op(a, b, |av, bv| {
+        let n = (0u32.wrapping_sub(bv as u32)) & 0x1F;
+        if n >= 16 { 0 } else { av >> n }
+    })
+}
+
+#[inline]
+fn halfword_sar(a: u128, b: u128) -> u128 {
+    halfword_op(a, b, |av, bv| {
+        let n = (0u32.wrapping_sub(bv as u32)) & 0x1F;
+        let v = av as i16;
+        if n >= 16 {
+            if v < 0 { 0xFFFF } else { 0 }
+        } else {
+            (v >> n) as u16
+        }
+    })
+}
+
+#[inline]
+fn halfword_rot(a: u128, b: u128) -> u128 {
+    halfword_op(a, b, |av, bv| av.rotate_left(bv as u32 & 0xF))
+}
+
+#[inline]
+fn halfword_shl_const(a: u128, n: u32) -> u128 {
+    halfword_const_op(a, |av| if n >= 16 { 0 } else { av << n })
+}
+
+#[inline]
+fn halfword_shr_const(a: u128, n: u32) -> u128 {
+    halfword_const_op(a, |av| if n >= 16 { 0 } else { av >> n })
+}
+
+#[inline]
+fn halfword_sar_const(a: u128, n: u32) -> u128 {
+    halfword_const_op(a, |av| {
+        let v = av as i16;
+        if n >= 16 {
+            if v < 0 { 0xFFFF } else { 0 }
+        } else {
+            (v >> n) as u16
+        }
+    })
+}
+
+#[inline]
+fn halfword_rot_const(a: u128, n: u32) -> u128 {
+    halfword_const_op(a, |av| av.rotate_left(n))
 }
 
 // =====================================================================
@@ -235,8 +498,8 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
 
     // ---- 11-bit register-form ALU -----------------------------
     match bits(inst, 0, 11) {
-        // a rt, ra, rb  — word add
-        0x180 => {
+        // a rt, ra, rb  — word add (canonical SPU primary 0xC0)
+        0x0C0 => {
             let a = split_lanes(spu.gpr[ra(inst)]);
             let b = split_lanes(spu.gpr[rb(inst)]);
             let r = [
@@ -249,8 +512,8 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
             spu.pc = pc.wrapping_add(4);
             return Ok(StepOutcome::Continue);
         }
-        // sf rt, ra, rb  — word sub-from (rb - ra)
-        0x080 => {
+        // sf rt, ra, rb  — word sub-from (rb - ra) (canonical 0x40)
+        0x040 => {
             let a = split_lanes(spu.gpr[ra(inst)]);
             let b = split_lanes(spu.gpr[rb(inst)]);
             let r = [
@@ -263,8 +526,8 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
             spu.pc = pc.wrapping_add(4);
             return Ok(StepOutcome::Continue);
         }
-        // and rt, ra, rb
-        0x181 => {
+        // and rt, ra, rb (canonical 0xC1)
+        0x0C1 => {
             spu.gpr[rt(inst)] = spu.gpr[ra(inst)] & spu.gpr[rb(inst)];
             spu.pc = pc.wrapping_add(4);
             return Ok(StepOutcome::Continue);
@@ -383,15 +646,18 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
             spu.pc = pc.wrapping_add(4);
             return Ok(StepOutcome::Continue);
         }
-        // fm rt, ra, rb — float multiply
+        // fm rt, ra, rb (cpp:1192)  — float multiply, lane-wise.
+        // Matches the "fast" SSE path: denormal-flush the inputs, do
+        // the multiply, then flush the result if it landed in
+        // sub-normal territory.
         0x2C6 => {
             let a = split_lanes(spu.gpr[ra(inst)]);
             let b = split_lanes(spu.gpr[rb(inst)]);
             let r = [
-                (f32::from_bits(a[0]) * f32::from_bits(b[0])).to_bits(),
-                (f32::from_bits(a[1]) * f32::from_bits(b[1])).to_bits(),
-                (f32::from_bits(a[2]) * f32::from_bits(b[2])).to_bits(),
-                (f32::from_bits(a[3]) * f32::from_bits(b[3])).to_bits(),
+                fmul_flushed(a[0], b[0]),
+                fmul_flushed(a[1], b[1]),
+                fmul_flushed(a[2], b[2]),
+                fmul_flushed(a[3], b[3]),
             ];
             spu.gpr[rt(inst)] = join_lanes(r);
             spu.pc = pc.wrapping_add(4);
@@ -564,6 +830,579 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
             spu.pc = pc.wrapping_add(4);
             return Ok(StepOutcome::Continue);
         }
+
+        // ===== Single-precision float compares (FCGT/FCMGT/FCEQ/FCMEQ)
+        // Semantics from `SPUInterpreter.cpp` "fast" handlers (anonymous
+        // namespace, lines 1131..1265). The fast path on x86 uses SSE
+        // primitives with denormal flush before the comparison; we
+        // mirror that lane-by-lane in scalar Rust via the helpers
+        // declared in the convert section above.
+
+        // fcgt rt, ra, rb (cpp:1131)  — float-compare-greater-than with
+        // denormal flush on both operands.
+        0x2C2 => {
+            let a = split_lanes(spu.gpr[ra(inst)]);
+            let b = split_lanes(spu.gpr[rb(inst)]);
+            let r = [
+                fcmp_gt(a[0], b[0]),
+                fcmp_gt(a[1], b[1]),
+                fcmp_gt(a[2], b[2]),
+                fcmp_gt(a[3], b[3]),
+            ];
+            spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // fcmgt rt, ra, rb (cpp:1237)  — magnitude compare-gt: |a| > |b|.
+        0x2CA => {
+            let a = split_lanes(spu.gpr[ra(inst)]);
+            let b = split_lanes(spu.gpr[rb(inst)]);
+            let r = [
+                fcmp_mgt(a[0], b[0]),
+                fcmp_mgt(a[1], b[1]),
+                fcmp_mgt(a[2], b[2]),
+                fcmp_mgt(a[3], b[3]),
+            ];
+            spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // fceq rt, ra, rb  — float compare-equal (bit-pattern after
+        // denormal flush; NaN never compares equal).
+        0x3C2 => {
+            let a = split_lanes(spu.gpr[ra(inst)]);
+            let b = split_lanes(spu.gpr[rb(inst)]);
+            let r = [
+                fcmp_eq(a[0], b[0]),
+                fcmp_eq(a[1], b[1]),
+                fcmp_eq(a[2], b[2]),
+                fcmp_eq(a[3], b[3]),
+            ];
+            spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // fcmeq rt, ra, rb  — magnitude compare-equal: |a| == |b|.
+        0x3CA => {
+            let a = split_lanes(spu.gpr[ra(inst)]);
+            let b = split_lanes(spu.gpr[rb(inst)]);
+            let r = [
+                fcmp_meq(a[0], b[0]),
+                fcmp_meq(a[1], b[1]),
+                fcmp_meq(a[2], b[2]),
+                fcmp_meq(a[3], b[3]),
+            ];
+            spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+
+        // ===== Float reciprocal estimates (FREST/FRSQEST) ==========
+        // The C++ uses 5-bit fraction-LUT + 8-bit exponent-LUT
+        // (cpp:690..735). For the iter-2 wave we use the IEEE direct
+        // form `1/x` and `1/sqrt(x)` as a *starting* approximation
+        // (denormal flush on input) — this is byte-exact only for
+        // exact-power-of-two inputs, but enough for getting code that
+        // doesn't rely on the exact bit-pattern of the estimate.
+        // TODO(spu-frest-lut): replace with the LUT path when we port
+        // `spu_frest_*_lut` (binary tables ~256 + 32 entries).
+        0x1B8 => {
+            let a = split_lanes(spu.gpr[ra(inst)]);
+            let r = [
+                frest_naive(a[0]),
+                frest_naive(a[1]),
+                frest_naive(a[2]),
+                frest_naive(a[3]),
+            ];
+            spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        0x1B9 => {
+            let a = split_lanes(spu.gpr[ra(inst)]);
+            let r = [
+                frsqest_naive(a[0]),
+                frsqest_naive(a[1]),
+                frsqest_naive(a[2]),
+                frsqest_naive(a[3]),
+            ];
+            spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+
+        // ===== FSM rt, ra  (cpp:661)  — form select mask, word ====
+        // Picks the low 4 bits of ra's preferred slot. Bit i (i=0..3)
+        // expands into element (3-i)'s 32-bit lane (because the cpp
+        // uses _mm_set_epi32(8,4,2,1): element 0 tests bit 3, etc.).
+        0x1B4 => {
+            let m = split_lanes(spu.gpr[ra(inst)])[0] & 0xF;
+            let r = [
+                if m & 0x8 != 0 { 0xFFFF_FFFF } else { 0 },
+                if m & 0x4 != 0 { 0xFFFF_FFFF } else { 0 },
+                if m & 0x2 != 0 { 0xFFFF_FFFF } else { 0 },
+                if m & 0x1 != 0 { 0xFFFF_FFFF } else { 0 },
+            ];
+            spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+
+        // ===== Indexed load/store (LQX/STQX) =====================
+        // cpp:738..742. addr = (ra[3] + rb[3]) & 0x3fff0 in C++ LE
+        // terms — that's our lane 0 + lane 0, masked to 16-byte align.
+        0x1C4 => {
+            // lqx rt, ra, rb
+            let base = split_lanes(spu.gpr[ra(inst)])[0];
+            let off = split_lanes(spu.gpr[rb(inst)])[0];
+            let lsa = base.wrapping_add(off) & 0x3FFF0;
+            let v = read_qword_be(spu, lsa)?;
+            spu.gpr[rt(inst)] = v;
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        0x144 => {
+            // stqx rt, ra, rb
+            let base = split_lanes(spu.gpr[ra(inst)])[0];
+            let off = split_lanes(spu.gpr[rb(inst)])[0];
+            let lsa = base.wrapping_add(off) & 0x3FFF0;
+            write_qword_be(spu, lsa, spu.gpr[rt(inst)])?;
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+
+        // ===== Branches indirect (BI / BISL / IRET / BIZ family) ===
+        // All take ra's preferred slot as the target address, masked
+        // to 4-byte alignment within the 256 KB local store
+        // (& 0x3fffc per `spu_branch_target` in SPUOpcodes.h:53).
+
+        // bi ra (cpp opcode 0x1a8)  — unconditional indirect branch
+        0x1A8 => {
+            let target = split_lanes(spu.gpr[ra(inst)])[0] & 0x3FFFC;
+            spu.pc = target;
+            return Ok(StepOutcome::Continue);
+        }
+        // bisl rt, ra (0x1a9)  — branch indirect with link.
+        // rt gets the next-pc (broadcast across all lanes per ABI).
+        0x1A9 => {
+            let target = split_lanes(spu.gpr[ra(inst)])[0] & 0x3FFFC;
+            let link = pc.wrapping_add(4) & 0x3FFFC;
+            spu.gpr[rt(inst)] = broadcast_u32(link);
+            spu.pc = target;
+            return Ok(StepOutcome::Continue);
+        }
+        // iret ra (0x1aa)  — interrupt return. Without modeled
+        // interrupts it degenerates to BI (target = ra preferred).
+        0x1AA => {
+            let target = split_lanes(spu.gpr[ra(inst)])[0] & 0x3FFFC;
+            spu.pc = target;
+            return Ok(StepOutcome::Continue);
+        }
+        // hbr ra, ro (0x1ac)  — branch hint. NOP for the interpreter,
+        // pure recompiler hint to prefetch the indirect target.
+        0x1AC => {
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // biz rt, ra (0x128)  — indirect branch if rt preferred == 0
+        0x128 => {
+            let cond = split_lanes(spu.gpr[rt(inst)])[0] == 0;
+            spu.pc = if cond {
+                split_lanes(spu.gpr[ra(inst)])[0] & 0x3FFFC
+            } else {
+                pc.wrapping_add(4)
+            };
+            return Ok(StepOutcome::Continue);
+        }
+        // binz rt, ra (0x129)  — opposite of biz
+        0x129 => {
+            let cond = split_lanes(spu.gpr[rt(inst)])[0] != 0;
+            spu.pc = if cond {
+                split_lanes(spu.gpr[ra(inst)])[0] & 0x3FFFC
+            } else {
+                pc.wrapping_add(4)
+            };
+            return Ok(StepOutcome::Continue);
+        }
+        // bihz rt, ra (0x12a)  — preferred-slot low-half == 0
+        0x12A => {
+            let cond = (split_lanes(spu.gpr[rt(inst)])[0] & 0xFFFF) == 0;
+            spu.pc = if cond {
+                split_lanes(spu.gpr[ra(inst)])[0] & 0x3FFFC
+            } else {
+                pc.wrapping_add(4)
+            };
+            return Ok(StepOutcome::Continue);
+        }
+        // bihnz rt, ra (0x12b)  — preferred-slot low-half != 0
+        0x12B => {
+            let cond = (split_lanes(spu.gpr[rt(inst)])[0] & 0xFFFF) != 0;
+            spu.pc = if cond {
+                split_lanes(spu.gpr[ra(inst)])[0] & 0x3FFFC
+            } else {
+                pc.wrapping_add(4)
+            };
+            return Ok(StepOutcome::Continue);
+        }
+
+        // ===== Iter-9: shifts vetoriais por palavra (cpp:287..339) ===
+        // SPU shift count comes from the **same lane** of rb (per-lane
+        // shift, not broadcast). Counts are masked to 6 bits (0..63);
+        // shifts of 32+ produce 0 / sign-bit because the cpp does the
+        // arithmetic in u64/s64 then truncates back to u32/s32.
+
+        // shl rt, ra, rb  — logical shift left per word
+        0x5B => {
+            let a = split_lanes(spu.gpr[ra(inst)]);
+            let b = split_lanes(spu.gpr[rb(inst)]);
+            let r = [
+                shl_word(a[0], b[0]),
+                shl_word(a[1], b[1]),
+                shl_word(a[2], b[2]),
+                shl_word(a[3], b[3]),
+            ];
+            spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // rot rt, ra, rb  — rotate left per word, count = rb mod 32
+        0x58 => {
+            let a = split_lanes(spu.gpr[ra(inst)]);
+            let b = split_lanes(spu.gpr[rb(inst)]);
+            let r = [
+                a[0].rotate_left(b[0] & 0x1F),
+                a[1].rotate_left(b[1] & 0x1F),
+                a[2].rotate_left(b[2] & 0x1F),
+                a[3].rotate_left(b[3] & 0x1F),
+            ];
+            spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // rotm rt, ra, rb  — logical shift right per word, count = -rb & 0x3F
+        0x59 => {
+            let a = split_lanes(spu.gpr[ra(inst)]);
+            let b = split_lanes(spu.gpr[rb(inst)]);
+            let r = [
+                shr_word(a[0], b[0]),
+                shr_word(a[1], b[1]),
+                shr_word(a[2], b[2]),
+                shr_word(a[3], b[3]),
+            ];
+            spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // rotma rt, ra, rb  — arithmetic shift right per word, count = -rb & 0x3F
+        0x5A => {
+            let a = split_lanes(spu.gpr[ra(inst)]);
+            let b = split_lanes(spu.gpr[rb(inst)]);
+            let r = [
+                sar_word(a[0], b[0]),
+                sar_word(a[1], b[1]),
+                sar_word(a[2], b[2]),
+                sar_word(a[3], b[3]),
+            ];
+            spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+
+        // ===== Iter-9: shift word imediatos (RR-form, count em rb's
+        // bits 25..31 = same encoding slot as rt — the cpp uses op.i7
+        // which maps to the i7 slot at 11..17. But the actual opcode
+        // uses the rb field as the shift count. We follow the cpp
+        // semantics: count comes from the i7 slot.
+
+        // roti rt, ra, imm7  — rotate left per word, count = i7 & 0x1F
+        0x78 => {
+            let n = bits(inst, 11, 7) & 0x1F;
+            let a = split_lanes(spu.gpr[ra(inst)]);
+            let r = [
+                a[0].rotate_left(n),
+                a[1].rotate_left(n),
+                a[2].rotate_left(n),
+                a[3].rotate_left(n),
+            ];
+            spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // rotmi rt, ra, imm7  — logical shr per word, count = (-i7) & 0x3F
+        0x79 => {
+            let n = (0u32.wrapping_sub(bits(inst, 11, 7))) & 0x3F;
+            let a = split_lanes(spu.gpr[ra(inst)]);
+            let r = [
+                shr_const(a[0], n),
+                shr_const(a[1], n),
+                shr_const(a[2], n),
+                shr_const(a[3], n),
+            ];
+            spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // rotmai rt, ra, imm7  — arith shr per word, count = (-i7) & 0x3F
+        0x7A => {
+            let n = (0u32.wrapping_sub(bits(inst, 11, 7))) & 0x3F;
+            let a = split_lanes(spu.gpr[ra(inst)]);
+            let r = [
+                sar_const(a[0], n),
+                sar_const(a[1], n),
+                sar_const(a[2], n),
+                sar_const(a[3], n),
+            ];
+            spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+
+        // ===== Iter-9: bitwise complementares =======================
+
+        // nand rt, ra, rb  (cpp:487)  — ~(a & b)
+        0xC9 => {
+            spu.gpr[rt(inst)] = !(spu.gpr[ra(inst)] & spu.gpr[rb(inst)]);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // eqv rt, ra, rb  (cpp:1026)  — ~(a ^ b) = a XNOR b
+        0x249 => {
+            spu.gpr[rt(inst)] = !(spu.gpr[ra(inst)] ^ spu.gpr[rb(inst)]);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // andc rt, ra, rb  (cpp:1124)  — a & ~b
+        0x2C1 => {
+            spu.gpr[rt(inst)] = spu.gpr[ra(inst)] & !spu.gpr[rb(inst)];
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // orc rt, ra, rb  (cpp:1230)  — a | ~b
+        0x2C9 => {
+            spu.gpr[rt(inst)] = spu.gpr[ra(inst)] | !spu.gpr[rb(inst)];
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+
+        // ===== Iter-9: barriers + alias stops =======================
+
+        // sync (0x002), dsync (0x003)  — memory/instruction barriers.
+        // For the interpreter both are NOPs (no out-of-order execution
+        // to fence). Encoded with all RT/RA/RB = 0 in the canonical
+        // form, but we accept any low-bits since the SPU ignores them.
+        0x002 | 0x003 => {
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // stopd ra, rb, rc (0x140)  — stop and signal in privileged
+        // mode. cpp:579 just sets PC and stops. For our purposes it
+        // behaves identically to `stop` with code 0.
+        0x140 => {
+            return Ok(StepOutcome::Stop(0));
+        }
+
+        // ===== Iter-9: compares estendidos (byte/halfword) ==========
+
+        // ceqh rt, ra, rb (cpp:1485)  — eq-compare per halfword (8 lanes)
+        0x3C8 => {
+            let a = spu.gpr[ra(inst)].to_be_bytes();
+            let b = spu.gpr[rb(inst)].to_be_bytes();
+            let mut out = [0u8; 16];
+            for i in 0..8 {
+                let av = u16::from_be_bytes([a[2*i], a[2*i+1]]);
+                let bv = u16::from_be_bytes([b[2*i], b[2*i+1]]);
+                let mask: u16 = if av == bv { 0xFFFF } else { 0 };
+                out[2*i..2*i+2].copy_from_slice(&mask.to_be_bytes());
+            }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(out);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // ceqb rt, ra, rb (cpp:1516)  — eq-compare per byte (16 lanes)
+        0x3D0 => {
+            let a = spu.gpr[ra(inst)].to_be_bytes();
+            let b = spu.gpr[rb(inst)].to_be_bytes();
+            let mut out = [0u8; 16];
+            for i in 0..16 {
+                out[i] = if a[i] == b[i] { 0xFF } else { 0 };
+            }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(out);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // cgth rt, ra, rb (cpp:1019)  — signed gt per halfword
+        0x248 => {
+            let a = spu.gpr[ra(inst)].to_be_bytes();
+            let b = spu.gpr[rb(inst)].to_be_bytes();
+            let mut out = [0u8; 16];
+            for i in 0..8 {
+                let av = i16::from_be_bytes([a[2*i], a[2*i+1]]);
+                let bv = i16::from_be_bytes([b[2*i], b[2*i+1]]);
+                let mask: u16 = if av > bv { 0xFFFF } else { 0 };
+                out[2*i..2*i+2].copy_from_slice(&mask.to_be_bytes());
+            }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(out);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // cgtb rt, ra, rb  — signed gt per byte
+        0x250 => {
+            let a = spu.gpr[ra(inst)].to_be_bytes();
+            let b = spu.gpr[rb(inst)].to_be_bytes();
+            let mut out = [0u8; 16];
+            for i in 0..16 {
+                out[i] = if (a[i] as i8) > (b[i] as i8) { 0xFF } else { 0 };
+            }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(out);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // clgth rt, ra, rb  — unsigned gt per halfword
+        0x2C8 => {
+            let a = spu.gpr[ra(inst)].to_be_bytes();
+            let b = spu.gpr[rb(inst)].to_be_bytes();
+            let mut out = [0u8; 16];
+            for i in 0..8 {
+                let av = u16::from_be_bytes([a[2*i], a[2*i+1]]);
+                let bv = u16::from_be_bytes([b[2*i], b[2*i+1]]);
+                let mask: u16 = if av > bv { 0xFFFF } else { 0 };
+                out[2*i..2*i+2].copy_from_slice(&mask.to_be_bytes());
+            }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(out);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // clgtb rt, ra, rb  — unsigned gt per byte
+        0x2D0 => {
+            let a = spu.gpr[ra(inst)].to_be_bytes();
+            let b = spu.gpr[rb(inst)].to_be_bytes();
+            let mut out = [0u8; 16];
+            for i in 0..16 {
+                out[i] = if a[i] > b[i] { 0xFF } else { 0 };
+            }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(out);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+
+        // ===== Iter-10: halfword arithmetic + carry/borrow ========
+
+        // ah rt, ra, rb (cpp:480)  — add per halfword (8 lanes)
+        0x0C8 => {
+            spu.gpr[rt(inst)] = halfword_add(spu.gpr[ra(inst)], spu.gpr[rb(inst)]);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // sfh rt, ra, rb (cpp:264)  — sub from halfword: rt = rb - ra
+        0x048 => {
+            spu.gpr[rt(inst)] = halfword_sub(spu.gpr[rb(inst)], spu.gpr[ra(inst)]);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // cg rt, ra, rb (cpp:471)  — carry generate per word: 1 if
+        // ra+rb overflows u32, else 0.
+        0x0C2 => {
+            let a = split_lanes(spu.gpr[ra(inst)]);
+            let b = split_lanes(spu.gpr[rb(inst)]);
+            let r = [
+                ((a[0] as u64 + b[0] as u64) >> 32) as u32,
+                ((a[1] as u64 + b[1] as u64) >> 32) as u32,
+                ((a[2] as u64 + b[2] as u64) >> 32) as u32,
+                ((a[3] as u64 + b[3] as u64) >> 32) as u32,
+            ];
+            spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // bg rt, ra, rb (cpp:257)  — borrow generate: 1 if rb-ra does
+        // NOT underflow (i.e. ra ≤ rb), else 0. Matches SPU convention
+        // that `sf rt,ra,rb` computes rb-ra.
+        0x042 => {
+            let a = split_lanes(spu.gpr[ra(inst)]);
+            let b = split_lanes(spu.gpr[rb(inst)]);
+            let r = [
+                if a[0] <= b[0] { 1 } else { 0 },
+                if a[1] <= b[1] { 1 } else { 0 },
+                if a[2] <= b[2] { 1 } else { 0 },
+                if a[3] <= b[3] { 1 } else { 0 },
+            ];
+            spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // orx rt, ra (cpp:882)  — OR-across all word lanes of ra,
+        // result lands in preferred slot of rt; other lanes zero.
+        0x1F0 => {
+            let a = split_lanes(spu.gpr[ra(inst)]);
+            let or_all = a[0] | a[1] | a[2] | a[3];
+            spu.gpr[rt(inst)] = join_lanes([or_all, 0, 0, 0]);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+
+        // ===== Iter-11: halfword shifts (cpp:341..394) ==============
+        // Per-halfword shift: 8 lanes of u16, count = b lane masked to
+        // 5 bits; shifts of 16+ produce 0 / sign-fill.
+
+        // roth rt, ra, rb (cpp:342)  — rotate left per halfword
+        0x05C => {
+            spu.gpr[rt(inst)] = halfword_rot(spu.gpr[ra(inst)], spu.gpr[rb(inst)]);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // rothm rt, ra, rb (cpp:355)  — logical shr per halfword
+        0x05D => {
+            spu.gpr[rt(inst)] = halfword_shr(spu.gpr[ra(inst)], spu.gpr[rb(inst)]);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // rotmah rt, ra, rb (cpp:369)  — arith shr per halfword
+        0x05E => {
+            spu.gpr[rt(inst)] = halfword_sar(spu.gpr[ra(inst)], spu.gpr[rb(inst)]);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // shlh rt, ra, rb (cpp:382)  — logical shl per halfword
+        0x05F => {
+            spu.gpr[rt(inst)] = halfword_shl(spu.gpr[ra(inst)], spu.gpr[rb(inst)]);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+
+        // ===== Iter-11: halfword shift immediates (cpp:427..453) ====
+        // Count comes from i7 slot, masked appropriately. Same as
+        // word-shift immediates (rotmi/rotmai/roti/shli) but at
+        // halfword granularity.
+
+        // rothi rt, ra, imm7 (cpp:427)  — rotate left per halfword
+        0x07C => {
+            let n = bits(inst, 11, 7) & 0xF;
+            spu.gpr[rt(inst)] = halfword_rot_const(spu.gpr[ra(inst)], n);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // rothmi rt, ra, imm7 (cpp:436)  — logical shr per halfword
+        0x07D => {
+            let n = (0u32.wrapping_sub(bits(inst, 11, 7))) & 0x1F;
+            spu.gpr[rt(inst)] = halfword_shr_const(spu.gpr[ra(inst)], n);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // rotmahi rt, ra, imm7 (cpp:443)  — arith shr per halfword
+        0x07E => {
+            let n = (0u32.wrapping_sub(bits(inst, 11, 7))) & 0x1F;
+            spu.gpr[rt(inst)] = halfword_sar_const(spu.gpr[ra(inst)], n);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // shlhi rt, ra, imm7 (cpp:450)  — logical shl per halfword
+        0x07F => {
+            let n = bits(inst, 11, 7) & 0x1F;
+            spu.gpr[rt(inst)] = halfword_shl_const(spu.gpr[ra(inst)], n);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+
         _ => {}
     }
 
@@ -599,6 +1438,16 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
                 spu.pc = ((pc as i64).wrapping_add(offset as i64)) as u32 & (SPU_LS_SIZE as u32 - 1);
                 return Ok(StepOutcome::Continue);
             }
+        }
+        // brsl rt, i16 (cpp:1681)  — branch relative with link.
+        // rt = next-pc broadcast; pc = pc + (i16 << 2), masked to LS.
+        0x066 => {
+            let target = ((pc as i64).wrapping_add((i16_rel(inst) * 4) as i64)) as u32
+                & (SPU_LS_SIZE as u32 - 1);
+            let link = pc.wrapping_add(4) & 0x3FFFC;
+            spu.gpr[rt(inst)] = broadcast_u32(link);
+            spu.pc = target;
+            return Ok(StepOutcome::Continue);
         }
         _ => {}
     }
@@ -884,6 +1733,51 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
             spu.pc = pc.wrapping_add(4);
             return Ok(StepOutcome::Continue);
         }
+        // ===== Iter-10: halfword-immediate compares (RI10 form) =====
+        // imm10 is signed 10-bit, broadcast across all 8 halfword lanes.
+
+        // ceqhi rt, ra, imm10 (cpp:1916)
+        0x7D => {
+            let imm = i10(inst) as i16 as u16;
+            let a = spu.gpr[ra(inst)].to_be_bytes();
+            let mut out = [0u8; 16];
+            for i in 0..8 {
+                let av = u16::from_be_bytes([a[2*i], a[2*i+1]]);
+                let mask: u16 = if av == imm { 0xFFFF } else { 0 };
+                out[2*i..2*i+2].copy_from_slice(&mask.to_be_bytes());
+            }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(out);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // cgthi rt, ra, imm10 (cpp:1838)  — signed gt halfword imm
+        0x4D => {
+            let imm = i10(inst) as i16;
+            let a = spu.gpr[ra(inst)].to_be_bytes();
+            let mut out = [0u8; 16];
+            for i in 0..8 {
+                let av = i16::from_be_bytes([a[2*i], a[2*i+1]]);
+                let mask: u16 = if av > imm { 0xFFFF } else { 0 };
+                out[2*i..2*i+2].copy_from_slice(&mask.to_be_bytes());
+            }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(out);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // clgthi rt, ra, imm10 (cpp:1869)  — unsigned gt halfword imm
+        0x5D => {
+            let imm = i10(inst) as i16 as u16;
+            let a = spu.gpr[ra(inst)].to_be_bytes();
+            let mut out = [0u8; 16];
+            for i in 0..8 {
+                let av = u16::from_be_bytes([a[2*i], a[2*i+1]]);
+                let mask: u16 = if av > imm { 0xFFFF } else { 0 };
+                out[2*i..2*i+2].copy_from_slice(&mask.to_be_bytes());
+            }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(out);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
         _ => {}
     }
 
@@ -926,6 +1820,13 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
             return Ok(StepOutcome::Continue);
         }
         _ => {}
+    }
+
+    // ---- 7-bit primary: branch hints HBRA / HBRR (cpp:1941..1947)
+    // Both are interpreter NOPs (recompiler-only prefetch hints).
+    if matches!(bits(inst, 0, 7), 0x08 | 0x09) {
+        spu.pc = pc.wrapping_add(4);
+        return Ok(StepOutcome::Continue);
     }
 
     // ---- 7-bit primary (ila = 18-bit immediate load) ----------
@@ -982,13 +1883,13 @@ pub mod encode {
 
     /// `a rt, ra, rb`
     #[must_use]
-    pub const fn a(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x180, rt, ra, rb) }
+    pub const fn a(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x0C0, rt, ra, rb) }
     /// `sf rt, ra, rb` — rt = rb - ra
     #[must_use]
-    pub const fn sf(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x080, rt, ra, rb) }
+    pub const fn sf(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x040, rt, ra, rb) }
     /// `and rt, ra, rb`
     #[must_use]
-    pub const fn and(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x181, rt, ra, rb) }
+    pub const fn and(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x0C1, rt, ra, rb) }
     /// `or rt, ra, rb`
     #[must_use]
     pub const fn or(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x041, rt, ra, rb) }
@@ -1230,6 +2131,217 @@ pub mod encode {
     pub const fn ila(rt: u32, imm18: u32) -> u32 {
         ((0x21u32) << 25) | ((imm18 & 0x3FFFF) << 7) | (rt & 0x7F)
     }
+
+    // ---- Iter-8: float compares + frest/frsqest + form-mask ---------
+
+    /// `fcgt rt, ra, rb` — float compare-greater-than (denormal flush).
+    #[must_use]
+    pub const fn fcgt(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x2C2, rt, ra, rb) }
+    /// `fcmgt rt, ra, rb` — magnitude compare-greater-than.
+    #[must_use]
+    pub const fn fcmgt(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x2CA, rt, ra, rb) }
+    /// `fceq rt, ra, rb` — float compare-equal.
+    #[must_use]
+    pub const fn fceq(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x3C2, rt, ra, rb) }
+    /// `fcmeq rt, ra, rb` — magnitude compare-equal.
+    #[must_use]
+    pub const fn fcmeq(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x3CA, rt, ra, rb) }
+    /// `frest rt, ra` — reciprocal estimate.
+    #[must_use]
+    pub const fn frest(rt: u32, ra: u32) -> u32 { pack_rr_unary(0x1B8, rt, ra) }
+    /// `frsqest rt, ra` — reciprocal-sqrt estimate.
+    #[must_use]
+    pub const fn frsqest(rt: u32, ra: u32) -> u32 { pack_rr_unary(0x1B9, rt, ra) }
+    /// `fsm rt, ra` — form select mask (word).
+    #[must_use]
+    pub const fn fsm(rt: u32, ra: u32) -> u32 { pack_rr_unary(0x1B4, rt, ra) }
+
+    // ---- Iter-8: indexed load/store ---------------------------------
+
+    /// `lqx rt, ra, rb` — load qword indexed.
+    #[must_use]
+    pub const fn lqx(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x1C4, rt, ra, rb) }
+    /// `stqx rt, ra, rb` — store qword indexed.
+    #[must_use]
+    pub const fn stqx(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x144, rt, ra, rb) }
+
+    // ---- Iter-8: indirect branches ----------------------------------
+
+    /// `bi ra` — branch indirect.
+    #[must_use]
+    pub const fn bi(ra: u32) -> u32 { pack_rr_unary(0x1A8, 0, ra) }
+    /// `bisl rt, ra` — branch indirect with link (rt = next-pc broadcast).
+    #[must_use]
+    pub const fn bisl(rt: u32, ra: u32) -> u32 { pack_rr_unary(0x1A9, rt, ra) }
+    /// `iret ra` — interrupt return (treated as bi without modeled IRQs).
+    #[must_use]
+    pub const fn iret(ra: u32) -> u32 { pack_rr_unary(0x1AA, 0, ra) }
+    /// `hbr ra, ro` — branch hint (NOP for interpreter).
+    #[must_use]
+    pub const fn hbr(ra: u32) -> u32 { pack_rr_unary(0x1AC, 0, ra) }
+    /// `biz rt, ra` — indirect branch if rt preferred == 0.
+    #[must_use]
+    pub const fn biz(rt: u32, ra: u32) -> u32 { pack_rr_unary(0x128, rt, ra) }
+    /// `binz rt, ra` — indirect branch if rt preferred != 0.
+    #[must_use]
+    pub const fn binz(rt: u32, ra: u32) -> u32 { pack_rr_unary(0x129, rt, ra) }
+    /// `bihz rt, ra` — indirect branch if rt preferred low-half == 0.
+    #[must_use]
+    pub const fn bihz(rt: u32, ra: u32) -> u32 { pack_rr_unary(0x12A, rt, ra) }
+    /// `bihnz rt, ra` — indirect branch if rt preferred low-half != 0.
+    #[must_use]
+    pub const fn bihnz(rt: u32, ra: u32) -> u32 { pack_rr_unary(0x12B, rt, ra) }
+
+    // ---- Iter-9: vector word shifts (RR-form, count from rb lane) ----
+
+    /// `shl rt, ra, rb` — logical shift left per word.
+    #[must_use]
+    pub const fn shl(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x05B, rt, ra, rb) }
+    /// `rot rt, ra, rb` — rotate left per word.
+    #[must_use]
+    pub const fn rot(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x058, rt, ra, rb) }
+    /// `rotm rt, ra, rb` — logical shift right per word.
+    #[must_use]
+    pub const fn rotm(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x059, rt, ra, rb) }
+    /// `rotma rt, ra, rb` — arithmetic shift right per word.
+    #[must_use]
+    pub const fn rotma(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x05A, rt, ra, rb) }
+
+    // ---- Iter-9: word shift immediates (RI7) ----
+
+    /// `roti rt, ra, imm7` — rotate left per word, count = i7 & 0x1F.
+    #[must_use]
+    pub const fn roti(rt: u32, ra: u32, imm7: i8) -> u32 { pack_ri7(0x078, rt, ra, imm7) }
+    /// `rotmi rt, ra, imm7` — logical shr per word.
+    #[must_use]
+    pub const fn rotmi(rt: u32, ra: u32, imm7: i8) -> u32 { pack_ri7(0x079, rt, ra, imm7) }
+    /// `rotmai rt, ra, imm7` — arith shr per word.
+    #[must_use]
+    pub const fn rotmai(rt: u32, ra: u32, imm7: i8) -> u32 { pack_ri7(0x07A, rt, ra, imm7) }
+
+    // ---- Iter-9: bitwise complementaries ----
+
+    /// `nand rt, ra, rb` — `~(a & b)`.
+    #[must_use]
+    pub const fn nand(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x0C9, rt, ra, rb) }
+    /// `eqv rt, ra, rb` — `~(a ^ b)`.
+    #[must_use]
+    pub const fn eqv(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x249, rt, ra, rb) }
+    /// `andc rt, ra, rb` — `a & ~b`.
+    #[must_use]
+    pub const fn andc(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x2C1, rt, ra, rb) }
+    /// `orc rt, ra, rb` — `a | ~b`.
+    #[must_use]
+    pub const fn orc(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x2C9, rt, ra, rb) }
+
+    // ---- Iter-9: extended compares ----
+
+    /// `ceqh rt, ra, rb` — eq-compare halfword.
+    #[must_use]
+    pub const fn ceqh(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x3C8, rt, ra, rb) }
+    /// `ceqb rt, ra, rb` — eq-compare byte.
+    #[must_use]
+    pub const fn ceqb(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x3D0, rt, ra, rb) }
+    /// `cgth rt, ra, rb` — signed gt halfword.
+    #[must_use]
+    pub const fn cgth(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x248, rt, ra, rb) }
+    /// `cgtb rt, ra, rb` — signed gt byte.
+    #[must_use]
+    pub const fn cgtb(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x250, rt, ra, rb) }
+    /// `clgth rt, ra, rb` — unsigned gt halfword.
+    #[must_use]
+    pub const fn clgth(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x2C8, rt, ra, rb) }
+    /// `clgtb rt, ra, rb` — unsigned gt byte.
+    #[must_use]
+    pub const fn clgtb(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x2D0, rt, ra, rb) }
+
+    // ---- Iter-9: barriers + STOPD ----
+
+    /// `sync` — instruction-stream barrier (NOP for the interpreter).
+    #[must_use]
+    pub const fn sync() -> u32 { 0x002 << 21 }
+    /// `dsync` — data-stream barrier.
+    #[must_use]
+    pub const fn dsync() -> u32 { 0x003 << 21 }
+    /// `stopd` — privileged stop. Behaves like `stop 0`.
+    #[must_use]
+    pub const fn stopd() -> u32 { 0x140 << 21 }
+
+    // ---- Iter-10: halfword arith + carry/borrow + or-across ----
+
+    /// `ah rt, ra, rb` — per-halfword add (8 lanes).
+    #[must_use]
+    pub const fn ah(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x0C8, rt, ra, rb) }
+    /// `sfh rt, ra, rb` — per-halfword sub-from: `rt = rb - ra`.
+    #[must_use]
+    pub const fn sfh(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x048, rt, ra, rb) }
+    /// `cg rt, ra, rb` — carry generate per word.
+    #[must_use]
+    pub const fn cg(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x0C2, rt, ra, rb) }
+    /// `bg rt, ra, rb` — borrow generate per word (for `rb-ra`).
+    #[must_use]
+    pub const fn bg(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x042, rt, ra, rb) }
+    /// `orx rt, ra` — OR-across word lanes; result in preferred slot.
+    #[must_use]
+    pub const fn orx(rt: u32, ra: u32) -> u32 { pack_rr_unary(0x1F0, rt, ra) }
+
+    // ---- Iter-10: branch relative w/ link + branch hints ----
+
+    /// `brsl rt, imm16` — branch relative w/ link.
+    #[must_use]
+    pub const fn brsl(rt: u32, imm16: i16) -> u32 {
+        ((0x066 & 0x1FF) << 23) | ((imm16 as u16 as u32 & 0xFFFF) << 7) | (rt & 0x7F)
+    }
+
+    /// `hbra ro, ra` — absolute branch hint (NOP). 7-bit primary 0x08.
+    #[must_use]
+    pub const fn hbra(ra: u32) -> u32 {
+        ((0x08u32) << 25) | ((ra & 0x7F) << 7)
+    }
+    /// `hbrr ro, imm16` — relative branch hint (NOP). 7-bit primary 0x09.
+    #[must_use]
+    pub const fn hbrr(imm16: i16) -> u32 {
+        ((0x09u32) << 25) | ((imm16 as u16 as u32 & 0xFFFF) << 7)
+    }
+
+    // ---- Iter-10: halfword immediate compares (RI10 form) ----
+
+    /// `ceqhi rt, ra, imm10` — per-halfword equality vs broadcast imm.
+    #[must_use]
+    pub const fn ceqhi(rt: u32, ra: u32, imm10: i16) -> u32 { pack_8_i10(0x7D, rt, ra, imm10) }
+    /// `cgthi rt, ra, imm10` — signed gt halfword imm.
+    #[must_use]
+    pub const fn cgthi(rt: u32, ra: u32, imm10: i16) -> u32 { pack_8_i10(0x4D, rt, ra, imm10) }
+    /// `clgthi rt, ra, imm10` — unsigned gt halfword imm.
+    #[must_use]
+    pub const fn clgthi(rt: u32, ra: u32, imm10: i16) -> u32 { pack_8_i10(0x5D, rt, ra, imm10) }
+
+    // ---- Iter-11: halfword shifts (RR + RI7) ------------------------
+
+    /// `roth rt, ra, rb` — rotate left per halfword.
+    #[must_use]
+    pub const fn roth(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x05C, rt, ra, rb) }
+    /// `rothm rt, ra, rb` — logical shr per halfword.
+    #[must_use]
+    pub const fn rothm(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x05D, rt, ra, rb) }
+    /// `rotmah rt, ra, rb` — arith shr per halfword.
+    #[must_use]
+    pub const fn rotmah(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x05E, rt, ra, rb) }
+    /// `shlh rt, ra, rb` — logical shl per halfword.
+    #[must_use]
+    pub const fn shlh(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x05F, rt, ra, rb) }
+    /// `rothi rt, ra, imm7` — rotate left per halfword.
+    #[must_use]
+    pub const fn rothi(rt: u32, ra: u32, imm7: i8) -> u32 { pack_ri7(0x07C, rt, ra, imm7) }
+    /// `rothmi rt, ra, imm7` — logical shr per halfword.
+    #[must_use]
+    pub const fn rothmi(rt: u32, ra: u32, imm7: i8) -> u32 { pack_ri7(0x07D, rt, ra, imm7) }
+    /// `rotmahi rt, ra, imm7` — arith shr per halfword.
+    #[must_use]
+    pub const fn rotmahi(rt: u32, ra: u32, imm7: i8) -> u32 { pack_ri7(0x07E, rt, ra, imm7) }
+    /// `shlhi rt, ra, imm7` — logical shl per halfword.
+    #[must_use]
+    pub const fn shlhi(rt: u32, ra: u32, imm7: i8) -> u32 { pack_ri7(0x07F, rt, ra, imm7) }
 }
 
 // =====================================================================
@@ -2122,5 +3234,688 @@ mod tests {
             Error::Unimplemented { .. } => {}
             other => panic!("expected Unimplemented, got {other:?}"),
         }
+    }
+
+    // --- Iter-8: float compares ---------------------------------
+
+    fn set_lane(spu: &mut SpuThread, gpr: usize, lanes: [u32; 4]) {
+        spu.gpr[gpr] = join_lanes(lanes);
+    }
+
+    #[test]
+    fn fcgt_strict_greater_than_per_lane() {
+        // a = [2.0, 1.0, 0.0, -1.0]
+        // b = [1.0, 1.0, 0.0, -2.0]
+        // expect: [F, 0, 0, F] (lane 0: 2>1 yes; lane 1: 1>1 no; lane 2: 0>0 no; lane 3: -1>-2 yes)
+        let mut spu = make_env(&[encode::fcgt(3, 4, 5)]);
+        set_lane(&mut spu, 4, [2.0_f32.to_bits(), 1.0_f32.to_bits(), 0.0_f32.to_bits(), (-1.0_f32).to_bits()]);
+        set_lane(&mut spu, 5, [1.0_f32.to_bits(), 1.0_f32.to_bits(), 0.0_f32.to_bits(), (-2.0_f32).to_bits()]);
+        step_ok(&mut spu);
+        assert_eq!(split_lanes(spu.gpr[3]), [0xFFFF_FFFF, 0, 0, 0xFFFF_FFFF]);
+    }
+
+    #[test]
+    fn fcgt_flushes_denormals() {
+        // a tiny denormal vs +0 — both flush to +0, compare is false.
+        let mut spu = make_env(&[encode::fcgt(3, 4, 5)]);
+        set_lane(&mut spu, 4, [1, 0, 0, 0]); // denormal in lane 0
+        set_lane(&mut spu, 5, [0, 0, 0, 0]);
+        step_ok(&mut spu);
+        assert_eq!(split_lanes(spu.gpr[3])[0], 0);
+    }
+
+    #[test]
+    fn fcmgt_compares_magnitudes() {
+        // |-3.0| > |2.0| → true; |1.0| > |-1.0| → false (equal mag)
+        let mut spu = make_env(&[encode::fcmgt(3, 4, 5)]);
+        set_lane(&mut spu, 4, [(-3.0_f32).to_bits(), 1.0_f32.to_bits(), 0.0_f32.to_bits(), 0.0_f32.to_bits()]);
+        set_lane(&mut spu, 5, [2.0_f32.to_bits(), (-1.0_f32).to_bits(), 0.0_f32.to_bits(), 0.0_f32.to_bits()]);
+        step_ok(&mut spu);
+        let r = split_lanes(spu.gpr[3]);
+        assert_eq!(r[0], 0xFFFF_FFFF);
+        assert_eq!(r[1], 0);
+    }
+
+    #[test]
+    fn fceq_equal_per_lane() {
+        let mut spu = make_env(&[encode::fceq(3, 4, 5)]);
+        set_lane(&mut spu, 4, [1.5_f32.to_bits(), 2.0_f32.to_bits(), 0.0_f32.to_bits(), f32::NAN.to_bits()]);
+        set_lane(&mut spu, 5, [1.5_f32.to_bits(), 2.0_f32.to_bits(), 0.0_f32.to_bits(), f32::NAN.to_bits()]);
+        step_ok(&mut spu);
+        let r = split_lanes(spu.gpr[3]);
+        assert_eq!(r[0], 0xFFFF_FFFF);
+        assert_eq!(r[1], 0xFFFF_FFFF);
+        assert_eq!(r[2], 0xFFFF_FFFF);
+        // NaN never compares equal even to itself.
+        assert_eq!(r[3], 0);
+    }
+
+    #[test]
+    fn fcmeq_magnitude_equality() {
+        let mut spu = make_env(&[encode::fcmeq(3, 4, 5)]);
+        set_lane(&mut spu, 4, [(-1.5_f32).to_bits(), 1.5_f32.to_bits(), 2.0_f32.to_bits(), 0.0_f32.to_bits()]);
+        set_lane(&mut spu, 5, [1.5_f32.to_bits(), (-1.5_f32).to_bits(), 3.0_f32.to_bits(), 0.0_f32.to_bits()]);
+        step_ok(&mut spu);
+        let r = split_lanes(spu.gpr[3]);
+        assert_eq!(r[0], 0xFFFF_FFFF);
+        assert_eq!(r[1], 0xFFFF_FFFF);
+        assert_eq!(r[2], 0);
+        assert_eq!(r[3], 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn fm_flushes_denormal_inputs_and_results() {
+        let mut spu = make_env(&[encode::fm(3, 4, 5)]);
+        // 2.0 * 3.0 = 6.0 (normal path)
+        set_lane(&mut spu, 4, [2.0_f32.to_bits(), 1.0_f32.to_bits(), 0.0_f32.to_bits(), 1, /* denorm */]);
+        set_lane(&mut spu, 5, [3.0_f32.to_bits(), 0.0_f32.to_bits(), 5.0_f32.to_bits(), 1.0_f32.to_bits()]);
+        step_ok(&mut spu);
+        let r = split_lanes(spu.gpr[3]);
+        assert_eq!(r[0], 6.0_f32.to_bits());
+        assert_eq!(r[1], 0.0_f32.to_bits());
+        assert_eq!(r[2], 0.0_f32.to_bits());
+        // denormal input flushed to +0 → 0 * 1 = 0.
+        assert_eq!(r[3], 0);
+    }
+
+    #[test]
+    fn frest_naive_one_over_two_is_half() {
+        let mut spu = make_env(&[encode::frest(3, 4)]);
+        set_lane(&mut spu, 4, [2.0_f32.to_bits(), 4.0_f32.to_bits(), 1.0_f32.to_bits(), 0.0_f32.to_bits()]);
+        step_ok(&mut spu);
+        let r = split_lanes(spu.gpr[3]);
+        assert_eq!(r[0], 0.5_f32.to_bits());
+        assert_eq!(r[1], 0.25_f32.to_bits());
+        assert_eq!(r[2], 1.0_f32.to_bits());
+        assert_eq!(r[3], 0x7F80_0000); // +inf for 1/0
+    }
+
+    #[test]
+    fn frsqest_naive_one_over_sqrt_four_is_half() {
+        let mut spu = make_env(&[encode::frsqest(3, 4)]);
+        set_lane(&mut spu, 4, [4.0_f32.to_bits(), 16.0_f32.to_bits(), 1.0_f32.to_bits(), 0.0_f32.to_bits()]);
+        step_ok(&mut spu);
+        let r = split_lanes(spu.gpr[3]);
+        assert_eq!(r[0], 0.5_f32.to_bits());
+        assert_eq!(r[1], 0.25_f32.to_bits());
+        assert_eq!(r[2], 1.0_f32.to_bits());
+        assert_eq!(r[3], 0x7F80_0000); // 1/sqrt(0) = +inf
+    }
+
+    // --- Iter-8: form select mask --------------------------------
+
+    #[test]
+    fn fsm_bit_pattern_expands_per_lane() {
+        // ra preferred = 0b1010 → lane 0 (bit 3 = 1) on, lane 1 (bit 2 = 0) off,
+        // lane 2 (bit 1 = 1) on, lane 3 (bit 0 = 0) off.
+        let mut spu = make_env(&[encode::fsm(3, 4)]);
+        set_lane(&mut spu, 4, [0b1010, 0, 0, 0]);
+        step_ok(&mut spu);
+        assert_eq!(split_lanes(spu.gpr[3]), [0xFFFF_FFFF, 0, 0xFFFF_FFFF, 0]);
+    }
+
+    // --- Iter-8: indexed load/store ------------------------------
+
+    #[test]
+    fn lqx_loads_quadword_at_ra_plus_rb() {
+        // Pre-store something at LSA 0x40, then load via lqx.
+        let payload = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210u128;
+        let mut spu = make_env(&[encode::lqx(3, 4, 5), encode::stop(0)]);
+        write_qword_be(&mut spu, 0x40, payload).unwrap();
+        set_lane(&mut spu, 4, [0x30, 0, 0, 0]);
+        set_lane(&mut spu, 5, [0x10, 0, 0, 0]);
+        step_ok(&mut spu);
+        assert_eq!(spu.gpr[3], payload);
+    }
+
+    #[test]
+    fn stqx_stores_quadword_at_ra_plus_rb() {
+        let mut spu = make_env(&[encode::stqx(3, 4, 5), encode::stop(0)]);
+        spu.gpr[3] = 0xDEAD_BEEF_CAFE_F00D_1234_5678_9ABC_DEF0u128;
+        set_lane(&mut spu, 4, [0x80, 0, 0, 0]);
+        set_lane(&mut spu, 5, [0x20, 0, 0, 0]);
+        step_ok(&mut spu);
+        assert_eq!(read_qword_be(&spu, 0xA0).unwrap(), spu.gpr[3]);
+    }
+
+    // --- Iter-8: indirect branches -------------------------------
+
+    #[test]
+    fn bi_jumps_to_ra_preferred_aligned() {
+        let mut spu = make_env(&[encode::bi(4)]);
+        set_lane(&mut spu, 4, [0x100, 0, 0, 0]);
+        step_ok(&mut spu);
+        assert_eq!(spu.pc, 0x100);
+    }
+
+    #[test]
+    fn bi_aligns_target_to_4_bytes_within_local_store() {
+        let mut spu = make_env(&[encode::bi(4)]);
+        // 0xFFFF_FFFF & 0x3FFFC = 0x3FFFC (last instruction slot).
+        set_lane(&mut spu, 4, [0xFFFF_FFFF, 0, 0, 0]);
+        step_ok(&mut spu);
+        assert_eq!(spu.pc, 0x3FFFC);
+    }
+
+    #[test]
+    fn bisl_writes_link_register_and_branches() {
+        let mut spu = make_env(&[
+            0, // pc=0: padding
+            encode::bisl(2, 4),  // pc=4: bisl rt=2, ra=4 → next-pc=8 broadcast to gpr[2]
+        ]);
+        spu.pc = 4;
+        set_lane(&mut spu, 4, [0x200, 0, 0, 0]);
+        step_ok(&mut spu);
+        assert_eq!(spu.pc, 0x200);
+        // Link register holds next-pc (8) broadcast across all 4 lanes.
+        assert_eq!(split_lanes(spu.gpr[2]), [8, 8, 8, 8]);
+    }
+
+    #[test]
+    fn iret_behaves_as_bi_without_irq_model() {
+        let mut spu = make_env(&[encode::iret(4)]);
+        set_lane(&mut spu, 4, [0x80, 0, 0, 0]);
+        step_ok(&mut spu);
+        assert_eq!(spu.pc, 0x80);
+    }
+
+    #[test]
+    fn hbr_is_nop_for_interpreter() {
+        let mut spu = make_env(&[encode::hbr(4)]);
+        set_lane(&mut spu, 4, [0xDEAD, 0, 0, 0]);
+        step_ok(&mut spu);
+        assert_eq!(spu.pc, 4);
+    }
+
+    #[test]
+    fn biz_branches_when_rt_preferred_is_zero() {
+        let mut spu = make_env(&[encode::biz(2, 4)]);
+        set_lane(&mut spu, 2, [0, 0, 0, 0]);
+        set_lane(&mut spu, 4, [0x300, 0, 0, 0]);
+        step_ok(&mut spu);
+        assert_eq!(spu.pc, 0x300);
+    }
+
+    #[test]
+    fn biz_falls_through_when_rt_preferred_nonzero() {
+        let mut spu = make_env(&[encode::biz(2, 4)]);
+        set_lane(&mut spu, 2, [42, 0, 0, 0]);
+        set_lane(&mut spu, 4, [0x300, 0, 0, 0]);
+        step_ok(&mut spu);
+        assert_eq!(spu.pc, 4);
+    }
+
+    #[test]
+    fn binz_is_inverse_of_biz() {
+        let mut spu = make_env(&[encode::binz(2, 4)]);
+        set_lane(&mut spu, 2, [42, 0, 0, 0]);
+        set_lane(&mut spu, 4, [0x400, 0, 0, 0]);
+        step_ok(&mut spu);
+        assert_eq!(spu.pc, 0x400);
+    }
+
+    #[test]
+    fn bihz_tests_low_halfword_only() {
+        // High half nonzero, low half zero → branches taken.
+        let mut spu = make_env(&[encode::bihz(2, 4)]);
+        set_lane(&mut spu, 2, [0xABCD_0000, 0, 0, 0]);
+        set_lane(&mut spu, 4, [0x500, 0, 0, 0]);
+        step_ok(&mut spu);
+        assert_eq!(spu.pc, 0x500);
+    }
+
+    #[test]
+    fn bihnz_inverse_of_bihz() {
+        let mut spu = make_env(&[encode::bihnz(2, 4)]);
+        set_lane(&mut spu, 2, [0x0000_BEEF, 0, 0, 0]);
+        set_lane(&mut spu, 4, [0x600, 0, 0, 0]);
+        step_ok(&mut spu);
+        assert_eq!(spu.pc, 0x600);
+    }
+
+    // --- Iter-9: vector word shifts ----------------------------
+
+    #[test]
+    fn shl_per_lane_count_from_rb() {
+        let mut spu = make_env(&[encode::shl(3, 4, 5)]);
+        set_lane(&mut spu, 4, [1, 1, 1, 1]);
+        set_lane(&mut spu, 5, [0, 1, 4, 31]);
+        step_ok(&mut spu);
+        assert_eq!(split_lanes(spu.gpr[3]), [1, 2, 16, 0x8000_0000]);
+    }
+
+    #[test]
+    fn shl_count_32_or_more_yields_zero() {
+        let mut spu = make_env(&[encode::shl(3, 4, 5)]);
+        set_lane(&mut spu, 4, [0xDEAD_BEEF; 4]);
+        set_lane(&mut spu, 5, [32, 33, 63, 0x40 /* 64 → masked to 0 */]);
+        step_ok(&mut spu);
+        // Lanes 0..2: ≥32 → zero. Lane 3: 0x40 & 0x3F = 0 → no shift.
+        assert_eq!(split_lanes(spu.gpr[3]), [0, 0, 0, 0xDEAD_BEEF]);
+    }
+
+    #[test]
+    fn rot_per_lane_modulo_32() {
+        let mut spu = make_env(&[encode::rot(3, 4, 5)]);
+        set_lane(&mut spu, 4, [0x12345678, 0x12345678, 0x12345678, 0x12345678]);
+        set_lane(&mut spu, 5, [0, 4, 16, 32 /* 32 & 0x1F = 0 → no rot */]);
+        step_ok(&mut spu);
+        assert_eq!(split_lanes(spu.gpr[3]),
+                   [0x12345678, 0x23456781, 0x56781234, 0x12345678]);
+    }
+
+    #[test]
+    fn rotm_logical_shr_with_negative_count_form() {
+        let mut spu = make_env(&[encode::rotm(3, 4, 5)]);
+        set_lane(&mut spu, 4, [0x8000_0000; 4]);
+        // count for shr = (-rb) & 0x3F. So rb=1 → shr 63 (zero), rb=-1 (0xFFFF_FFFF & 0x3F=0x3F → shr 63 → zero), rb=-32 (0xFFFF_FFE0 & 0x3F=0x20 → shr 32 → zero), rb=-31 (0xFFFF_FFE1 & 0x3F=0x21 → shr 33 → zero — actually 33≥32 so zero too).
+        set_lane(&mut spu, 5, [0, 1u32.wrapping_neg(), 0u32.wrapping_sub(31), 0u32.wrapping_sub(1)]);
+        step_ok(&mut spu);
+        let r = split_lanes(spu.gpr[3]);
+        // rb=0 → -0=0 & 0x3F = 0 → no shift.
+        assert_eq!(r[0], 0x8000_0000);
+        // rb=-1 → 1 & 0x3F = 1 → shr 1.
+        assert_eq!(r[1], 0x4000_0000);
+        // rb=-31 → 31 → shr 31 = 1.
+        assert_eq!(r[2], 1);
+        // rb=-1 lane3 → also shr 1.
+        assert_eq!(r[3], 0x4000_0000);
+    }
+
+    #[test]
+    fn rotma_arith_shr_preserves_sign() {
+        let mut spu = make_env(&[encode::rotma(3, 4, 5)]);
+        set_lane(&mut spu, 4, [0x8000_0000; 4]);
+        // Same encoding as rotm (count = -rb & 0x3F), but sign-fill.
+        set_lane(&mut spu, 5, [0u32.wrapping_sub(1), 0u32.wrapping_sub(31), 0u32.wrapping_sub(32), 0]);
+        step_ok(&mut spu);
+        let r = split_lanes(spu.gpr[3]);
+        assert_eq!(r[0], 0xC000_0000); // shr 1 with sign-fill
+        assert_eq!(r[1], 0xFFFF_FFFF); // shr 31 of 0x80000000 = all ones
+        assert_eq!(r[2], 0xFFFF_FFFF); // shr 32 → all sign bits
+        assert_eq!(r[3], 0x8000_0000); // no shift
+    }
+
+    #[test]
+    fn roti_immediate_rotate() {
+        let mut spu = make_env(&[encode::roti(3, 4, 4)]);
+        set_lane(&mut spu, 4, [0x12345678; 4]);
+        step_ok(&mut spu);
+        assert_eq!(split_lanes(spu.gpr[3]), [0x23456781; 4]);
+    }
+
+    #[test]
+    fn rotmi_immediate_logical_shr() {
+        // i7 = -4 → count = 4 → shr 4.
+        let mut spu = make_env(&[encode::rotmi(3, 4, -4)]);
+        set_lane(&mut spu, 4, [0xFF00_0000; 4]);
+        step_ok(&mut spu);
+        assert_eq!(split_lanes(spu.gpr[3]), [0x0FF0_0000; 4]);
+    }
+
+    #[test]
+    fn rotmai_immediate_arith_shr() {
+        let mut spu = make_env(&[encode::rotmai(3, 4, -4)]);
+        set_lane(&mut spu, 4, [0xFF00_0000; 4]);
+        step_ok(&mut spu);
+        // -16777216 >> 4 sign-extended = 0xFFF0_0000.
+        assert_eq!(split_lanes(spu.gpr[3]), [0xFFF0_0000; 4]);
+    }
+
+    // --- Iter-9: bitwise complementaries -----------------------
+
+    #[test]
+    fn nand_is_not_and() {
+        let mut spu = make_env(&[encode::nand(3, 4, 5)]);
+        spu.gpr[4] = 0xFF00_FF00_FF00_FF00_FF00_FF00_FF00_FF00;
+        spu.gpr[5] = 0x0F0F_0F0F_0F0F_0F0F_0F0F_0F0F_0F0F_0F0F;
+        step_ok(&mut spu);
+        assert_eq!(spu.gpr[3], !(spu.gpr[4] & spu.gpr[5]));
+    }
+
+    #[test]
+    fn eqv_is_xnor() {
+        let mut spu = make_env(&[encode::eqv(3, 4, 5)]);
+        spu.gpr[4] = 0xAAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA;
+        spu.gpr[5] = 0xCCCC_CCCC_CCCC_CCCC_CCCC_CCCC_CCCC_CCCC;
+        step_ok(&mut spu);
+        assert_eq!(spu.gpr[3], !(spu.gpr[4] ^ spu.gpr[5]));
+    }
+
+    #[test]
+    fn andc_is_a_and_not_b() {
+        let mut spu = make_env(&[encode::andc(3, 4, 5)]);
+        spu.gpr[4] = 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF;
+        spu.gpr[5] = 0x0F0F_0F0F_0F0F_0F0F_0F0F_0F0F_0F0F_0F0F;
+        step_ok(&mut spu);
+        assert_eq!(spu.gpr[3], 0xF0F0_F0F0_F0F0_F0F0_F0F0_F0F0_F0F0_F0F0);
+    }
+
+    #[test]
+    fn orc_is_a_or_not_b() {
+        let mut spu = make_env(&[encode::orc(3, 4, 5)]);
+        spu.gpr[4] = 0;
+        spu.gpr[5] = 0x0F0F_0F0F_0F0F_0F0F_0F0F_0F0F_0F0F_0F0F;
+        step_ok(&mut spu);
+        assert_eq!(spu.gpr[3], !spu.gpr[5]);
+    }
+
+    // --- Iter-9: barriers + stopd ------------------------------
+
+    #[test]
+    fn sync_dsync_are_nops() {
+        let mut spu = make_env(&[encode::sync(), encode::dsync(), encode::stop(0)]);
+        step_ok(&mut spu);
+        assert_eq!(spu.pc, 4);
+        step_ok(&mut spu);
+        assert_eq!(spu.pc, 8);
+    }
+
+    #[test]
+    fn stopd_halts_with_code_zero() {
+        let mut spu = make_env(&[encode::stopd()]);
+        match step_ok(&mut spu) {
+            StepOutcome::Stop(0) => {}
+            other => panic!("expected Stop(0), got {other:?}"),
+        }
+    }
+
+    // --- Iter-9: extended compares -----------------------------
+
+    #[test]
+    fn ceqh_per_halfword_lane() {
+        let mut spu = make_env(&[encode::ceqh(3, 4, 5)]);
+        // 8 halves: a = [1,2,3,4,5,6,7,8], b = [1,2,9,4,9,6,9,8]
+        // → matches at idx 0,1,3,5,7
+        spu.gpr[4] = 0x0001_0002_0003_0004_0005_0006_0007_0008;
+        spu.gpr[5] = 0x0001_0002_0009_0004_0009_0006_0009_0008;
+        step_ok(&mut spu);
+        assert_eq!(spu.gpr[3], 0xFFFF_FFFF_0000_FFFF_0000_FFFF_0000_FFFF);
+    }
+
+    #[test]
+    fn ceqb_per_byte_lane() {
+        let mut spu = make_env(&[encode::ceqb(3, 4, 5)]);
+        spu.gpr[4] = 0xAA_BB_CC_DD_AA_BB_CC_DD_AA_BB_CC_DD_AA_BB_CC_DDu128;
+        spu.gpr[5] = 0xAA_00_CC_00_AA_00_CC_00_AA_00_CC_00_AA_00_CC_00u128;
+        step_ok(&mut spu);
+        assert_eq!(spu.gpr[3], 0xFF_00_FF_00_FF_00_FF_00_FF_00_FF_00_FF_00_FF_00u128);
+    }
+
+    #[test]
+    fn cgth_signed_halfword_gt() {
+        let mut spu = make_env(&[encode::cgth(3, 4, 5)]);
+        // [1, -1, 100, -100, 0x7FFF, -0x8000, 5, -5] vs [0, 0, 0, 0, 0, 0, 5, 5]
+        let a_halves: [i16; 8] = [1, -1, 100, -100, 0x7FFF, -0x8000, 5, -5];
+        let b_halves: [i16; 8] = [0, 0, 0, 0, 0, 0, 5, 5];
+        let pack = |hs: [i16; 8]| -> u128 {
+            let mut bytes = [0u8; 16];
+            for (i, h) in hs.iter().enumerate() {
+                bytes[2*i..2*i+2].copy_from_slice(&h.to_be_bytes());
+            }
+            u128::from_be_bytes(bytes)
+        };
+        spu.gpr[4] = pack(a_halves);
+        spu.gpr[5] = pack(b_halves);
+        step_ok(&mut spu);
+        // expected: 1>0=T, -1>0=F, 100>0=T, -100>0=F, MAX>0=T, MIN>0=F, 5>5=F, -5>5=F
+        assert_eq!(spu.gpr[3], 0xFFFF_0000_FFFF_0000_FFFF_0000_0000_0000);
+    }
+
+    #[test]
+    fn clgtb_unsigned_byte_gt() {
+        let mut spu = make_env(&[encode::clgtb(3, 4, 5)]);
+        // 16 bytes: a = 0xFF (255), b = 0x80 (128) → all gt.
+        spu.gpr[4] = u128::from_be_bytes([0xFF; 16]);
+        spu.gpr[5] = u128::from_be_bytes([0x80; 16]);
+        step_ok(&mut spu);
+        assert_eq!(spu.gpr[3], u128::from_be_bytes([0xFF; 16]));
+    }
+
+    // --- Iter-10: halfword arith + carry/borrow + or-across ----
+
+    fn pack_halves(hs: [u16; 8]) -> u128 {
+        let mut bytes = [0u8; 16];
+        for (i, h) in hs.iter().enumerate() {
+            bytes[2*i..2*i+2].copy_from_slice(&h.to_be_bytes());
+        }
+        u128::from_be_bytes(bytes)
+    }
+
+    fn unpack_halves(v: u128) -> [u16; 8] {
+        let bytes = v.to_be_bytes();
+        let mut out = [0u16; 8];
+        for i in 0..8 {
+            out[i] = u16::from_be_bytes([bytes[2*i], bytes[2*i+1]]);
+        }
+        out
+    }
+
+    #[test]
+    fn ah_per_halfword_add() {
+        let mut spu = make_env(&[encode::ah(3, 4, 5)]);
+        spu.gpr[4] = pack_halves([1, 2, 3, 4, 100, 200, 300, 400]);
+        spu.gpr[5] = pack_halves([10, 20, 30, 40, 0xFFFF, 1, 0, 0]);
+        step_ok(&mut spu);
+        assert_eq!(unpack_halves(spu.gpr[3]),
+                   [11, 22, 33, 44, 99 /* wrap */, 201, 300, 400]);
+    }
+
+    #[test]
+    fn sfh_per_halfword_sub_from() {
+        // sfh rt, ra, rb → rt = rb - ra
+        let mut spu = make_env(&[encode::sfh(3, 4, 5)]);
+        spu.gpr[4] = pack_halves([1, 2, 3, 4, 5, 6, 7, 8]);
+        spu.gpr[5] = pack_halves([10, 20, 30, 40, 50, 60, 70, 80]);
+        step_ok(&mut spu);
+        assert_eq!(unpack_halves(spu.gpr[3]), [9, 18, 27, 36, 45, 54, 63, 72]);
+    }
+
+    #[test]
+    fn cg_carry_generate_per_word() {
+        let mut spu = make_env(&[encode::cg(3, 4, 5)]);
+        // [no-carry, carry, no-carry, carry-on-edge]
+        set_lane(&mut spu, 4, [1, 0xFFFF_FFFF, 0x7FFF_FFFF, 0xFFFF_FFFE]);
+        set_lane(&mut spu, 5, [2, 1, 1, 1]);
+        step_ok(&mut spu);
+        assert_eq!(split_lanes(spu.gpr[3]), [0, 1, 0, 0]);
+    }
+
+    #[test]
+    fn bg_borrow_generate_per_word() {
+        // bg = 1 if a ≤ b (no borrow when computing rb-ra), else 0.
+        let mut spu = make_env(&[encode::bg(3, 4, 5)]);
+        set_lane(&mut spu, 4, [5, 5, 0, 0xFFFF_FFFF]);
+        set_lane(&mut spu, 5, [10, 5, 0xFFFF_FFFF, 0]);
+        step_ok(&mut spu);
+        assert_eq!(split_lanes(spu.gpr[3]), [1 /* 5≤10 */, 1 /* equal */, 1 /* 0≤max */, 0 /* max>0 */]);
+    }
+
+    #[test]
+    fn orx_collects_or_into_preferred_slot() {
+        let mut spu = make_env(&[encode::orx(3, 4)]);
+        set_lane(&mut spu, 4, [0x0000_0001, 0x0000_0002, 0x0000_0004, 0x0000_0008]);
+        step_ok(&mut spu);
+        assert_eq!(split_lanes(spu.gpr[3]), [0xF, 0, 0, 0]);
+    }
+
+    // --- Iter-10: brsl + hbra/hbrr -----------------------------
+
+    #[test]
+    fn brsl_writes_link_and_branches_relative() {
+        let mut spu = make_env(&[
+            0x4020_0000, // 0x000: nop (padding)
+            encode::brsl(2, 4),  // 0x004: brsl rt=2, +4*4=+16 → target 0x14
+        ]);
+        spu.pc = 4;
+        step_ok(&mut spu);
+        assert_eq!(spu.pc, 0x14);
+        // Link = next-pc broadcast = 8.
+        assert_eq!(split_lanes(spu.gpr[2]), [8, 8, 8, 8]);
+    }
+
+    #[test]
+    fn hbra_is_nop_for_interpreter() {
+        let mut spu = make_env(&[encode::hbra(4)]);
+        step_ok(&mut spu);
+        assert_eq!(spu.pc, 4);
+    }
+
+    #[test]
+    fn hbrr_is_nop_for_interpreter() {
+        let mut spu = make_env(&[encode::hbrr(0x100)]);
+        step_ok(&mut spu);
+        assert_eq!(spu.pc, 4);
+    }
+
+    // --- Iter-10: halfword immediate compares ------------------
+
+    #[test]
+    fn ceqhi_per_halfword_eq_with_imm() {
+        let mut spu = make_env(&[encode::ceqhi(3, 4, 42)]);
+        spu.gpr[4] = pack_halves([42, 41, 42, 43, 42, 0, 42, 100]);
+        step_ok(&mut spu);
+        let r = unpack_halves(spu.gpr[3]);
+        assert_eq!(r, [0xFFFF, 0, 0xFFFF, 0, 0xFFFF, 0, 0xFFFF, 0]);
+    }
+
+    #[test]
+    fn cgthi_signed_halfword_gt_imm() {
+        let mut spu = make_env(&[encode::cgthi(3, 4, -5)]);
+        spu.gpr[4] = pack_halves([0, 0u16.wrapping_sub(10), 0u16.wrapping_sub(5),
+                                   0u16.wrapping_sub(4), 1, 100, 0, 0u16.wrapping_sub(1)]);
+        step_ok(&mut spu);
+        let r = unpack_halves(spu.gpr[3]);
+        // 0>-5 T, -10>-5 F, -5>-5 F, -4>-5 T, 1>-5 T, 100>-5 T, 0>-5 T, -1>-5 T
+        assert_eq!(r, [0xFFFF, 0, 0, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF]);
+    }
+
+    #[test]
+    fn clgthi_unsigned_halfword_gt_imm() {
+        let mut spu = make_env(&[encode::clgthi(3, 4, 100)]);
+        spu.gpr[4] = pack_halves([99, 100, 101, 200, 0, 0xFFFF, 50, 1000]);
+        step_ok(&mut spu);
+        let r = unpack_halves(spu.gpr[3]);
+        assert_eq!(r, [0, 0, 0xFFFF, 0xFFFF, 0, 0xFFFF, 0, 0xFFFF]);
+    }
+
+    // --- Iter-11: halfword shifts ------------------------------
+
+    #[test]
+    fn shlh_per_halfword_count_from_rb() {
+        let mut spu = make_env(&[encode::shlh(3, 4, 5)]);
+        spu.gpr[4] = pack_halves([1, 1, 1, 1, 1, 1, 1, 1]);
+        spu.gpr[5] = pack_halves([0, 1, 4, 8, 15, 16 /* ≥16 → 0 */, 17, 31 /* ≥16 → 0 */]);
+        step_ok(&mut spu);
+        let r = unpack_halves(spu.gpr[3]);
+        assert_eq!(r, [1, 2, 16, 256, 0x8000, 0, 0, 0]);
+    }
+
+    #[test]
+    fn rothm_logical_shr_per_halfword() {
+        let mut spu = make_env(&[encode::rothm(3, 4, 5)]);
+        spu.gpr[4] = pack_halves([0xFF00; 8]);
+        // count = (-bv) & 0x1F. bv=0 → 0 (no shift); bv=-4 (0xFFFC) → 4
+        // (because (-(-4)) & 0x1F = 4); bv=1 → -1 & 0x1F = 31 (≥16 → 0).
+        spu.gpr[5] = pack_halves([
+            0,
+            0u16.wrapping_sub(4),
+            0u16.wrapping_sub(8),
+            0u16.wrapping_sub(15),
+            0u16.wrapping_sub(16),  // → shift 16 ≥16 → 0
+            1,                      // → shift 31 ≥16 → 0
+            0u16.wrapping_sub(2),
+            0,
+        ]);
+        step_ok(&mut spu);
+        let r = unpack_halves(spu.gpr[3]);
+        assert_eq!(r[0], 0xFF00); // no shift
+        assert_eq!(r[1], 0x0FF0); // shr 4
+        assert_eq!(r[2], 0x00FF); // shr 8
+        assert_eq!(r[3], 0x0001); // shr 15
+        assert_eq!(r[4], 0);
+        assert_eq!(r[5], 0);
+        assert_eq!(r[6], 0x3FC0); // shr 2
+        assert_eq!(r[7], 0xFF00); // no shift
+    }
+
+    #[test]
+    fn rotmah_arith_shr_preserves_sign_per_halfword() {
+        let mut spu = make_env(&[encode::rotmah(3, 4, 5)]);
+        spu.gpr[4] = pack_halves([0x8000; 8]); // -32768 each lane
+        spu.gpr[5] = pack_halves([
+            0u16.wrapping_sub(1),
+            0u16.wrapping_sub(15),
+            0u16.wrapping_sub(16),
+            0,
+            0u16.wrapping_sub(4),
+            0u16.wrapping_sub(8),
+            0u16.wrapping_sub(2),
+            0u16.wrapping_sub(7),
+        ]);
+        step_ok(&mut spu);
+        let r = unpack_halves(spu.gpr[3]);
+        // shr 1 of 0x8000 with sign-fill = 0xC000
+        assert_eq!(r[0], 0xC000);
+        // shr 15 of 0x8000 sign-extend = 0xFFFF
+        assert_eq!(r[1], 0xFFFF);
+        // shr 16 saturates to all-ones (sign bit set)
+        assert_eq!(r[2], 0xFFFF);
+        // no shift
+        assert_eq!(r[3], 0x8000);
+    }
+
+    #[test]
+    fn roth_rotate_per_halfword() {
+        let mut spu = make_env(&[encode::roth(3, 4, 5)]);
+        spu.gpr[4] = pack_halves([0x1234; 8]);
+        spu.gpr[5] = pack_halves([0, 4, 8, 12, 16, 20, 1, 15]);
+        step_ok(&mut spu);
+        let r = unpack_halves(spu.gpr[3]);
+        // rotate counts mod 16
+        assert_eq!(r[0], 0x1234);  // 0
+        assert_eq!(r[1], 0x2341);  // 4
+        assert_eq!(r[2], 0x3412);  // 8
+        assert_eq!(r[3], 0x4123);  // 12
+        assert_eq!(r[4], 0x1234);  // 16 mod 16 = 0
+        assert_eq!(r[5], 0x2341);  // 20 mod 16 = 4
+        assert_eq!(r[6], 0x2468);  // 1
+    }
+
+    #[test]
+    fn shlhi_const_shl_per_halfword() {
+        let mut spu = make_env(&[encode::shlhi(3, 4, 4)]);
+        spu.gpr[4] = pack_halves([1, 2, 4, 8, 0x1000, 0x4000, 0x8000, 0xFFFF]);
+        step_ok(&mut spu);
+        let r = unpack_halves(spu.gpr[3]);
+        assert_eq!(r, [0x10, 0x20, 0x40, 0x80, 0x0000, 0x0000, 0x0000, 0xFFF0]);
+    }
+
+    #[test]
+    fn rothmi_const_shr_per_halfword() {
+        // i7 = -4 → count = 4 → shr 4
+        let mut spu = make_env(&[encode::rothmi(3, 4, -4)]);
+        spu.gpr[4] = pack_halves([0xFF00; 8]);
+        step_ok(&mut spu);
+        let r = unpack_halves(spu.gpr[3]);
+        assert_eq!(r, [0x0FF0; 8]);
+    }
+
+    #[test]
+    fn rotmahi_const_arith_shr_per_halfword() {
+        let mut spu = make_env(&[encode::rotmahi(3, 4, -4)]);
+        spu.gpr[4] = pack_halves([0xF000; 8]);
+        step_ok(&mut spu);
+        let r = unpack_halves(spu.gpr[3]);
+        // (-4096) >> 4 sign-extended = (-256) = 0xFF00
+        assert_eq!(r, [0xFF00; 8]);
+    }
+
+    #[test]
+    fn rothi_const_rotate_per_halfword() {
+        let mut spu = make_env(&[encode::rothi(3, 4, 4)]);
+        spu.gpr[4] = pack_halves([0x1234; 8]);
+        step_ok(&mut spu);
+        assert_eq!(unpack_halves(spu.gpr[3]), [0x2341; 8]);
     }
 }

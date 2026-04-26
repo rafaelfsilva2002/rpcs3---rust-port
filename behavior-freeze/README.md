@@ -16,7 +16,11 @@ behavior-freeze/
 ├── README.md                  # Este arquivo
 ├── docs/
 │   ├── INVENTORY.md           # Inventário P0/P1/P2 com file:line anchors
-│   └── CHECKLIST.md            # Checklist operacional da suíte
+│   ├── HOMEBREW_PLAN.md       # Plano homebrew real (P1+P5)
+│   ├── DECISIONS.md           # ADR log point-in-time
+│   ├── DEFERRED.md / BACKLOG_RESIDUAL.md  # Items deferidos/residuais
+│   ├── AUTONOMOUS_LOG.md      # Stub + telemetry (.claude hooks)
+│   └── SPU_RECOMPILER_PLAN.md # Stub (rust src doc-comment)
 ├── harness/
 │   ├── run_headless.py         # Wrapper CLI --headless + captura de saída
 │   ├── capture_baseline.py     # Roda um cenário e salva em baselines/
@@ -48,4 +52,4 @@ python behavior-freeze/harness/capture_baseline.py --scenario=boot_no_fw
 python behavior-freeze/harness/compare_run.py --scenario=boot_no_fw
 ```
 
-Veja [docs/INVENTORY.md](docs/INVENTORY.md) para a lista completa do que congelar e [docs/CHECKLIST.md](docs/CHECKLIST.md) para o plano de execução.
+Veja [docs/INVENTORY.md](docs/INVENTORY.md) para a lista completa do que congelar e [../docs/PROJECT_STATUS.md](../docs/PROJECT_STATUS.md) para o status atual da execução. O checklist operacional pré-cleanup está preservado em [../historico/pre-r4b-2026-04-25/CHECKLIST.md](../historico/pre-r4b-2026-04-25/CHECKLIST.md).

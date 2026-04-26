@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-spu-decoder"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure SPU instruction decoder + control-flow analysis. No execution, no codegen — produces a basic-block graph that any executor backend (interpreter, recompiler) consumes."
+
+[lib]
+name = "rpcs3_spu_decoder"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# No deps — stays pure.
+
+[lints]
+workspace = true

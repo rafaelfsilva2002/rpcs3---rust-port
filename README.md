@@ -4,15 +4,26 @@ Port byte-exato de subsistemas do [RPCS3](https://github.com/RPCS3/rpcs3) (emula
 
 ## Status
 
-| Métrica | Valor |
-|---------|-------|
-| **Crates** | **230** |
-| **Tests verdes** | **5165** |
-| **Iterações autônomas** | **229** |
-| **Regressões** | **0** |
-| **Cobertura Cell/Modules/** | **100%** (136 crates HLE) |
+> **Para o status autoritativo atual, ver [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md).**
+>
+> Os números abaixo eram a snapshot do baseline de 2026-04-24 (frozen).
+> Após esse marco, foi adicionado um SPU recompiler real (Cranelift JIT)
+> — ver `docs/PROJECT_STATUS.md` para a versão verificada localmente.
 
-🎉🎉🎉🎉 **Plano substancialmente completo** — todos os candidatos viáveis byte-exato cobertos. Os giants de runtime (SPU/PPU Recompilers, RSX Thread, VKGSRender, Qt UI) estão fora de escopo desta wave por design (cada um é um projeto dedicado de semanas).
+| Métrica | Frozen baseline (2026-04-24) | Atual |
+|---------|------------------------------|-------|
+| **Crates** | 230 | ver PROJECT_STATUS.md |
+| **Tests `--workspace --lib`** | 5165 | ver PROJECT_STATUS.md |
+| **SPU recompiler** | scaffold delegando ao interpreter | Cranelift JIT real (R4a + R4b + R4c minimal SMC) |
+| **Cobertura Cell/Modules/** | 100% (136 crates HLE) | igual |
+
+**Plano substancialmente completo** como artefato de escopo — todos os
+candidatos viáveis byte-exato de `Cell/Modules/`, `Audio/`, `Io/`,
+`Loader/`, `RSX/` (helpers), `NP/`, LV2, HLE foram entregues. Runtime
+giants ainda fora de escopo: PPU JIT completo (LLVM/ASMJIT backends),
+PPU Translator, PPU Thread/Module/Analyser, RSX Thread/VKGSRender,
+System.cpp, Qt UI. O SPU recompiler está parcialmente implementado
+(ver `docs/PROJECT_STATUS.md` para detalhe do que está done vs partial).
 
 ## Como rodar os testes
 
@@ -21,7 +32,9 @@ cd rust/
 cargo test --workspace --lib
 ```
 
-Esperado: `5165 passed; 0 failed`.
+Resultado esperado: passa sem failures. Para a contagem exata e o status
+de cada sub-suite (SPU stack, recompiler --release, etc.), ver
+[`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md).
 
 ## Estrutura
 
@@ -65,14 +78,23 @@ rust/                         ← 230 Rust crates (workspace Cargo)
 ├── rpcs3-localized-string/   ← 315 UI string IDs
 └── ... (230 total)
 
-behavior-freeze/              ← Documentação da wave
+docs/                            ← Status autoritativo atual
+└── PROJECT_STATUS.md            ← Verified status, R4a/R4b/R4c done, next phase
+
+historico/                       ← Snapshots históricos
+└── pre-r4b-2026-04-25/         ← Docs antes da limpeza (CHECKLIST, ROADMAP, PORT_PLAN, AUTONOMOUS_LOG full, etc.)
+
+behavior-freeze/                 ← Wave behavior-freeze (harness, fixtures, docs ainda em uso)
 ├── docs/
-│   ├── CHECKLIST.md          ← Estado por wave + plano residual
-│   ├── AUTONOMOUS_LOG.md     ← Trilha auditável das 229 iters
-│   ├── INVENTORY.md          ← P0/P1/P2 inventory
-│   └── PORT_PLAN.md          ← Decision matrix 8D
-├── contracts/                ← GTest contracts (cpp side)
-├── harness/                  ← Python test harness
+│   ├── INVENTORY.md             ← P0/P1/P2 inventory factual
+│   ├── HOMEBREW_PLAN.md         ← Plano P1+P5 homebrew real (referenciado pelo Python harness)
+│   ├── DECISIONS.md             ← ADR log (point-in-time records)
+│   ├── DEFERRED.md              ← Deferred items
+│   ├── BACKLOG_RESIDUAL.md      ← Backlog residual ao baseline 2026-04-24
+│   ├── AUTONOMOUS_LOG.md        ← Stub + telemetry section (.claude hooks dependem)
+│   └── SPU_RECOMPILER_PLAN.md   ← Stub (rust source comment depende)
+├── contracts/                   ← GTest contracts (cpp side)
+├── harness/                     ← Python test harness
 └── fixtures/
 ```
 
@@ -99,19 +121,29 @@ Três dispositivos USB emulados portados com cipher byte-exato verificável:
 
 ## Fora de escopo desta wave (gigantes de runtime)
 
-Cada item abaixo é um projeto dedicado de semanas — não foi tentado nesta wave linear:
+Cada item abaixo é um projeto dedicado de semanas. **Nem todos seguem fora de escopo** —
+o SPU recompiler em particular saiu da lista após a wave R1..R4c (ver `docs/PROJECT_STATUS.md`).
 
-- `SPUCommonRecompiler.cpp` (9792L) — JIT x86 backend
-- `SPULLVMRecompiler.cpp` (9497L) — JIT LLVM backend
-- `SPUASMJITRecompiler.cpp` (4878L) — ASMJIT legacy backend
-- `PPUInterpreter.cpp` (7888L), `SPUInterpreter.cpp` (3363L) — runtime
-- `PPUThread.cpp` (5684L), `SPUThread.cpp` (7488L) — runtime threads
-- `PPUTranslator.cpp` (5594L), `PPUAnalyser.cpp` (3278L), `PPUModule.cpp` (3254L) — PPU JIT tooling
-- `System.cpp` (4823L) — Emulator singleton
-- `RSXThread.cpp` (3675L), `VKGSRender.cpp` (3009L) — GPU runtime
-- `rpcs3qt/**` — Qt UI (framework-specific)
+Status atualizado:
 
-Contract stubs suficientes pra behavior-freeze wave em `rpcs3-ppu-interpreter`/`rpcs3-spu-interpreter`/`rpcs3-ppu-thread`/`rpcs3-spu-thread`.
+- `SPUCommonRecompiler.cpp` (9792L) — JIT x86 backend → **port em andamento**
+  via `rpcs3-spu-recompiler` com Cranelift (~102 opcodes JIT-cobertos,
+  R4a dispatcher, R4b chained patching, R4c SMC scan).
+- `SPULLVMRecompiler.cpp` (9497L) — JIT LLVM backend → ainda fora de escopo;
+  reservado para R5+ se Cranelift mostrar gargalo.
+- `SPUASMJITRecompiler.cpp` (4878L) — ASMJIT legacy → não será portado
+  (substituído por Cranelift).
+- `PPUInterpreter.cpp` (7888L) — fora de escopo (contract stub em `rpcs3-ppu-interpreter`).
+- `SPUInterpreter.cpp` (3363L) — substituído por `rpcs3-spu-interpreter` Rust real (~70% ISA).
+- `PPUThread.cpp` (5684L), `SPUThread.cpp` (7488L) — runtime threads, fora de escopo.
+- `PPUTranslator.cpp` (5594L), `PPUAnalyser.cpp` (3278L), `PPUModule.cpp` (3254L) — PPU JIT tooling, fora de escopo.
+- `System.cpp` (4823L) — Emulator singleton, fora de escopo.
+- `RSXThread.cpp` (3675L), `VKGSRender.cpp` (3009L) — GPU runtime, fora de escopo.
+- `rpcs3qt/**` — Qt UI (framework-specific), fora de escopo.
+
+Contract stubs em `rpcs3-ppu-interpreter`/`rpcs3-ppu-thread` cobrem o
+suficiente para a wave behavior-freeze em PPU. SPU foi além do stub —
+ver `docs/PROJECT_STATUS.md` SPU recompiler section.
 
 ## Bloqueado por dependências externas
 
@@ -137,10 +169,11 @@ cargo test -p rpcs3-io-dimensions --lib
 
 ## Documentação
 
-- [`behavior-freeze/docs/CHECKLIST.md`](behavior-freeze/docs/CHECKLIST.md) — Estado de cada wave + plano residual + lista do que está fora de escopo
-- [`behavior-freeze/docs/AUTONOMOUS_LOG.md`](behavior-freeze/docs/AUTONOMOUS_LOG.md) — Trilha auditável das 229 iterações (cada iter = 1 entry)
-- [`behavior-freeze/docs/INVENTORY.md`](behavior-freeze/docs/INVENTORY.md) — Inventário P0/P1/P2
-- [`behavior-freeze/docs/PORT_PLAN.md`](behavior-freeze/docs/PORT_PLAN.md) — Decision matrix 8D para crate-a-crate
+- [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) — **Status autoritativo atual** (testes verificados localmente, R4a/R4b/R4c done, próxima fase recomendada).
+- [`behavior-freeze/docs/INVENTORY.md`](behavior-freeze/docs/INVENTORY.md) — Inventário P0/P1/P2 (estável, fatos por crate).
+- [`behavior-freeze/docs/HOMEBREW_PLAN.md`](behavior-freeze/docs/HOMEBREW_PLAN.md) — Plano para validação diferencial vs RPCS3 com homebrew real (P1+P5 ainda bloqueados).
+- [`historico/pre-r4b-2026-04-25/`](historico/pre-r4b-2026-04-25/) — Snapshots históricos completos dos docs antes da limpeza. Inclui `CURRENT_STATE.md`, `CHECKLIST.md`, `ROADMAP.md`, `PORT_PLAN.md`, `AUTONOMOUS_LOG.md` (versão completa com 230+ iters), `SPU_RECOMPILER_PLAN.md`, frozen snapshots `*_2026-04-24.md`, e arquivos `.bak` originais.
+- `behavior-freeze/docs/AUTONOMOUS_LOG.md` e `behavior-freeze/docs/SPU_RECOMPILER_PLAN.md` — mantidos no caminho original como stubs porque hook do Claude Code (Stop/SessionStart) e doc-comment do Rust source (`rust/rpcs3-spu-recompiler/src/lib.rs`) dependem do path exato. Conteúdo completo está em `historico/`.
 
 ## Licença
 
@@ -148,4 +181,8 @@ GPL-2.0-only — mesma licença do RPCS3 upstream.
 
 ## Co-autoria
 
-Este port foi desenvolvido em sessões assistidas por Claude (Anthropic), com 229 iterações autônomas consecutivas em ZERO regressões. Decisões arquiteturais, validação byte-exata e testes finais sob supervisão humana.
+Este port foi desenvolvido em sessões assistidas por Claude (Anthropic),
+com mais de 230 iterações autônomas consecutivas em ZERO regressões pela
+wave behavior-freeze. Decisões arquiteturais, validação byte-exata e
+testes finais sob supervisão humana. Para a contagem exata e o status
+mais recente, ver [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md).

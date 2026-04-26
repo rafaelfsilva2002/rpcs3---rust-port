@@ -1,0 +1,28 @@
+[package]
+name = "rpcs3-spu-recompiler"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Scaffold for the SPU recompiler. Currently exposes a `RecompilerExecutor` that delegates to the interpreter; the Cranelift-backed JIT lands in Phase R2 of SPU_RECOMPILER_PLAN.md once a backend is approved."
+
+[lib]
+name = "rpcs3_spu_recompiler"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-spu-decoder = { path = "../rpcs3-spu-decoder" }
+rpcs3-spu-differential = { path = "../rpcs3-spu-differential" }
+
+# Cranelift JIT — pure-Rust assembler + register allocator.
+# Chosen over LLVM/inkwell per SPU_RECOMPILER_PLAN.md D1: easier
+# Windows MSVC integration, no external toolchain.
+cranelift = "0.118"
+cranelift-jit = "0.118"
+cranelift-module = "0.118"
+cranelift-native = "0.118"
+target-lexicon = "0.13"
+
+[lints]
+workspace = true
