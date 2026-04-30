@@ -37,6 +37,35 @@
 # Local tooling state (not part of repo)
 /.claude/
 /.serena/
+**/.claude/
+**/.serena/
+**/*.local.json
+
+# Python bytecode (never tracked)
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Local backup files (never tracked)
+*.bak
+*.bak-*
+
+# PS3 firmware / commercial blobs (never tracked — sourced separately by users)
+*.PUP
+*.pup
+
+# Behavior-freeze SPU homebrew build artifacts.
+# CC0 sources + Makefile + capture script are tracked under
+# behavior-freeze/fixtures/spu/sources/<homebrew>/; binary outputs
+# (`*.elf`, `*.self`, intermediate `.bin`/`.s`/`.o`) are reproducible
+# via `make` and stay untracked. The captured trace + `.spuimg`
+# side-file under behavior-freeze/fixtures/spu/{traces,images}/ ARE
+# the load-bearing artifacts and DO get committed.
+behavior-freeze/fixtures/spu/sources/*/build/
+behavior-freeze/fixtures/spu/sources/*/spu/*.elf
+behavior-freeze/fixtures/spu/sources/*/*_bin.s
+behavior-freeze/fixtures/spu/sources/*/*_bin.o
+behavior-freeze/fixtures/spu/sources/*/*.bin
 
 # =============================================================================
 # Original upstream .gitignore patterns below

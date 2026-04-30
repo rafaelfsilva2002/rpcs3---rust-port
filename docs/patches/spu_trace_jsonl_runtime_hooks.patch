@@ -1,0 +1,354 @@
+diff --git a/rpcs3/Emu/Cell/RawSPUThread.cpp b/rpcs3/Emu/Cell/RawSPUThread.cpp
+index 81bb6fd89..5c05315f6 100644
+--- a/rpcs3/Emu/Cell/RawSPUThread.cpp
++++ b/rpcs3/Emu/Cell/RawSPUThread.cpp
+@@ -4,6 +4,7 @@
+ #include "util/asm.hpp"
+ 
+ #include "SPUThread.h"
++#include "SPUTraceJsonl.h"
+ 
+ inline void try_start(spu_thread& spu)
+ {
+@@ -144,7 +145,25 @@ bool spu_thread::read_reg(const u32 addr, u32& value)
+ 
+ 	case SPU_Out_MBox_offs:
+ 	{
++		// R5.8 A.3 trace hook: capture pre-pop count to distinguish a real
++		// value pop from an empty-mbox pop (which returns 0 by RPCS3 convention).
++		// get_count() is non-destructive (atomic read on count atomic), the
++		// same pattern used in set_ch_value's stall check. No extra pop —
++		// we reuse the existing `value` from the unchanged ch_out_mbox.pop()
++		// call below. Race between get_count and pop is documented and
++		// considered acceptable for first-pass capture (window is tiny and
++		// would only affect the empty-vs-Some discrimination, never the
++		// numeric value reported).
++		const bool trace_had_value_o = ch_out_mbox.get_count() > 0;
+ 		value = ch_out_mbox.pop();
++		{
++			auto& tracer = rpcs3::spu_trace::TraceWriter::instance();
++			if (tracer.enabled())
++			{
++				tracer.record_ppu_pop_outmbox(lv2_id,
++					trace_had_value_o ? std::optional<u32>(value) : std::nullopt);
++			}
++		}
+ 		return true;
+ 	}
+ 
+diff --git a/rpcs3/Emu/Cell/SPUThread.cpp b/rpcs3/Emu/Cell/SPUThread.cpp
+index 855d95a44..956165e33 100644
+--- a/rpcs3/Emu/Cell/SPUThread.cpp
++++ b/rpcs3/Emu/Cell/SPUThread.cpp
+@@ -21,6 +21,7 @@
+ #include "Emu/Cell/SPUAnalyser.h"
+ #include "Emu/Cell/SPUThread.h"
+ #include "Emu/Cell/SPURecompiler.h"
++#include "Emu/Cell/SPUTraceJsonl.h"
+ #include "Emu/Cell/timers.hpp"
+ 
+ #include "Emu/RSX/Core/RSXReservationLock.hpp"
+@@ -1446,6 +1447,54 @@ void spu_thread::cpu_task()
+ #endif
+ 	start_time = 0;
+ 
++	// R5.8 A.3 trace hook: emit final_state on any normal scope exit
++	// from cpu_task (return or unwind). Best-effort, swallows exceptions
++	// so the trace writer cannot perturb SPU shutdown behavior.
++	// Edge case (per docs): force-exit paths that bypass cpu_task return
++	// will not fire this guard. That's acceptable for the first capture pass.
++	struct TraceFinalGuard
++	{
++		spu_thread* spu;
++		~TraceFinalGuard()
++		{
++			try
++			{
++				auto& tracer = rpcs3::spu_trace::TraceWriter::instance();
++				if (!tracer.enabled()) return;
++
++				// Capture all non-zero lane-0 GPRs. Per RPCS3 little-endian
++				// layout, SPU lane-0 (preferred slot) maps to v128::_u32[3].
++				std::vector<rpcs3::spu_trace::GprEntry> gprs;
++				gprs.reserve(8);
++				for (u32 reg = 0; reg < 128; ++reg)
++				{
++					const u32 lane0 = spu->gpr[reg]._u32[3];
++					if (lane0 != 0)
++					{
++						gprs.push_back({reg, lane0});
++					}
++				}
++
++				rpcs3::spu_trace::ChannelsSnapshot ch{};
++				// in_mbox is spu_channel_4_t (4-deep queue) which exposes
++				// only destructive try_pop()/pop() — no non-destructive peek.
++				// Per "do not pop extra just to log" rule, omit value here;
++				// count-only signal is preserved by the schema's optional<u32>.
++				ch.in_mbox       = std::nullopt;
++				ch.out_mbox      = spu->ch_out_mbox.get_count()      ? std::optional<u32>(spu->ch_out_mbox.get_value())      : std::nullopt;
++				ch.out_intr_mbox = spu->ch_out_intr_mbox.get_count() ? std::optional<u32>(spu->ch_out_intr_mbox.get_value()) : std::nullopt;
++				ch.snr1 = spu->ch_snr1.get_count() ? spu->ch_snr1.get_value() : 0;
++				ch.snr2 = spu->ch_snr2.get_count() ? spu->ch_snr2.get_value() : 0;
++
++				tracer.record_final_state(spu->lv2_id, gprs, ch);
++			}
++			catch (...)
++			{
++				// Best-effort. Never propagate from a destructor.
++			}
++		}
++	} _trace_final_guard{this};
++
+ 	// Get next PC and SPU Interrupt status
+ 	pc = status_npc.load().npc;
+ 
+@@ -1455,3 +1504,17 @@ void spu_thread::cpu_task()
+ 	pc &= 0x3fffc;
+ 
++	// R5.9e.3 trace hook: emit spu_image once per SPU thread at thread entry,
++	// AFTER pc &= 0x3fffc strips the status/interrupt bit so entry_pc is the
++	// raw instruction address. Writer dedupes per target_spu so re-entries
++	// of cpu_task (pause/resume) are no-ops; the SPU's image is captured
++	// exactly once per trace session.
++	{
++		auto& tracer = rpcs3::spu_trace::TraceWriter::instance();
++		if (tracer.enabled())
++		{
++			tracer.record_spu_image(lv2_id, ls, SPU_LS_SIZE,
++				/*load_addr=*/0u, /*entry_pc=*/pc);
++		}
++	}
++
+ 	std::fesetround(FE_TOWARDZERO);
+@@ -5289,19 +5352,23 @@ u32 spu_thread::get_ch_count(u32 ch)
+ {
+ 	if (ch < 128) spu_log.trace("get_ch_count(ch=%s)", spu_ch_name[ch]);
+ 
++	// R5.8 A.3 trace hook: structural rewrite with single result accumulator
++	// to enable a single record_spu_rchcnt emission. No semantic change to
++	// the existing per-channel count expressions.
++	u32 result;
+ 	switch (ch)
+ 	{
+-	case SPU_WrOutMbox:       return ch_out_mbox.get_count() ^ 1;
+-	case SPU_WrOutIntrMbox:   return ch_out_intr_mbox.get_count() ^ 1;
+-	case SPU_RdInMbox:        return ch_in_mbox.get_count();
+-	case MFC_RdTagStat:       return ch_tag_stat.get_count();
+-	case MFC_RdListStallStat: return ch_stall_stat.get_count();
+-	case MFC_WrTagUpdate:     return 1;
+-	case SPU_RdSigNotify1:    return ch_snr1.get_count();
+-	case SPU_RdSigNotify2:    return ch_snr2.get_count();
+-	case MFC_RdAtomicStat:    return ch_atomic_stat.get_count();
+-	case SPU_RdEventStat:     return static_cast<u32>(get_events().count);
+-	case MFC_Cmd:             return 16 - mfc_size;
++	case SPU_WrOutMbox:       result = ch_out_mbox.get_count() ^ 1;          break;
++	case SPU_WrOutIntrMbox:   result = ch_out_intr_mbox.get_count() ^ 1;     break;
++	case SPU_RdInMbox:        result = ch_in_mbox.get_count();               break;
++	case MFC_RdTagStat:       result = ch_tag_stat.get_count();              break;
++	case MFC_RdListStallStat: result = ch_stall_stat.get_count();            break;
++	case MFC_WrTagUpdate:     result = 1;                                    break;
++	case SPU_RdSigNotify1:    result = ch_snr1.get_count();                  break;
++	case SPU_RdSigNotify2:    result = ch_snr2.get_count();                  break;
++	case MFC_RdAtomicStat:    result = ch_atomic_stat.get_count();           break;
++	case SPU_RdEventStat:     result = static_cast<u32>(get_events().count); break;
++	case MFC_Cmd:             result = 16 - mfc_size;                        break;
+ 
+ 	// Channels with a constant count of 1:
+ 	case SPU_WrEventMask:
+@@ -5323,23 +5390,52 @@ u32 spu_thread::get_ch_count(u32 ch)
+ 	case MFC_TagID:
+ 	case MFC_WrTagMask:
+ 	case MFC_WrListStallAck:
+-		return 1;
+-	default: break;
++		result = 1;
++		break;
++	default:
++		ensure(ch < 128u);
++		spu_log.error("Unknown/illegal channel in RCHCNT (ch=%s)", spu_ch_name[ch]);
++		return 0; // Default count, no trace emit for invalid channels.
+ 	}
+ 
+-	ensure(ch < 128u);
+-	spu_log.error("Unknown/illegal channel in RCHCNT (ch=%s)", spu_ch_name[ch]);
+-	return 0; // Default count
++	{
++		auto& tracer = rpcs3::spu_trace::TraceWriter::instance();
++		if (tracer.enabled())
++		{
++			tracer.record_spu_rchcnt(lv2_id, pc, ch, result);
++		}
++	}
++	return result;
+ }
+ 
+ s64 spu_thread::get_ch_value(u32 ch)
+ {
+ 	if (ch < 128) spu_log.trace("get_ch_value(ch=%s)", spu_ch_name[ch]);
+ 
++	// R5.8 A.3 trace hook: capture pre-state for park decision so the
++	// stall/wake/value triple can be emitted in order. Variables are local
++	// to the read_channel lambda's outer scope so they survive the lambda
++	// invocation. PC is snapshotted at entry — the channel op is logically
++	// at the current PC even though pop_wait may unwind state internally.
++	// R5.9c also snapshots `lv2_id` as `trace_target_spu` so every
++	// per-SPU recorder call inside the lambda passes the same SPU id.
++	auto& trace_tracer = rpcs3::spu_trace::TraceWriter::instance();
++	const u32 trace_pc = pc;
++	const u32 trace_target_spu = lv2_id;
++	bool trace_did_stall = false;
++
+ 	auto read_channel = [&](spu_channel& channel) -> s64
+ 	{
+-		if (channel.get_count() == 0)
++		const bool empty_at_entry = channel.get_count() == 0;
++		if (empty_at_entry)
+ 		{
++			if (trace_tracer.enabled())
++			{
++				trace_tracer.record_spu_rdch(trace_target_spu, trace_pc, ch, std::nullopt, /*would_stall=*/true);
++				trace_tracer.record_spu_park(trace_target_spu, trace_pc,
++					rpcs3::spu_trace::ParkReason::ChannelRead, ch, std::nullopt);
++				trace_did_stall = true;
++			}
+ 			state += cpu_flag::wait + cpu_flag::temp;
+ 		}
+ 
+@@ -5358,6 +5454,21 @@ s64 spu_thread::get_ch_value(u32 ch)
+ 			wakeup_delay();
+ 		}
+ 
++		// After pop_wait returns, if we had stalled we are now resumed.
++		// Emit wake + rdch (would_stall=false) only when read truly completed.
++		// pop_wait may return error sentinel via high bits of the s64; for
++		// the first-pass capture we record the truncated u32 value — the
++		// Rust transformer sees the trace as observed.
++		if (trace_tracer.enabled())
++		{
++			if (trace_did_stall)
++			{
++				trace_tracer.record_spu_wake(trace_target_spu, trace_pc);
++			}
++			trace_tracer.record_spu_rdch(trace_target_spu, trace_pc, ch,
++				static_cast<u32>(out), /*would_stall=*/false);
++		}
++
+ 		static_cast<void>(test_stopped());
+ 		return out;
+ 	};
+@@ -6167,6 +6278,25 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
+ 
+ 	case SPU_WrOutMbox:
+ 	{
++		// R5.8 A.3 trace hook: capture wrch + park decision at entry.
++		// would_stall is checked at entry; if push_wait then doesn't stall
++		// (e.g., mfc drains the mbox first) the trace still emits a balanced
++		// park/wake pair around the committed write. Acceptable imprecision
++		// for the first capture pass.
++		auto& trace_tracer_w = rpcs3::spu_trace::TraceWriter::instance();
++		const u32 trace_pc_w = pc;
++		const u32 trace_target_spu_w = lv2_id;
++		const bool trace_would_stall_w = ch_out_mbox.get_count() != 0;
++		if (trace_tracer_w.enabled())
++		{
++			trace_tracer_w.record_spu_wrch(trace_target_spu_w, trace_pc_w, ch, value, trace_would_stall_w);
++			if (trace_would_stall_w)
++			{
++				trace_tracer_w.record_spu_park(trace_target_spu_w, trace_pc_w,
++					rpcs3::spu_trace::ParkReason::ChannelWrite, ch, std::nullopt);
++			}
++		}
++
+ 		if (state & cpu_flag::pending)
+ 		{
+ 			do_mfc();
+@@ -6182,6 +6312,26 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
+ 			return false;
+ 		}
+ 
++		// Push committed. Emit wake + wrch(would_stall=false) if we logged a stall.
++		if (trace_tracer_w.enabled())
++		{
++			if (trace_would_stall_w)
++			{
++				trace_tracer_w.record_spu_wake(trace_target_spu_w, trace_pc_w);
++			}
++			// Always emit the post-commit observation; if we did not log
++			// would_stall=true above, this is the only wrch event emitted.
++			if (!trace_would_stall_w)
++			{
++				// (Already emitted at entry with would_stall=false; skip
++				//  duplicate emit.)
++			}
++			else
++			{
++				trace_tracer_w.record_spu_wrch(trace_target_spu_w, trace_pc_w, ch, value, /*would_stall=*/false);
++			}
++		}
++
+ 		check_state();
+ 		return true;
+ 	}
+@@ -6432,6 +6582,15 @@ bool spu_thread::stop_and_signal(u32 code)
+ {
+ 	spu_log.trace("stop_and_signal(code=0x%x)", code);
+ 
++	// R5.8 A.3 trace hook: emit spu_stop. Best-effort, gated by env var.
++	{
++		auto& tracer = rpcs3::spu_trace::TraceWriter::instance();
++		if (tracer.enabled())
++		{
++			tracer.record_spu_stop(lv2_id, pc, code);
++		}
++	}
++
+ 	auto set_status_npc = [&]()
+ 	{
+ 		status_npc.atomic_op([&](status_npc_sync_var& state)
+diff --git a/rpcs3/Emu/Cell/lv2/sys_spu.cpp b/rpcs3/Emu/Cell/lv2/sys_spu.cpp
+index 263d87120..68cda38eb 100644
+--- a/rpcs3/Emu/Cell/lv2/sys_spu.cpp
++++ b/rpcs3/Emu/Cell/lv2/sys_spu.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include "Emu/Cell/ErrorCodes.h"
+ #include "Emu/Cell/PPUThread.h"
++#include "Emu/Cell/SPUTraceJsonl.h"
+ #include "Emu/Cell/timers.hpp"
+ #include "Emu/Memory/vm_reservation.h"
+ #include "sys_interrupt.h"
+@@ -1962,6 +1963,16 @@ error_code sys_spu_thread_write_spu_mb(ppu_thread& ppu, u32 id, u32 value)
+ 		return {};
+ 	}
+ 
++	// R5.8 A.3 trace hook: PPU pushed value into target SPU's in_mbox.
++	// Emitted only after op_done — push is committed to the channel.
++	{
++		auto& tracer = rpcs3::spu_trace::TraceWriter::instance();
++		if (tracer.enabled())
++		{
++			tracer.record_ppu_push_inmbox(id, value);
++		}
++	}
++
+ 	if (state.notify)
+ 	{
+ 		thread->ch_in_mbox.notify();
+@@ -2032,6 +2043,16 @@ error_code sys_spu_thread_write_snr(ppu_thread& ppu, u32 id, u32 number, u32 val
+ 
+ 	thread->push_snr(number, value);
+ 
++	// R5.8 A.3 trace hook: PPU wrote SNR slot. number is 0 (SNR1) or 1 (SNR2)
++	// per the early-return guard above.
++	{
++		auto& tracer = rpcs3::spu_trace::TraceWriter::instance();
++		if (tracer.enabled())
++		{
++			tracer.record_ppu_signal(id, number, value);
++		}
++	}
++
+ 	return CELL_OK;
+ }
+ 

@@ -1,0 +1,851 @@
+diff --git a/rpcs3/Emu/CMakeLists.txt b/rpcs3/Emu/CMakeLists.txt
+index f863a2b91..129199900 100644
+--- a/rpcs3/Emu/CMakeLists.txt
++++ b/rpcs3/Emu/CMakeLists.txt
+@@ -184,6 +184,9 @@ target_sources(rpcs3_emu PRIVATE
+     Cell/SPUCommonRecompiler.cpp
+     Cell/SPULLVMRecompiler.cpp
+     Cell/SPUThread.cpp
++    # R5.8 A.3 — SPU trace JSONL writer scaffolding (gated, disabled by default).
++    # See docs/SPU_TRACE_CAPTURE_RUNTIME_HOOKS.md for runtime-hook integration.
++    Cell/SPUTraceJsonl.cpp
+     Cell/lv2/lv2.cpp
+     Cell/lv2/sys_bdemu.cpp
+     Cell/lv2/sys_btsetting.cpp
+diff --git a/rpcs3/Emu/Cell/SPUTraceJsonl.cpp b/rpcs3/Emu/Cell/SPUTraceJsonl.cpp
+new file mode 100644
+index 000000000..21027ec65
+--- /dev/null
++++ b/rpcs3/Emu/Cell/SPUTraceJsonl.cpp
+@@ -0,0 +1,553 @@
++#include "stdafx.h"
++
++// R5.8 A.3 — SPU PPU↔SPU trace JSONL writer (impl).
++//
++// See SPUTraceJsonl.h for the public surface and `docs/SPU_TRACE_CAPTURE.md`
++// for the wire format. This translation unit is self-contained — it
++// has zero dependencies on RPCS3-internal types and could compile
++// standalone given a host with C++17 + the standard library.
++
++#include "SPUTraceJsonl.h"
++#include "Crypto/sha256.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++#include <sstream>
++#include <iomanip>
++#include <string>
++#include <system_error>
++#include <filesystem>
++
++namespace rpcs3::spu_trace {
++
++// =====================================================================
++// Singleton lifecycle
++// =====================================================================
++
++TraceWriter& TraceWriter::instance()
++{
++	static TraceWriter inst;
++	return inst;
++}
++
++TraceWriter::TraceWriter()
++{
++	const char* path = std::getenv("RPCS3_SPU_TRACE_JSONL");
++	if (!path || path[0] == '\0')
++	{
++		// Disabled — every emit is a fast atomic-load short-circuit.
++		return;
++	}
++	m_file.open(path, std::ios::out | std::ios::trunc);
++	if (!m_file.is_open())
++	{
++		std::fprintf(stderr,
++			"[spu_trace] failed to open '%s' for writing — capture disabled\n",
++			path);
++		return;
++	}
++	// R5.9e.3 — record the trace path so `record_spu_image` can derive
++	// the side-file directory `<m_trace_path>.images/`. Only set when
++	// the writer is being enabled — the empty default disables side-
++	// file emission as a safety fallback.
++	m_trace_path.assign(path);
++	m_enabled.store(true, std::memory_order_release);
++	std::fprintf(stderr, "[spu_trace] capture enabled, output: %s\n", path);
++}
++
++TraceWriter::~TraceWriter()
++{
++	if (m_file.is_open())
++	{
++		m_file.flush();
++		m_file.close();
++	}
++}
++
++std::uint64_t TraceWriter::next_seq() noexcept
++{
++	return m_seq.fetch_add(1, std::memory_order_relaxed);
++}
++
++void TraceWriter::emit_line(std::string_view line)
++{
++	// Caller MUST hold m_write_mutex. The lock guards seq allocation,
++	// JSON formatting, and the actual write as a single critical section
++	// so on-disk line order matches seq allocation order. The original
++	// implementation took the lock here (after seq was already allocated
++	// in the caller's local scope) which allowed thread interleaving:
++	// thread A could allocate seq=N, thread B allocate seq=N+1, B reach
++	// the lock first and write seq=N+1, then A write seq=N — producing
++	// non-monotonic JSONL the Rust parser correctly rejected with
++	// `NonMonotonicSeq`. Locking the entire seq+format+write triple in
++	// the caller fixes the race.
++	if (!m_file.is_open())
++	{
++		return;
++	}
++	m_file.write(line.data(), static_cast<std::streamsize>(line.size()));
++	m_file.put('\n');
++	// No flush per line — OS buffer flushes on close. If the process
++	// crashes before exit the trace is truncated; that is acceptable
++	// because such a capture is uninteresting (the homebrew didn't
++	// reach final_state). For sync-flush, change to `m_file.flush();`.
++}
++
++// =====================================================================
++// JSON formatting helpers
++// =====================================================================
++//
++// Hand-rolled minimal serializer to avoid adding a JSON dep. The schema
++// only emits flat objects with primitive fields and a single nested
++// object (`channels` / `channels_at_park`) plus one array of small
++// objects (`gpr_lane_zero`). Fields are written in a stable order so
++// identical event content produces identical bytes — critical for diff
++// stability.
++
++namespace {
++
++void append_u32(std::ostringstream& os, std::uint32_t v) { os << v; }
++void append_u64(std::ostringstream& os, std::uint64_t v) { os << v; }
++
++void append_optional_u32(std::ostringstream& os, const std::optional<std::uint32_t>& v)
++{
++	if (v.has_value())
++	{
++		os << *v;
++	}
++	else
++	{
++		os << "null";
++	}
++}
++
++void append_bool(std::ostringstream& os, bool v) { os << (v ? "true" : "false"); }
++
++void append_channels(std::ostringstream& os, const ChannelsSnapshot& c)
++{
++	os << "{\"in_mbox\":";
++	append_optional_u32(os, c.in_mbox);
++	os << ",\"out_mbox\":";
++	append_optional_u32(os, c.out_mbox);
++	os << ",\"out_intr_mbox\":";
++	append_optional_u32(os, c.out_intr_mbox);
++	os << ",\"snr1\":";
++	append_u32(os, c.snr1);
++	os << ",\"snr2\":";
++	append_u32(os, c.snr2);
++	os << "}";
++}
++
++const char* park_reason_str(ParkReason r) noexcept
++{
++	return r == ParkReason::ChannelRead ? "channel_read" : "channel_write";
++}
++
++// Writes `"seq":<n>,"side":"<spu|ppu>","kind":"<kind>"` (no trailing
++// comma, no surrounding braces). Caller appends event-specific fields
++// then `}`.
++void start_event(std::ostringstream& os, std::uint64_t seq, bool spu_side,
++	std::string_view kind)
++{
++	os << "{\"seq\":" << seq
++	   << ",\"side\":\"" << (spu_side ? "spu" : "ppu") << '"'
++	   << ",\"kind\":\"" << kind << '"';
++}
++
++} // anonymous namespace
++
++// =====================================================================
++// SPU-side recorders
++// =====================================================================
++
++void TraceWriter::record_spu_rdch(std::uint32_t target_spu, std::uint32_t pc, std::uint32_t channel,
++	std::optional<std::uint32_t> value, bool would_stall)
++{
++	if (!enabled()) return;
++	std::lock_guard<std::mutex> lk(m_write_mutex);
++	const auto seq = next_seq();
++	std::ostringstream os;
++	start_event(os, seq, true, "spu_rdch");
++	os << ",\"target_spu\":"; append_u32(os, target_spu);
++	os << ",\"pc\":";       append_u32(os, pc);
++	os << ",\"channel\":";  append_u32(os, channel);
++	os << ",\"value\":";    append_optional_u32(os, value);
++	os << ",\"would_stall\":"; append_bool(os, would_stall);
++	os << "}";
++	emit_line(os.str());
++}
++
++void TraceWriter::record_spu_wrch(std::uint32_t target_spu, std::uint32_t pc, std::uint32_t channel,
++	std::uint32_t value, bool would_stall)
++{
++	if (!enabled()) return;
++	std::lock_guard<std::mutex> lk(m_write_mutex);
++	const auto seq = next_seq();
++	std::ostringstream os;
++	start_event(os, seq, true, "spu_wrch");
++	os << ",\"target_spu\":"; append_u32(os, target_spu);
++	os << ",\"pc\":";       append_u32(os, pc);
++	os << ",\"channel\":";  append_u32(os, channel);
++	os << ",\"value\":";    append_u32(os, value);
++	os << ",\"would_stall\":"; append_bool(os, would_stall);
++	os << "}";
++	emit_line(os.str());
++}
++
++void TraceWriter::record_spu_rchcnt(std::uint32_t target_spu, std::uint32_t pc, std::uint32_t channel, std::uint32_t count)
++{
++	if (!enabled()) return;
++	std::lock_guard<std::mutex> lk(m_write_mutex);
++	const auto seq = next_seq();
++	std::ostringstream os;
++	start_event(os, seq, true, "spu_rchcnt");
++	os << ",\"target_spu\":"; append_u32(os, target_spu);
++	os << ",\"pc\":";      append_u32(os, pc);
++	os << ",\"channel\":"; append_u32(os, channel);
++	os << ",\"count\":";   append_u32(os, count);
++	os << "}";
++	emit_line(os.str());
++}
++
++void TraceWriter::record_spu_park(std::uint32_t target_spu, std::uint32_t pc, ParkReason reason, std::uint32_t channel,
++	const std::optional<ChannelsSnapshot>& channels)
++{
++	if (!enabled()) return;
++	std::lock_guard<std::mutex> lk(m_write_mutex);
++	const auto seq = next_seq();
++	std::ostringstream os;
++	start_event(os, seq, true, "spu_park");
++	os << ",\"target_spu\":"; append_u32(os, target_spu);
++	os << ",\"pc\":";      append_u32(os, pc);
++	os << ",\"reason\":\"" << park_reason_str(reason) << '"';
++	os << ",\"channel\":"; append_u32(os, channel);
++	if (channels.has_value())
++	{
++		os << ",\"channels_at_park\":";
++		append_channels(os, *channels);
++	}
++	os << "}";
++	emit_line(os.str());
++}
++
++void TraceWriter::record_spu_wake(std::uint32_t target_spu, std::uint32_t pc)
++{
++	if (!enabled()) return;
++	std::lock_guard<std::mutex> lk(m_write_mutex);
++	const auto seq = next_seq();
++	std::ostringstream os;
++	start_event(os, seq, true, "spu_wake");
++	os << ",\"target_spu\":"; append_u32(os, target_spu);
++	os << ",\"pc\":"; append_u32(os, pc);
++	os << "}";
++	emit_line(os.str());
++}
++
++void TraceWriter::record_spu_stop(std::uint32_t target_spu, std::uint32_t pc, std::uint32_t stop_code)
++{
++	if (!enabled()) return;
++	std::lock_guard<std::mutex> lk(m_write_mutex);
++	const auto seq = next_seq();
++	std::ostringstream os;
++	start_event(os, seq, true, "spu_stop");
++	os << ",\"target_spu\":"; append_u32(os, target_spu);
++	os << ",\"pc\":";        append_u32(os, pc);
++	os << ",\"stop_code\":"; append_u32(os, stop_code);
++	os << "}";
++	emit_line(os.str());
++}
++
++void TraceWriter::record_final_state(std::uint32_t target_spu, const std::vector<GprEntry>& gprs,
++	const ChannelsSnapshot& channels)
++{
++	if (!enabled()) return;
++	std::lock_guard<std::mutex> lk(m_write_mutex);
++	const auto seq = next_seq();
++	std::ostringstream os;
++	start_event(os, seq, true, "final_state");
++	os << ",\"target_spu\":"; append_u32(os, target_spu);
++	os << ",\"gpr_lane_zero\":[";
++	for (std::size_t i = 0; i < gprs.size(); ++i)
++	{
++		if (i > 0) os << ',';
++		os << "{\"reg\":";    append_u32(os, gprs[i].reg);
++		os << ",\"value\":";  append_u32(os, gprs[i].value);
++		os << "}";
++	}
++	os << "],\"channels\":";
++	append_channels(os, channels);
++	os << "}";
++	emit_line(os.str());
++}
++
++// R5.9e.3 — Capture the SPU's local-store image at thread entry, write a
++// content-addressed side-file, and emit a metadata-only JSONL event.
++// Per-target_spu dedup keeps the emit single-shot even on re-entered
++// `cpu_task`. Bytes are NEVER inlined in the JSONL.
++void TraceWriter::record_spu_image(std::uint32_t target_spu, const std::uint8_t* ls_bytes,
++	std::uint32_t size, std::uint32_t load_addr, std::uint32_t entry_pc)
++{
++	if (!enabled()) return;
++	if (!ls_bytes || size == 0)
++	{
++		// Defensive — caller error; would produce a zero-byte file
++		// hashing to a known well-formed sha but with no content.
++		// Drop the emit rather than corrupt the trace.
++		std::fprintf(stderr,
++			"[spu_trace] record_spu_image dropped: ls_bytes=%p, size=%u\n",
++			static_cast<const void*>(ls_bytes), size);
++		return;
++	}
++
++	// Snapshot the LS bytes BEFORE taking the lock or computing the
++	// hash. The SPU may not yet be running (the documented contract),
++	// but a concurrent PPU-side DMA could in principle modify LS during
++	// the capture window. A local copy gives a stable view for both
++	// the SHA and the side-file write.
++	std::vector<std::uint8_t> snapshot(ls_bytes, ls_bytes + size);
++
++	// Compute SHA-256 of the snapshot. mbedtls is already linked into
++	// emucore (rpcs3/Crypto/sha256.cpp); using the existing utility
++	// avoids a bundled SHA implementation in this TU.
++	unsigned char hash[32];
++	if (mbedtls_sha256_ret(snapshot.data(), snapshot.size(), hash, /*is224=*/0) != 0)
++	{
++		std::fprintf(stderr,
++			"[spu_trace] record_spu_image dropped: mbedtls_sha256_ret failed for target_spu=%u\n",
++			target_spu);
++		return;
++	}
++
++	// Convert the 32-byte digest to a 64-char lowercase hex string,
++	// matching the schema's `image_sha256` format (R5.9e.1).
++	static constexpr char hex_chars[] = "0123456789abcdef";
++	char hex[65];
++	for (std::size_t i = 0; i < 32; ++i)
++	{
++		hex[i * 2]     = hex_chars[(hash[i] >> 4) & 0xF];
++		hex[i * 2 + 1] = hex_chars[hash[i] & 0xF];
++	}
++	hex[64] = '\0';
++	std::string sha256_hex(hex, 64);
++
++	std::lock_guard<std::mutex> lk(m_write_mutex);
++
++	// Per-target_spu dedup pre-check: if this SPU already had a
++	// successful spu_image emit, the second invocation is a no-op.
++	// We only INSERT into the dedup set AFTER the side-file write
++	// succeeds — a failed write must not block a future retry.
++	if (m_emitted_images.find(target_spu) != m_emitted_images.end())
++	{
++		return;
++	}
++
++	// R5.9e.3-fix — Side-file write MUST succeed BEFORE the JSONL
++	// emit. The v4 bug was: the side-file write silently failed (no
++	// `<trace>.images/` directory created), but the JSONL `spu_image`
++	// event was emitted anyway, producing a trace whose
++	// `image_sha256` referenced a non-existent file. The schema
++	// (R5.9e.1 rule 8 — "no silent fallback") forbids this; the
++	// replay engine would later fail with `ImageFileMissing`. The
++	// fix bails out of the entire `record_spu_image` call when the
++	// write fails — neither the JSONL line nor the dedup-set
++	// insertion happen, so a subsequent call (e.g., from a re-
++	// entered `cpu_task`) gets to retry.
++	if (!write_image_side_file(sha256_hex, snapshot.data(), size))
++	{
++		std::fprintf(stderr,
++			"[spu_trace] record_spu_image dropped for target_spu=%u: side-file "
++			"write failed; JSONL spu_image NOT emitted (per R5.9e.1 rule 8)\n",
++			target_spu);
++		return;
++	}
++
++	// Side-file is on disk with the correct size. Now mark the SPU
++	// as emitted (so future calls dedup) AND emit the JSONL line.
++	m_emitted_images.insert(target_spu);
++
++	const auto seq = next_seq();
++	std::ostringstream os;
++	start_event(os, seq, true, "spu_image");
++	os << ",\"target_spu\":";   append_u32(os, target_spu);
++	os << ",\"image_sha256\":\"" << sha256_hex << '"';
++	os << ",\"load_addr\":";    append_u32(os, load_addr);
++	os << ",\"size\":";         append_u32(os, size);
++	os << ",\"entry_pc\":";     append_u32(os, entry_pc);
++	os << "}";
++	emit_line(os.str());
++}
++
++// R5.9e.3-fix — Returns true iff the side-file is on disk with the
++// expected size after the call. False on any failure path; caller
++// (`record_spu_image`) refuses to emit the JSONL line in that case
++// so the trace never references a missing/short file.
++bool TraceWriter::write_image_side_file(const std::string& sha256_hex,
++	const std::uint8_t* bytes, std::uint32_t size)
++{
++	if (m_trace_path.empty())
++	{
++		// Should never happen — the writer is only enabled when the
++		// constructor successfully captured the env var. Defensive.
++		std::fprintf(stderr,
++			"[spu_trace] write_image_side_file: m_trace_path is empty (writer state inconsistent)\n");
++		return false;
++	}
++
++	namespace fs = std::filesystem;
++	std::error_code ec;
++
++	// Side-file directory: `<trace_path>.images/`. Create on demand.
++	// `create_directories` returns true if it created anything new
++	// AND `ec` is unset; returns false (no-error) if the directory
++	// already exists; sets `ec` on permission/path failures. We treat
++	// "ec set" as failure, regardless of return value.
++	const fs::path images_dir = fs::path(m_trace_path).concat(".images");
++	fs::create_directories(images_dir, ec);
++	if (ec)
++	{
++		std::fprintf(stderr,
++			"[spu_trace] write_image_side_file: create_directories('%s') failed: %s (errno-equivalent %d)\n",
++			images_dir.string().c_str(), ec.message().c_str(), ec.value());
++		return false;
++	}
++
++	// Sanity: the dir must exist and be a directory after the call.
++	// Defensive against silent no-op + missing directory cases that
++	// might arise on Windows with sandboxed FS access (the v4 bug
++	// symptom).
++	if (!fs::is_directory(images_dir, ec))
++	{
++		std::fprintf(stderr,
++			"[spu_trace] write_image_side_file: '%s' is not a directory after create_directories (ec=%s)\n",
++			images_dir.string().c_str(), ec.message().c_str());
++		return false;
++	}
++
++	const fs::path file_path = images_dir / (sha256_hex + ".spuimg");
++
++	// Content-addressed dedup: if a file with the same SHA-named name
++	// already exists AND its size matches, assume content equality
++	// (SHA-256 is collision-resistant) and skip the rewrite. Returning
++	// true here is the load-bearing claim: "the side-file is on disk
++	// with the expected size".
++	if (fs::exists(file_path, ec))
++	{
++		ec.clear();
++		const auto existing_size = fs::file_size(file_path, ec);
++		if (!ec && existing_size == size)
++		{
++			return true;
++		}
++		// Existing file but size mismatch — overwrite below. Log so
++		// a future debugger can investigate if dedup ever produces
++		// surprising results.
++		std::fprintf(stderr,
++			"[spu_trace] write_image_side_file: '%s' exists with size %llu, expected %u — overwriting\n",
++			file_path.string().c_str(),
++			static_cast<unsigned long long>(existing_size), size);
++	}
++
++	{
++		std::ofstream of(file_path, std::ios::binary | std::ios::trunc);
++		if (!of.is_open())
++		{
++			std::fprintf(stderr,
++				"[spu_trace] write_image_side_file: ofstream open('%s', binary|trunc) failed\n",
++				file_path.string().c_str());
++			return false;
++		}
++		of.write(reinterpret_cast<const char*>(bytes), static_cast<std::streamsize>(size));
++		if (!of.good())
++		{
++			// `tellp()` reports how many bytes the ofstream believed
++			// it wrote before going bad. `gcount()` is istream-only.
++			const auto wrote = static_cast<long long>(of.tellp());
++			std::fprintf(stderr,
++				"[spu_trace] write_image_side_file: short/failed write to '%s' (wrote ~%lld of %u)\n",
++				file_path.string().c_str(), wrote, size);
++			return false;
++		}
++		of.flush();
++		// `of` closes on scope exit. Flush + close before the
++		// post-write size check so the on-disk size is final.
++	}
++
++	// Post-write verification: the file MUST exist with exactly
++	// `size` bytes after the close. This catches Windows quirks where
++	// the write appeared to succeed but the file was truncated by a
++	// concurrent file-system filter (antivirus, sandbox, etc.).
++	ec.clear();
++	const auto final_size = fs::file_size(file_path, ec);
++	if (ec)
++	{
++		std::fprintf(stderr,
++			"[spu_trace] write_image_side_file: post-write file_size('%s') failed: %s\n",
++			file_path.string().c_str(), ec.message().c_str());
++		return false;
++	}
++	if (final_size != size)
++	{
++		std::fprintf(stderr,
++			"[spu_trace] write_image_side_file: post-write size mismatch for '%s': on disk %llu, expected %u\n",
++			file_path.string().c_str(),
++			static_cast<unsigned long long>(final_size), size);
++		return false;
++	}
++
++	return true;
++}
++
++// =====================================================================
++// PPU-side recorders
++// =====================================================================
++
++void TraceWriter::record_ppu_push_inmbox(std::uint32_t target_spu, std::uint32_t value)
++{
++	if (!enabled()) return;
++	std::lock_guard<std::mutex> lk(m_write_mutex);
++	const auto seq = next_seq();
++	std::ostringstream os;
++	start_event(os, seq, false, "ppu_push_inmbox");
++	os << ",\"target_spu\":"; append_u32(os, target_spu);
++	os << ",\"value\":";      append_u32(os, value);
++	os << "}";
++	emit_line(os.str());
++}
++
++void TraceWriter::record_ppu_pop_outmbox(std::uint32_t target_spu, std::optional<std::uint32_t> value)
++{
++	if (!enabled()) return;
++	std::lock_guard<std::mutex> lk(m_write_mutex);
++	const auto seq = next_seq();
++	std::ostringstream os;
++	start_event(os, seq, false, "ppu_pop_outmbox");
++	os << ",\"target_spu\":"; append_u32(os, target_spu);
++	os << ",\"value\":";      append_optional_u32(os, value);
++	os << "}";
++	emit_line(os.str());
++}
++
++void TraceWriter::record_ppu_signal(std::uint32_t target_spu, std::uint32_t slot, std::uint32_t value)
++{
++	if (!enabled()) return;
++	if (slot > 1)
++	{
++		// Defensive — schema requires slot ∈ {0, 1}. Drop the event
++		// rather than emit malformed JSONL the parser would reject.
++		std::fprintf(stderr,
++			"[spu_trace] dropped ppu_signal with invalid slot=%u\n", slot);
++		return;
++	}
++	std::lock_guard<std::mutex> lk(m_write_mutex);
++	const auto seq = next_seq();
++	std::ostringstream os;
++	start_event(os, seq, false, "ppu_signal");
++	os << ",\"target_spu\":"; append_u32(os, target_spu);
++	os << ",\"slot\":";       append_u32(os, slot);
++	os << ",\"value\":";      append_u32(os, value);
++	os << "}";
++	emit_line(os.str());
++}
++
++} // namespace rpcs3::spu_trace
+diff --git a/rpcs3/Emu/Cell/SPUTraceJsonl.h b/rpcs3/Emu/Cell/SPUTraceJsonl.h
+new file mode 100644
+index 000000000..15c45fb93
+--- /dev/null
++++ b/rpcs3/Emu/Cell/SPUTraceJsonl.h
+@@ -0,0 +1,228 @@
++// R5.8 A.3 — SPU PPU↔SPU trace JSONL writer.
++//
++// Self-contained, gated, disabled-by-default trace emitter that produces
++// JSONL events per the schema in `docs/SPU_TRACE_CAPTURE.md`. The
++// resulting trace file feeds the Rust-side `replay_trace` engine
++// (`rpcs3-spu-differential::trace_fmt`) so a captured C++ run can be
++// validated byte-exact against the Rust SPU stack.
++//
++// Activation:
++//   1. Set environment variable `RPCS3_SPU_TRACE_JSONL=/path/to/out.jsonl`
++//      before launching RPCS3.
++//   2. The writer opens the file lazily on the first emit call.
++//   3. When the env var is unset (or empty), every emit is a noinline
++//      atomic-load-and-return-fast path with zero file I/O.
++//
++// Determinism: a single global monotonic `seq` counter (`std::atomic<u64>`)
++// is incremented and bound to the event before serialization. Thread
++// safety: a single mutex serializes the file write so events appear in
++// `seq` order on disk. As of R5.9c, every SPU-side recorder takes a
++// `target_spu` argument (the source SPU's `lv2_id`) and emits it as a
++// `target_spu` field in the JSON line. The Rust-side R5.9a parser
++// validates per-SPU `final_state` terminality using this discriminator;
++// the R5.9b transformer groups events into per-SPU traces. PPU-side
++// recorders already carried `target_spu` (the destination SPU's
++// `lv2_id`); their semantics are unchanged in R5.9c.
++//
++// The writer has zero dependencies on RPCS3-specific types in its public
++// surface — every input is a plain C++ scalar (u32, optional u32, etc.).
++// Integration call sites convert RPCS3 internal state into these scalars
++// before invoking the recorder. See `docs/SPU_TRACE_CAPTURE_PATCH.md`
++// for the integration diffs.
++
++#pragma once
++
++#include <cstdint>
++#include <fstream>
++#include <mutex>
++#include <atomic>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <unordered_set>
++#include <vector>
++
++namespace rpcs3::spu_trace {
++
++// Schema event-kind enum, mirrors the `kind` field in JSONL.
++enum class EventKind {
++	SpuRdch,
++	SpuWrch,
++	SpuRchcnt,
++	SpuPark,
++	SpuWake,
++	SpuStop,
++	FinalState,
++	SpuImage, // R5.9e.1 — SPU local store image metadata (bytes in side-file)
++	PpuPushInmbox,
++	PpuPopOutmbox,
++	PpuSignal,
++};
++
++enum class ParkReason {
++	ChannelRead,
++	ChannelWrite,
++};
++
++// Channel snapshot used by `spu_park` (optional `channels_at_park`)
++// and the terminal `final_state`. Mirrors the Rust-side
++// `CapturedChannels` shape.
++struct ChannelsSnapshot
++{
++	std::optional<std::uint32_t> in_mbox;
++	std::optional<std::uint32_t> out_mbox;
++	std::optional<std::uint32_t> out_intr_mbox;
++	std::uint32_t snr1 = 0;
++	std::uint32_t snr2 = 0;
++};
++
++struct GprEntry
++{
++	std::uint32_t reg;
++	std::uint32_t value;
++};
++
++// Singleton trace writer. `instance()` returns a never-null reference;
++// the underlying writer is enabled iff the env var is set at the time
++// of first call. Subsequent env var changes are NOT picked up — capture
++// is bound at process startup for determinism.
++class TraceWriter
++{
++public:
++	// Returns the singleton. First call reads the env var and opens
++	// the JSONL file if set. Subsequent calls are O(1).
++	static TraceWriter& instance();
++
++	// Whether the writer is enabled (env var set, file opened OK).
++	// Hot-path emit functions short-circuit on this.
++	[[nodiscard]] bool enabled() const noexcept { return m_enabled.load(std::memory_order_relaxed); }
++
++	// === SPU-side recorders ====================================
++	//
++	// R5.9c: every SPU-side recorder takes a `target_spu` argument
++	// (the source SPU's `lv2_id`) as the first parameter. The recorder
++	// emits it as `"target_spu":<u32>` in the JSON line. For legacy
++	// single-SPU traces captured with R5.7/R5.8 writers (where this
++	// field was absent), the Rust R5.9a parser treats absence as
++	// `target_spu = 0` via `#[serde(default)]` — see
++	// `docs/SPU_TRACE_R5_9_MULTISPU_PLAN.md` § A.4.
++
++	// `spu_rdch`: dispatched at channel-read entry. `value` is empty
++	// if the read would stall (no value actually transferred); else
++	// holds the consumed value.
++	void record_spu_rdch(std::uint32_t target_spu, std::uint32_t pc, std::uint32_t channel,
++		std::optional<std::uint32_t> value, bool would_stall);
++
++	// `spu_wrch`: dispatched at channel-write entry. `value` is the
++	// value the SPU attempted to write regardless of stall outcome.
++	void record_spu_wrch(std::uint32_t target_spu, std::uint32_t pc, std::uint32_t channel,
++		std::uint32_t value, bool would_stall);
++
++	// `spu_rchcnt`: dispatched at rchcnt entry. Never stalls.
++	void record_spu_rchcnt(std::uint32_t target_spu, std::uint32_t pc, std::uint32_t channel, std::uint32_t count);
++
++	// `spu_park`: dispatched on channel-op stall after the
++	// would_stall=true rdch/wrch was already emitted. `channels` is
++	// optional — when populated, the Rust transformer emits an
++	// ExpectChannelState immediately after the ExpectSpuPark.
++	void record_spu_park(std::uint32_t target_spu, std::uint32_t pc, ParkReason reason, std::uint32_t channel,
++		const std::optional<ChannelsSnapshot>& channels);
++
++	// `spu_wake`: dispatched immediately after a parked SPU is
++	// resumed. `pc` MUST equal the preceding `spu_park`'s pc — the
++	// SPU re-executes the channel op at this address.
++	void record_spu_wake(std::uint32_t target_spu, std::uint32_t pc);
++
++	// `spu_stop`: dispatched at `stop` / `stopd` instruction handling.
++	void record_spu_stop(std::uint32_t target_spu, std::uint32_t pc, std::uint32_t stop_code);
++
++	// `final_state`: dispatched exactly once at SPU thread exit
++	// after `spu_stop`. `gprs` is the subset the capture chose to
++	// assert (NOT every non-zero GPR); typical policy is the
++	// homebrew's contract registers only.
++	void record_final_state(std::uint32_t target_spu, const std::vector<GprEntry>& gprs,
++		const ChannelsSnapshot& channels);
++
++	// R5.9e.3 — dispatched ONCE per SPU thread at thread entry, before
++	// any executed event for that target_spu. Snapshots `size` bytes
++	// from `ls_bytes` (the SPU's local store), computes the SHA-256
++	// of the snapshot, writes a content-addressed side-file at
++	// `<trace_path>.images/<sha256>.spuimg` (created on demand; not
++	// re-written if the same SHA already exists), and emits a JSONL
++	// `spu_image` event carrying the metadata. Subsequent calls with
++	// the same `target_spu` are no-ops (per-target_spu dedup via
++	// `m_emitted_images`); the SPU's image is captured exactly once
++	// per trace session even if `cpu_task` is re-entered after a
++	// pause/resume cycle.
++	//
++	// Per the R5.9e.1 schema: bytes are NEVER inlined in the JSONL
++	// (no base64, no hex). The side-file holds raw binary bytes; the
++	// JSONL holds only the metadata pointer.
++	//
++	// Caller-side requirements: `ls_bytes` must point to at least
++	// `size` valid bytes; `size` must equal the captured image size
++	// (typically `SPU_LS_SIZE` = 256 KB); `load_addr` is the LS offset
++	// where the image starts (usually 0); `entry_pc` is the SPU's
++	// initial PC. The function is safe to call from inside
++	// `spu_thread::cpu_task` as long as the SPU has not yet started
++	// executing — the caller is responsible for the snapshot timing.
++	void record_spu_image(std::uint32_t target_spu, const std::uint8_t* ls_bytes,
++		std::uint32_t size, std::uint32_t load_addr, std::uint32_t entry_pc);
++
++	// === PPU-side recorders ====================================
++
++	void record_ppu_push_inmbox(std::uint32_t target_spu, std::uint32_t value);
++
++	// `value` holds the value drained from out_mbox; empty when the
++	// PPU-side helper popped against an empty mailbox.
++	void record_ppu_pop_outmbox(std::uint32_t target_spu, std::optional<std::uint32_t> value);
++
++	// `slot` is 0 (SNR1) or 1 (SNR2). Out-of-range slots are dropped
++	// with a stderr diagnostic (defensive — should never happen).
++	void record_ppu_signal(std::uint32_t target_spu, std::uint32_t slot, std::uint32_t value);
++
++private:
++	TraceWriter();
++	~TraceWriter();
++	TraceWriter(const TraceWriter&) = delete;
++	TraceWriter& operator=(const TraceWriter&) = delete;
++
++	// Allocate the next monotonic seq value. Lock-free.
++	std::uint64_t next_seq() noexcept;
++
++	// Serialize `kind` payload to one JSONL line and write it
++	// atomically (under m_write_mutex). No-op if not enabled.
++	void emit_line(std::string_view line);
++
++	// R5.9e.3-fix — write the captured image bytes to
++	// `<m_trace_path>.images/<sha256>.spuimg` if the file does not
++	// already exist. Caller MUST hold `m_write_mutex`. Returns true
++	// iff the side-file is on disk with exactly `size` bytes after
++	// the call (either freshly written or pre-existing with matching
++	// size — the SHA-named-file dedup contract). Returns false on
++	// any failure (mkdir, ofstream open, partial write, post-write
++	// size mismatch). All failures emit a [spu_trace] line on stderr
++	// describing the path + reason. Callers MUST check the return
++	// value and refuse to emit the JSONL `spu_image` event when this
++	// returns false — the v4-bug fix that surfaced when the JSONL
++	// referenced a `.spuimg` that never made it to disk.
++	bool write_image_side_file(const std::string& sha256_hex,
++		const std::uint8_t* bytes, std::uint32_t size);
++
++	std::atomic<bool> m_enabled{false};
++	std::atomic<std::uint64_t> m_seq{0};
++	std::ofstream m_file;
++	std::mutex m_write_mutex;
++	// R5.9e.3 — trace file path captured at writer construction time.
++	// Used to derive the side-file directory `<m_trace_path>.images/`
++	// for `record_spu_image`. Empty when the writer is disabled.
++	std::string m_trace_path;
++	// R5.9e.3 — set of `target_spu` ids for which `spu_image` has
++	// already been emitted on this writer. Guarded by `m_write_mutex`.
++	// Ensures every SPU's image lands at most once in the JSONL even
++	// if `record_spu_image` is invoked multiple times for the same
++	// SPU (e.g., from a re-entered `spu_thread::cpu_task`).
++	std::unordered_set<std::uint32_t> m_emitted_images;
++};
++
++} // namespace rpcs3::spu_trace
+diff --git a/rpcs3/emucore.vcxproj b/rpcs3/emucore.vcxproj
+index 3606a2091..f2aacd897 100644
+--- a/rpcs3/emucore.vcxproj
++++ b/rpcs3/emucore.vcxproj
+@@ -547,6 +547,7 @@
+     <ClCompile Include="Emu\Cell\SPUCommonRecompiler.cpp" />
+     <ClCompile Include="Emu\Cell\SPULLVMRecompiler.cpp" />
+     <ClCompile Include="Emu\Cell\SPUThread.cpp" />
++    <ClCompile Include="Emu\Cell\SPUTraceJsonl.cpp" />
+     <ClCompile Include="Emu\CPU\CPUThread.cpp" />
+     <ClCompile Include="Emu\VFS.cpp" />
+     <ClCompile Include="Emu\RSX\GSRender.cpp" />
+@@ -1000,6 +1001,7 @@
+     <ClInclude Include="Emu\Cell\SPUOpcodes.h" />
+     <ClInclude Include="Emu\Cell\SPURecompiler.h" />
+     <ClInclude Include="Emu\Cell\SPUThread.h" />
++    <ClInclude Include="Emu\Cell\SPUTraceJsonl.h" />
+     <ClInclude Include="Emu\Cell\timers.hpp" />
+     <ClInclude Include="Emu\CPU\CPUDisAsm.h" />
+     <ClInclude Include="Emu\CPU\CPUThread.h" />
+diff --git a/rpcs3/emucore.vcxproj.filters b/rpcs3/emucore.vcxproj.filters
+index 87bf4fed6..04a6c16d4 100644
+--- a/rpcs3/emucore.vcxproj.filters
++++ b/rpcs3/emucore.vcxproj.filters
+@@ -186,6 +186,9 @@
+     <ClCompile Include="Emu\Cell\SPUThread.cpp">
+       <Filter>Emu\Cell</Filter>
+     </ClCompile>
++    <ClCompile Include="Emu\Cell\SPUTraceJsonl.cpp">
++      <Filter>Emu\Cell</Filter>
++    </ClCompile>
+     <ClCompile Include="Emu\CPU\CPUThread.cpp">
+       <Filter>Emu\CPU</Filter>
+     </ClCompile>
+@@ -1512,6 +1515,9 @@
+     <ClInclude Include="Emu\Cell\SPUThread.h">
+       <Filter>Emu\Cell</Filter>
+     </ClInclude>
++    <ClInclude Include="Emu\Cell\SPUTraceJsonl.h">
++      <Filter>Emu\Cell</Filter>
++    </ClInclude>
+     <ClInclude Include="Emu\CPU\CPUDisAsm.h">
+       <Filter>Emu\CPU</Filter>
+     </ClInclude>
