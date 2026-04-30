@@ -178,11 +178,3 @@ cargo test -p rpcs3-io-dimensions --lib
 ## Licença
 
 GPL-2.0-only — mesma licença do RPCS3 upstream.
-
-## Co-autoria
-
-Este port foi desenvolvido em sessões assistidas por Claude (Anthropic),
-com mais de 230 iterações autônomas consecutivas em ZERO regressões pela
-wave behavior-freeze. Decisões arquiteturais, validação byte-exata e
-testes finais sob supervisão humana. Para a contagem exata e o status
-mais recente, ver [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md).
