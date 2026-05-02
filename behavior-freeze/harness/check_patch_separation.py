@@ -59,6 +59,17 @@ PATCH_DIR = REPO_ROOT / "docs" / "patches"
 SCAFFOLDING = PATCH_DIR / "spu_trace_jsonl_scaffolding.patch"
 RUNTIME_HOOKS = PATCH_DIR / "spu_trace_jsonl_runtime_hooks.patch"
 
+# R6.1 — optional Rust SPU bridge patch. Tracked separately from the
+# pinned trace-writer pair: the bridge patch's content is NOT part of
+# the writer's separation contract (different scope), but its sha256
+# is pinned so the patch can't drift silently. The pin is OPTIONAL:
+# if the file is absent, the gate stays green (R6.0 / pre-R6.1
+# states are valid).
+RUST_BRIDGE = PATCH_DIR / "spu_rust_bridge.patch"
+RUST_BRIDGE_PINNED_SHA256 = (
+    "7d6b6bba3d1c590ec16f2ff175b262a4f95bdf95ace92eb91636824488436c03"
+)
+
 # Hot-path source files that runtime hooks edit; scaffolding MUST NOT
 # touch any of these.
 HOT_PATH_FILES = (
@@ -300,6 +311,19 @@ def main() -> int:
     violations.extend(check_writer_race_guard(scaffolding_text))
     violations.extend(check_spu_image_api_wiring(scaffolding_text, runtime_text))
 
+    # R6.1 — optional sha256 pin on the Rust bridge patch. Absent file
+    # is fine (pre-R6.1 state); present file with mismatched sha is a
+    # violation (= silent drift).
+    rust_bridge_sha = None
+    if RUST_BRIDGE.is_file():
+        rust_bridge_sha = sha256(RUST_BRIDGE)
+        if rust_bridge_sha != RUST_BRIDGE_PINNED_SHA256:
+            violations.append(
+                f"R6.1 sha drift: spu_rust_bridge.patch sha256 = {rust_bridge_sha} "
+                f"but pinned = {RUST_BRIDGE_PINNED_SHA256}. Regenerate the patch "
+                "(see docs/SPU_RUST_BRIDGE_PATCH.md) and update RUST_BRIDGE_PINNED_SHA256."
+            )
+
     if violations:
         print(f"FAIL: {len(violations)} violation(s)", file=sys.stderr)
         for v in violations:
@@ -309,6 +333,10 @@ def main() -> int:
     print("OK: patch separation + writer race guards satisfied")
     print(f"  - scaffolding sha256: {sha256(SCAFFOLDING)}")
     print(f"  - runtime hooks sha256: {sha256(RUNTIME_HOOKS)}")
+    if rust_bridge_sha is not None:
+        print(f"  - rust bridge sha256: {rust_bridge_sha}")
+    else:
+        print("  - rust bridge patch: not present (pre-R6.1 state, OK)")
     return 0
 
 

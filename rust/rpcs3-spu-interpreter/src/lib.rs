@@ -19,7 +19,7 @@
 //! and full MFC DMA semantics.
 
 use rpcs3_emu_types::CellError;
-use rpcs3_spu_thread::{ChannelStatus, SpuThread, SPU_LS_SIZE};
+use rpcs3_spu_thread::{ChannelStatus, SpuParkReason, SpuThread, SPU_LS_SIZE};
 
 /// What [`step`] returns after executing a single instruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -496,6 +496,94 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
         return Ok(StepOutcome::Continue);
     }
 
+    // ---- R5.10d — C-family insert-control opcodes -----------
+    // CBX/CHX/CWX/CDX (RR-form, primaries 0x1D4..0x1D7) and
+    // CBD/CHD/CWD/CDD (RI7-form, primaries 0x1F4..0x1F7) all build a
+    // 16-byte `shufb` mask.
+    //
+    // Default mask in SPU big-endian byte order is `0x10..0x1F` linear:
+    //   bytes 0..7  = 0x10 0x11 0x12 0x13 0x14 0x15 0x16 0x17
+    //   bytes 8..15 = 0x18 0x19 0x1A 0x1B 0x1C 0x1D 0x1E 0x1F
+    // (= "select source B" identity in SPU-BE byte order). Matches
+    // the RPCS3 C++ `from64(0x18191A1B1C1D1E1F, 0x1011121314151617)`
+    // when read in SPU-BE view: `_u32[3]` (preferred slot) = SPU
+    // bytes 0..3 = 0x10111213; `_u32[0]` (low word) = SPU bytes
+    // 12..15 = 0x1C1D1E1F. R5.11b — corrected from the prior
+    // half-swapped form which made the `cwd_generates_word_insert_mask`
+    // unit test self-consistent but diverge from real captured
+    // RPCS3 behaviour (caught by the single_spu_loadstore_v1
+    // fixture's r7 = 0x10111213 cwd output assertion).
+    //
+    // Then `granularity` consecutive bytes at SPU-BE byte offset
+    // `addr & granularity_mask` are overwritten with `0x00 0x01 ...
+    // (granularity-1)` (= "select bytes 0..(granularity-1) of source
+    // A's preferred slot"). This builds the shuffle mask that
+    // `shufb rt2, rA, rB, mask` consumes to insert A's preferred slot
+    // into B at the chosen byte/halfword/word/doubleword position.
+    //
+    // RA convention: `gpr[ra]_lane0` (= preferred slot, `split_lanes(v)[0]`).
+    // RB convention (RR-form): `gpr[rb]_lane0` similarly.
+    // imm7 (RI7-form): sign-extended 7-bit, added as u32 (sign-extends
+    // via `as u32` from i32, which gives the same wrapping_add result
+    // as the C++ `op.i7 + spu.gpr[op.ra]._u32[3]` 32-bit arithmetic).
+    match bits(inst, 0, 11) {
+        // CBX/CHX/CWX/CDX (RR-form) — addr = ra_lane0 + rb_lane0.
+        // CBD/CHD/CWD/CDD (RI7-form) — addr = ra_lane0 + sext(imm7).
+        p @ (0x1D4 | 0x1D5 | 0x1D6 | 0x1D7 | 0x1F4 | 0x1F5 | 0x1F6 | 0x1F7) => {
+            let granularity = match p & 0x3 {
+                0x0 => 1usize, // Byte
+                0x1 => 2usize, // Halfword
+                0x2 => 4usize, // Word
+                0x3 => 8usize, // Doubleword
+                _ => unreachable!(),
+            };
+            let alignment_mask: u32 = match granularity {
+                1 => 0xF,
+                2 => 0xE,
+                4 => 0xC,
+                8 => 0x8,
+                _ => unreachable!(),
+            };
+            let ra_lane0 = split_lanes(spu.gpr[ra(inst)])[0];
+            let addr = if (p & 0x020) != 0 {
+                // RI7-form: addr = ra_lane0 + sext(imm7) (32-bit wrapping).
+                ra_lane0.wrapping_add(i7(inst) as u32)
+            } else {
+                // RR-form: addr = ra_lane0 + rb_lane0.
+                ra_lane0.wrapping_add(split_lanes(spu.gpr[rb(inst)])[0])
+            };
+            let p_byte = (addr & alignment_mask) as usize;
+
+            // Insert pattern: granularity bytes whose VALUES point into
+            // source A's preferred slot. The preferred byte is A[3],
+            // preferred halfword is A[2..=3], preferred word is A[0..=3],
+            // preferred doubleword extends past the 4-byte preferred-
+            // slot to A[0..=7]. So the start offset is `4 - g` for g ≤ 4
+            // and `0` for g = 8 (matches the C++ C-family bodies bit-
+            // for-bit: CBD writes 0x03, CHD writes 0x0203, CWD writes
+            // 0x00010203, CDD writes 0x0001020304050607).
+            let a_start: u8 = match granularity {
+                1 => 3,
+                2 => 2,
+                4 => 0,
+                8 => 0,
+                _ => unreachable!(),
+            };
+
+            let mut bytes: [u8; 16] = [
+                0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+            ];
+            for i in 0..granularity {
+                bytes[p_byte + i] = a_start + i as u8;
+            }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(bytes);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        _ => {}
+    }
+
     // ---- 11-bit register-form ALU -----------------------------
     match bits(inst, 0, 11) {
         // a rt, ra, rb  — word add (canonical SPU primary 0xC0)
@@ -603,13 +691,66 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
             spu.pc = pc.wrapping_add(4);
             return Ok(StepOutcome::Continue);
         }
-        // shlqbyi rt, ra, imm7 — shift left quadword by bytes immediate
+        // R5.11b — rotqby rt, ra, rb (RR-form sibling of rotqbyi 0x1FC).
+        // Shift count is the low 4 bits of rb's preferred slot value.
+        // Surfaced by GCC -O2 codegen for runtime-indexed extraction
+        // of a 4-byte slot from a 16-byte aligned LS load (see
+        // single_spu_loadstore_v1 fixture). Same byte-rotation
+        // semantics as rotqbyi; only the shift-count source differs.
+        0x1DC => {
+            let sh = ((spu.gpr[rb(inst)] >> 96) as u32) & 0x0F;
+            let bytes = spu.gpr[ra(inst)].to_be_bytes();
+            let mut out = [0u8; 16];
+            for i in 0..16u32 {
+                out[i as usize] = bytes[((i + sh) & 0x0F) as usize];
+            }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(out);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // R5.10m — rotqmbyi rt, ra, imm7 (cpp:981) — quadword right-shift
+        // by `(0 - imm7) & 0x1F` bytes with zero-fill (the "M" stands for
+        // "mask" / zero-fill, NOT "rotate"; the name is a misnomer).
+        // For our v4 site `imm7=0x7C` (=-4 signed), shift count is 4.
+        // If shift count >= 16, output is all zeros.
+        0x1FD => {
+            let n = ((0i32.wrapping_sub(i7(inst))) & 0x1F) as usize;
+            let bytes = spu.gpr[ra(inst)].to_be_bytes();
+            let mut out = [0u8; 16];
+            if n < 16 {
+                for i in n..16 {
+                    out[i] = bytes[i - n];
+                }
+            }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(out);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // R5.10m — shlqbii rt, ra, imm7 (cpp:963) — quadword LEFT-shift
+        // by `imm7 & 0x7` BITS (zero-fill). Pre-R5.10m this primary was
+        // mistakenly assigned byte-shift semantics labeled "shlqbyi";
+        // the labeling bug is now fixed: 0x1FB is SHLQBII (bit-shift),
+        // and the byte-shift moves to 0x1FF (= SHLQBYI per RPCS3).
+        // Shift in big-endian SPU byte order corresponds to a u128
+        // left-shift in our `from_be_bytes` representation (SPU byte 0
+        // = u128 MSB). For `n=0` the shift is identity; the mask `& 0x7`
+        // bounds n to 0..=7 which is a safe u128 shift amount.
         0x1FB => {
+            let n = (i7(inst) & 0x7) as u32;
+            spu.gpr[rt(inst)] = spu.gpr[ra(inst)] << n;
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // R5.10m — shlqbyi rt, ra, imm7 (cpp:990) — quadword LEFT-shift
+        // by `imm7 & 0x1F` BYTES (zero-fill). Moved here from 0x1FB
+        // (where it was mislabeled pre-R5.10m). For shift count >= 16,
+        // output is all zeros. Identical byte-stride logic as before
+        // — only the dispatch primary changed to match RPCS3.
+        0x1FF => {
             let sh = (i7(inst) & 0x1F) as u32;
             let bytes = spu.gpr[ra(inst)].to_be_bytes();
             let mut out = [0u8; 16];
             if sh < 16 {
-                // Shift left: byte 0 of out = byte sh of bytes, etc.
                 for i in 0..(16 - sh) {
                     out[i as usize] = bytes[(i + sh) as usize];
                 }
@@ -690,6 +831,11 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
                     return Ok(StepOutcome::Continue);
                 }
                 Err(ChannelStatus::WouldStall) => {
+                    // R5.4a: park the SPU thread on this rdch. The
+                    // park PC is the rdch instruction itself (not
+                    // pc+4) — re-running from this PC after the
+                    // mailbox refills will retry the same op.
+                    spu.park_on_channel(pc, SpuParkReason::ChannelRead { channel });
                     return Ok(StepOutcome::ChannelStall { channel, is_write: false });
                 }
                 Err(_) => {
@@ -710,6 +856,10 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
                     return Ok(StepOutcome::Continue);
                 }
                 Err(ChannelStatus::WouldStall) => {
+                    // R5.4a: park on the wrch. PC is the wrch itself
+                    // so a future scheduler can resume from here once
+                    // the mailbox drains.
+                    spu.park_on_channel(pc, SpuParkReason::ChannelWrite { channel });
                     return Ok(StepOutcome::ChannelStall { channel, is_write: true });
                 }
                 Err(_) => {
@@ -944,6 +1094,47 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
                 if m & 0x1 != 0 { 0xFFFF_FFFF } else { 0 },
             ];
             spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+
+        // ===== FSMH rt, ra (cpp:670) — form select mask, halfword =====
+        // R5.10f. Take the low 8 bits of ra's preferred slot. Bit i
+        // (i=0..7) expands into halfword (7-i): bit 7 → halfword 0,
+        // bit 6 → halfword 1, ..., bit 0 → halfword 7. Each halfword is
+        // 0xFFFF if its bit is set, else 0x0000. SPU big-endian byte
+        // order: halfword 0 occupies SPU bytes 0..1.
+        0x1B5 => {
+            let m = (split_lanes(spu.gpr[ra(inst)])[0] & 0xFF) as u32;
+            let mut bytes = [0u8; 16];
+            for h in 0..8 {
+                let bit = 7 - h;
+                if m & (1 << bit) != 0 {
+                    bytes[h * 2]     = 0xFF;
+                    bytes[h * 2 + 1] = 0xFF;
+                }
+            }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(bytes);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+
+        // ===== FSMB rt, ra (cpp:680) — form select mask, byte =========
+        // R5.10f. Take the low 16 bits of ra's preferred slot. Bit i
+        // (i=0..15) expands into byte (15-i): bit 15 → SPU byte 0, ...,
+        // bit 0 → SPU byte 15. Each byte is 0xFF if its bit is set,
+        // else 0x00. (Same shape as FSMBI but the source is `ra` bits
+        // instead of an immediate.)
+        0x1B6 => {
+            let m = (split_lanes(spu.gpr[ra(inst)])[0] & 0xFFFF) as u32;
+            let mut bytes = [0u8; 16];
+            for k in 0..16 {
+                let bit = 15 - k;
+                if m & (1 << bit) != 0 {
+                    bytes[k] = 0xFF;
+                }
+            }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(bytes);
             spu.pc = pc.wrapping_add(4);
             return Ok(StepOutcome::Continue);
         }
@@ -1449,6 +1640,70 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
             spu.pc = target;
             return Ok(StepOutcome::Continue);
         }
+        // R5.10b — lqr rt, imm16 (cpp:1690) — load qword PC-relative.
+        // Target = (pc + (imm16 << 2)) & 0x3FFF0 — same as RPCS3 C++
+        // `spu_ls_target(pc, imm16)`: LS-mask AND 16-byte align (the
+        // `& 0x3FFF0` does both — bottom 4 bits forced to 0 for the
+        // qword alignment, top bits masked to the 256 KiB LS).
+        // No channels, no FP, no DMA, no branches — pure LS→GPR load.
+        0x067 => {
+            let target = ((pc as i64).wrapping_add((i16_rel(inst) * 4) as i64)) as u32
+                & 0x3FFF0;
+            let v = read_qword_be(spu, target)?;
+            spu.gpr[rt(inst)] = v;
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // R5.10g — stqr rt, imm16 (cpp:1634) — store qword PC-relative.
+        // Direct mirror of LQR (0x067): same `spu_ls_target(pc, imm16)`
+        // address — `(pc + (imm16<<2)) & 0x3FFF0`, LS-mask AND 16-byte
+        // align — just `LS[target..+16] = gpr[rt]` instead of the load.
+        // No channels, no DMA, no FP, no atomics, no branches.
+        0x047 => {
+            let target = ((pc as i64).wrapping_add((i16_rel(inst) * 4) as i64)) as u32
+                & 0x3FFF0;
+            write_qword_be(spu, target, spu.gpr[rt(inst)])?;
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // R5.10o — lqa rt, imm16 (cpp:1648) — load qword absolute.
+        // Mirror of LQR (0x067) but with PC=0:
+        //   target = (imm16 << 2) & 0x3FFF0
+        // Pure LS read; no PC contribution to the address. Negative
+        // imm16 wraps via the `& 0x3FFF0` mask onto the top of LS.
+        0x061 => {
+            let target = ((i16_rel(inst) * 4) as u32) & 0x3FFF0;
+            spu.gpr[rt(inst)] = read_qword_be(spu, target)?;
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // R5.10o — stqa rt, imm16 (cpp:1594) — store qword absolute.
+        // Mirror of LQA above (0x061) with reversed direction; mirror
+        // of STQR (0x047) with PC=0 in the address calc.
+        0x041 => {
+            let target = ((i16_rel(inst) * 4) as u32) & 0x3FFF0;
+            write_qword_be(spu, target, spu.gpr[rt(inst)])?;
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // R5.10f — fsmbi rt, imm16 (cpp:1671) — form select mask from
+        // 16-bit immediate. Byte k of rt = 0xFF iff bit (15-k) of imm16
+        // is set, else 0x00. SPU big-endian byte 0 → high u64 byte. No
+        // ra/rb access, no LS read/write, no channels, no FP, no
+        // branches — pure i16 → 16-byte mask compute.
+        0x065 => {
+            let m = u16imm(inst);
+            let mut bytes = [0u8; 16];
+            for k in 0..16 {
+                let bit = 15 - k;
+                if m & (1 << bit) != 0 {
+                    bytes[k] = 0xFF;
+                }
+            }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(bytes);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
         _ => {}
     }
 
@@ -1534,16 +1789,22 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
     }
 
     // ---- 4-bit RRR-form dispatch (selb / shufb / fma / fnms / fms)
-    // Layout: primary (4) | rc (7) | rb (7) | ra (7) | rt (7)
-    // `rc` sits at bits 25..31 (same position as `rt` in RR form);
-    // `rt` migrates to bits 4..=10 in RRR — the SPU ISA peculiarity.
+    // Layout: primary (4) | rt (7) | rb (7) | ra (7) | rc (7)
+    // R5.11b — `rt` (destination) is at bits 4..=10 (which is what the
+    // assembler/disassembler outputs); `rc` (4th source) is at bits
+    // 25..=31. Pre-R5.11b the dispatch had rt and rc field positions
+    // swapped (matching pack_rrr's mirror error), making the executor
+    // self-consistent against synthetic-encoded fixtures but
+    // divergent from real captured binaries. Corrected together with
+    // pack_rrr; both encoder and decoder now match the real SPU
+    // encoding.
     match bits(inst, 0, 4) {
         0x8 => {
             // selb rt, ra, rb, rc  — (rc & rb) | (!rc & ra) bit-wise.
-            let rt_idx = bits(inst, 25, 7) as usize;  // RRR: rt in low 7 bits
+            let rt_idx = bits(inst, 4, 7) as usize;
             let rb_idx = bits(inst, 11, 7) as usize;
             let ra_idx = bits(inst, 18, 7) as usize;
-            let rc_idx = bits(inst, 4, 7) as usize;
+            let rc_idx = bits(inst, 25, 7) as usize;
             let a = spu.gpr[ra_idx];
             let b = spu.gpr[rb_idx];
             let c = spu.gpr[rc_idx];
@@ -1556,10 +1817,10 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
             // For each output byte (16 total), the selector byte in rc
             // picks one of 32 input bytes (ra bytes 0..15, rb bytes
             // 0..15) or produces a constant based on the high bits.
-            let rt_idx = bits(inst, 25, 7) as usize;
+            let rt_idx = bits(inst, 4, 7) as usize;
             let rb_idx = bits(inst, 11, 7) as usize;
             let ra_idx = bits(inst, 18, 7) as usize;
-            let rc_idx = bits(inst, 4, 7) as usize;
+            let rc_idx = bits(inst, 25, 7) as usize;
             let a = spu.gpr[ra_idx].to_be_bytes();
             let b = spu.gpr[rb_idx].to_be_bytes();
             let c = spu.gpr[rc_idx].to_be_bytes();
@@ -1588,10 +1849,11 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
         }
         0xE => {
             // fma rt, ra, rb, rc — rt = ra*rb + rc (lane-wise f32).
-            let rt_idx = bits(inst, 25, 7) as usize;
+            // R5.11b — corrected RRR-form rt/rc field positions.
+            let rt_idx = bits(inst, 4, 7) as usize;
             let rb_idx = bits(inst, 11, 7) as usize;
             let ra_idx = bits(inst, 18, 7) as usize;
-            let rc_idx = bits(inst, 4, 7) as usize;
+            let rc_idx = bits(inst, 25, 7) as usize;
             let a = split_lanes(spu.gpr[ra_idx]);
             let b = split_lanes(spu.gpr[rb_idx]);
             let c = split_lanes(spu.gpr[rc_idx]);
@@ -1607,10 +1869,11 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
         }
         0xD => {
             // fnms rt, ra, rb, rc — rt = rc - ra*rb (lane-wise f32).
-            let rt_idx = bits(inst, 25, 7) as usize;
+            // R5.11b — corrected RRR-form rt/rc field positions.
+            let rt_idx = bits(inst, 4, 7) as usize;
             let rb_idx = bits(inst, 11, 7) as usize;
             let ra_idx = bits(inst, 18, 7) as usize;
-            let rc_idx = bits(inst, 4, 7) as usize;
+            let rc_idx = bits(inst, 25, 7) as usize;
             let a = split_lanes(spu.gpr[ra_idx]);
             let b = split_lanes(spu.gpr[rb_idx]);
             let c = split_lanes(spu.gpr[rc_idx]);
@@ -1626,10 +1889,11 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
         }
         0xF => {
             // fms rt, ra, rb, rc — rt = ra*rb - rc (lane-wise f32).
-            let rt_idx = bits(inst, 25, 7) as usize;
+            // R5.11b — corrected RRR-form rt/rc field positions.
+            let rt_idx = bits(inst, 4, 7) as usize;
             let rb_idx = bits(inst, 11, 7) as usize;
             let ra_idx = bits(inst, 18, 7) as usize;
-            let rc_idx = bits(inst, 4, 7) as usize;
+            let rc_idx = bits(inst, 25, 7) as usize;
             let a = split_lanes(spu.gpr[ra_idx]);
             let b = split_lanes(spu.gpr[rb_idx]);
             let c = split_lanes(spu.gpr[rc_idx]);
@@ -1724,6 +1988,91 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
             spu.pc = pc.wrapping_add(4);
             return Ok(StepOutcome::Continue);
         }
+        // R5.10k — clgti rt, ra, imm10 (cpp:1862) — UNSIGNED word gt
+        // imm. si10 sign-extended to i32, then compared as u32 against
+        // each word lane of ra. Result lane = 0xFFFFFFFF/0.
+        0x5C => {
+            let imm_u = i10(inst) as u32;
+            let a = split_lanes(spu.gpr[ra(inst)]);
+            let r = [
+                if a[0] > imm_u { 0xFFFF_FFFF } else { 0 },
+                if a[1] > imm_u { 0xFFFF_FFFF } else { 0 },
+                if a[2] > imm_u { 0xFFFF_FFFF } else { 0 },
+                if a[3] > imm_u { 0xFFFF_FFFF } else { 0 },
+            ];
+            spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // R5.10k — sfi rt, ra, imm10 (cpp:1747) — per-word
+        // `sext(si10) - gpr[ra]` (note operand order: imm minus ra).
+        0x0C => {
+            let imm = i10(inst);
+            let a = split_lanes(spu.gpr[ra(inst)]);
+            let r = [
+                (imm as u32).wrapping_sub(a[0]),
+                (imm as u32).wrapping_sub(a[1]),
+                (imm as u32).wrapping_sub(a[2]),
+                (imm as u32).wrapping_sub(a[3]),
+            ];
+            spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // R5.10k — ahi rt, ra, imm10 (cpp:1789) — per-HALFWORD add.
+        // si10 broadcast as i16 across 8 halfword lanes; halfword-wise
+        // add with wraparound.
+        0x1D => {
+            let imm_h = i10(inst) as i16 as u16;
+            let a = spu.gpr[ra(inst)].to_be_bytes();
+            let mut out = [0u8; 16];
+            for i in 0..8 {
+                let av = u16::from_be_bytes([a[2*i], a[2*i+1]]);
+                let r  = av.wrapping_add(imm_h);
+                out[2*i..2*i+2].copy_from_slice(&r.to_be_bytes());
+            }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(out);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // R5.10k — mpyi rt, ra, imm10 (cpp:1893) — per-WORD signed
+        // 16x16->32 multiply: take low 16 bits of each ra word as an
+        // i16, multiply by sext(si10) interpreted as i16; sign-extend
+        // the 32-bit product to fill the word lane. The C++ uses
+        // `_mm_madd_epi16(a, set1_epi32(si10 & 0xFFFF))` which puts 0
+        // in the high i16 of each broadcast lane, so the high half of
+        // `a` is multiplied by 0 and only the low half contributes.
+        0x74 => {
+            let imm_i16 = i10(inst) as i16;
+            let a = split_lanes(spu.gpr[ra(inst)]);
+            let r = [
+                ((a[0] as i16) as i32).wrapping_mul(imm_i16 as i32) as u32,
+                ((a[1] as i16) as i32).wrapping_mul(imm_i16 as i32) as u32,
+                ((a[2] as i16) as i32).wrapping_mul(imm_i16 as i32) as u32,
+                ((a[3] as i16) as i32).wrapping_mul(imm_i16 as i32) as u32,
+            ];
+            spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // R5.10k — mpyui rt, ra, imm10 (cpp:1900) — per-WORD UNSIGNED
+        // 16x16->32 multiply. Same shape as MPYI but unsigned: take
+        // low 16 bits of each ra word as u16, multiply by `(si10 &
+        // 0xFFFF) as u16`; full 32-bit unsigned product fills the
+        // word lane.
+        0x75 => {
+            let imm_u16 = (i10(inst) & 0xFFFF) as u32;
+            let a = split_lanes(spu.gpr[ra(inst)]);
+            let r = [
+                (a[0] & 0xFFFF).wrapping_mul(imm_u16),
+                (a[1] & 0xFFFF).wrapping_mul(imm_u16),
+                (a[2] & 0xFFFF).wrapping_mul(imm_u16),
+                (a[3] & 0xFFFF).wrapping_mul(imm_u16),
+            ];
+            spu.gpr[rt(inst)] = join_lanes(r);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
         // stqd rt, imm10*16(ra)  — store qword
         0x24 => {
             let off = i10(inst).wrapping_mul(16);
@@ -1778,6 +2127,88 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
             spu.pc = pc.wrapping_add(4);
             return Ok(StepOutcome::Continue);
         }
+
+        // ===== R5.10i: byte-immediate RI10 family ===================
+        // All 6 byte-imm opcodes take the same `i8` field (bits 14..21,
+        // LSB-0) and broadcast it to all 16 bytes of the 128-bit
+        // operand, then apply the per-byte op against `gpr[ra]`.
+        // C++ refs: SPUInterpreter.cpp:1740 (ORBI), 1775 (ANDBI),
+        // 1824 (XORBI), 1845 (CGTBI), 1876 (CLGTBI), 1923 (CEQBI).
+        // The decoder (R5.10i) extracts `i8` correctly; we read it
+        // back via `(inst >> 14) & 0xFF` here because the interpreter
+        // dispatches on raw bits (not on decoder variants).
+
+        // orbi rt, ra, i8 (cpp:1740)
+        0x06 => {
+            let i8b = ((inst >> 14) & 0xFF) as u8;
+            let a = spu.gpr[ra(inst)].to_be_bytes();
+            let mut out = [0u8; 16];
+            for k in 0..16 { out[k] = a[k] | i8b; }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(out);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // andbi rt, ra, i8 (cpp:1775)
+        0x16 => {
+            let i8b = ((inst >> 14) & 0xFF) as u8;
+            let a = spu.gpr[ra(inst)].to_be_bytes();
+            let mut out = [0u8; 16];
+            for k in 0..16 { out[k] = a[k] & i8b; }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(out);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // xorbi rt, ra, i8 (cpp:1824)
+        0x46 => {
+            let i8b = ((inst >> 14) & 0xFF) as u8;
+            let a = spu.gpr[ra(inst)].to_be_bytes();
+            let mut out = [0u8; 16];
+            for k in 0..16 { out[k] = a[k] ^ i8b; }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(out);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // cgtbi rt, ra, i8 (cpp:1845) — SIGNED byte greater-than
+        0x4E => {
+            let i8s = ((inst >> 14) & 0xFF) as u8 as i8;
+            let a = spu.gpr[ra(inst)].to_be_bytes();
+            let mut out = [0u8; 16];
+            for k in 0..16 {
+                out[k] = if (a[k] as i8) > i8s { 0xFF } else { 0x00 };
+            }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(out);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // clgtbi rt, ra, i8 (cpp:1876) — UNSIGNED byte greater-than.
+        // C++ uses _mm_xor_si128(gpr[ra], 0x80808080) and a signed
+        // _mm_cmpgt_epi8 against (i8 ^ 0x80) — the standard XOR-trick
+        // for unsigned compare. The plain `as u8` compare is the
+        // direct equivalent.
+        0x5E => {
+            let i8u = ((inst >> 14) & 0xFF) as u8;
+            let a = spu.gpr[ra(inst)].to_be_bytes();
+            let mut out = [0u8; 16];
+            for k in 0..16 {
+                out[k] = if a[k] > i8u { 0xFF } else { 0x00 };
+            }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(out);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+        // ceqbi rt, ra, i8 (cpp:1923) — byte equality
+        0x7E => {
+            let i8b = ((inst >> 14) & 0xFF) as u8;
+            let a = spu.gpr[ra(inst)].to_be_bytes();
+            let mut out = [0u8; 16];
+            for k in 0..16 {
+                out[k] = if a[k] == i8b { 0xFF } else { 0x00 };
+            }
+            spu.gpr[rt(inst)] = u128::from_be_bytes(out);
+            spu.pc = pc.wrapping_add(4);
+            return Ok(StepOutcome::Continue);
+        }
+
         _ => {}
     }
 
@@ -1929,6 +2360,70 @@ pub mod encode {
         let imm = (imm10 as u32) & 0x3FF;
         ((0x34u32) << 24) | (imm << 14) | ((ra & 0x7F) << 7) | (rt & 0x7F)
     }
+    /// R5.10b — `lqr rt, imm16` — load qword PC-relative.
+    /// imm16 is a signed halfword offset; target =
+    /// `(pc + (imm16 << 2)) & 0x3FFF0` (LS-mask + 16-byte align).
+    /// Encoding: 9-bit primary 0x067 at bits 0..8, signed imm16 at
+    /// bits 9..24, rt at bits 25..31.
+    #[must_use]
+    pub const fn lqr(rt: u32, imm16: i16) -> u32 {
+        pack_ri16(0x067, rt, imm16 as u16)
+    }
+    /// R5.10g — `stqr rt, imm16` — store qword PC-relative. Mirror of
+    /// `lqr`; same encoding shape, primary `0x047` instead of `0x067`.
+    #[must_use]
+    pub const fn stqr(rt: u32, imm16: i16) -> u32 {
+        pack_ri16(0x047, rt, imm16 as u16)
+    }
+    /// R5.10o — `lqa rt, imm16` — load qword ABSOLUTE. Same RI16
+    /// encoding shape as LQR; primary `0x061`. Address calc is
+    /// PC-independent: `(imm16 << 2) & 0x3FFF0`.
+    #[must_use]
+    pub const fn lqa(rt: u32, imm16: i16) -> u32 {
+        pack_ri16(0x061, rt, imm16 as u16)
+    }
+    /// R5.10o — `stqa rt, imm16` — store qword ABSOLUTE. Mirror of
+    /// `lqa`; primary `0x041`.
+    #[must_use]
+    pub const fn stqa(rt: u32, imm16: i16) -> u32 {
+        pack_ri16(0x041, rt, imm16 as u16)
+    }
+
+    // R5.10d — C-family insert-control encoders. RR-form packs rb at
+    // bits 11..17; RI7-form packs imm7 at the same field. Helpers are
+    // used by the interpreter unit tests; they encode the canonical
+    // 11-bit primary opcode followed by the appropriate body.
+    const fn pack_rr_11(p11: u32, rt: u32, ra: u32, rb: u32) -> u32 {
+        ((p11 & 0x7FF) << 21) | ((rb & 0x7F) << 14) | ((ra & 0x7F) << 7) | (rt & 0x7F)
+    }
+    const fn pack_ri7_11(p11: u32, rt: u32, ra: u32, imm7: i8) -> u32 {
+        ((p11 & 0x7FF) << 21) | (((imm7 as u32) & 0x7F) << 14) | ((ra & 0x7F) << 7) | (rt & 0x7F)
+    }
+
+    /// R5.10d — `cbx rt, ra, rb`  — generate byte-insert controls (RR).
+    #[must_use]
+    pub const fn cbx(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr_11(0x1D4, rt, ra, rb) }
+    /// R5.10d — `chx rt, ra, rb`  — generate halfword-insert controls (RR).
+    #[must_use]
+    pub const fn chx(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr_11(0x1D5, rt, ra, rb) }
+    /// R5.10d — `cwx rt, ra, rb`  — generate word-insert controls (RR).
+    #[must_use]
+    pub const fn cwx(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr_11(0x1D6, rt, ra, rb) }
+    /// R5.10d — `cdx rt, ra, rb`  — generate doubleword-insert controls (RR).
+    #[must_use]
+    pub const fn cdx(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr_11(0x1D7, rt, ra, rb) }
+    /// R5.10d — `cbd rt, imm7(ra)` — generate byte-insert controls (RI7).
+    #[must_use]
+    pub const fn cbd(rt: u32, ra: u32, imm7: i8) -> u32 { pack_ri7_11(0x1F4, rt, ra, imm7) }
+    /// R5.10d — `chd rt, imm7(ra)` — generate halfword-insert controls (RI7).
+    #[must_use]
+    pub const fn chd(rt: u32, ra: u32, imm7: i8) -> u32 { pack_ri7_11(0x1F5, rt, ra, imm7) }
+    /// R5.10d — `cwd rt, imm7(ra)` — generate word-insert controls (RI7).
+    #[must_use]
+    pub const fn cwd(rt: u32, ra: u32, imm7: i8) -> u32 { pack_ri7_11(0x1F6, rt, ra, imm7) }
+    /// R5.10d — `cdd rt, imm7(ra)` — generate doubleword-insert controls (RI7).
+    #[must_use]
+    pub const fn cdd(rt: u32, ra: u32, imm7: i8) -> u32 { pack_ri7_11(0x1F7, rt, ra, imm7) }
     /// `stqd rt, imm10(ra)`
     #[must_use]
     pub const fn stqd(rt: u32, ra: u32, imm10: i16) -> u32 {
@@ -1960,6 +2455,21 @@ pub mod encode {
     /// `cgti rt, ra, imm10`
     #[must_use]
     pub const fn cgti(rt: u32, ra: u32, imm10: i16) -> u32 { pack_8_i10(0x4C, rt, ra, imm10) }
+    /// R5.10k — `clgti rt, ra, imm10` — unsigned word gt-than imm.
+    #[must_use]
+    pub const fn clgti(rt: u32, ra: u32, imm10: i16) -> u32 { pack_8_i10(0x5C, rt, ra, imm10) }
+    /// R5.10k — `sfi rt, ra, imm10` — per-word `sext(si10) - gpr[ra]`.
+    #[must_use]
+    pub const fn sfi(rt: u32, ra: u32, imm10: i16) -> u32 { pack_8_i10(0x0C, rt, ra, imm10) }
+    /// R5.10k — `ahi rt, ra, imm10` — per-halfword add immediate.
+    #[must_use]
+    pub const fn ahi(rt: u32, ra: u32, imm10: i16) -> u32 { pack_8_i10(0x1D, rt, ra, imm10) }
+    /// R5.10k — `mpyi rt, ra, imm10` — per-word signed 16x16->32 multiply.
+    #[must_use]
+    pub const fn mpyi(rt: u32, ra: u32, imm10: i16) -> u32 { pack_8_i10(0x74, rt, ra, imm10) }
+    /// R5.10k — `mpyui rt, ra, imm10` — per-word unsigned 16x16->32 multiply.
+    #[must_use]
+    pub const fn mpyui(rt: u32, ra: u32, imm10: i16) -> u32 { pack_8_i10(0x75, rt, ra, imm10) }
 
     /// `brnz rt, imm16` — branch if preferred-slot != 0.
     #[must_use]
@@ -1991,6 +2501,34 @@ pub mod encode {
     #[must_use]
     pub const fn xori(rt: u32, ra: u32, imm10: i16) -> u32 { pack_8_i10(0x44, rt, ra, imm10) }
 
+    /// R5.10i — pack a byte-immediate RI10 instruction. The 8-bit imm
+    /// field occupies LSB-0 bits 14..21 (matching RPCS3 `bf_t<u32, 14,
+    /// 8> i8`); the upper 2 bits of the 10-bit immediate slot (bits
+    /// 22..23) are forced to 0 so the encoded inst matches what real
+    /// compilers emit. The decoder reads back via `(raw >> 14) & 0xFF`.
+    const fn pack_8_i8(primary_8: u32, rt: u32, ra: u32, i8v: i8) -> u32 {
+        let imm = (i8v as u8) as u32;
+        ((primary_8 & 0xFF) << 24) | (imm << 14) | ((ra & 0x7F) << 7) | (rt & 0x7F)
+    }
+    /// R5.10i — `orbi rt, ra, i8`
+    #[must_use]
+    pub const fn orbi(rt: u32, ra: u32, i8v: i8) -> u32 { pack_8_i8(0x06, rt, ra, i8v) }
+    /// R5.10i — `andbi rt, ra, i8`
+    #[must_use]
+    pub const fn andbi(rt: u32, ra: u32, i8v: i8) -> u32 { pack_8_i8(0x16, rt, ra, i8v) }
+    /// R5.10i — `xorbi rt, ra, i8`
+    #[must_use]
+    pub const fn xorbi(rt: u32, ra: u32, i8v: i8) -> u32 { pack_8_i8(0x46, rt, ra, i8v) }
+    /// R5.10i — `cgtbi rt, ra, i8` (signed byte greater-than)
+    #[must_use]
+    pub const fn cgtbi(rt: u32, ra: u32, i8v: i8) -> u32 { pack_8_i8(0x4E, rt, ra, i8v) }
+    /// R5.10i — `clgtbi rt, ra, i8` (unsigned byte greater-than)
+    #[must_use]
+    pub const fn clgtbi(rt: u32, ra: u32, i8v: i8) -> u32 { pack_8_i8(0x5E, rt, ra, i8v) }
+    /// R5.10i — `ceqbi rt, ra, i8` (byte equality)
+    #[must_use]
+    pub const fn ceqbi(rt: u32, ra: u32, i8v: i8) -> u32 { pack_8_i8(0x7E, rt, ra, i8v) }
+
     /// Pack an RI7 instruction: primary (11) | imm7 (7, MSB 11..17) | ra (7) | rt (7).
     const fn pack_ri7(primary_11: u32, rt: u32, ra: u32, imm7: i8) -> u32 {
         let imm = (imm7 as u32) & 0x7F;
@@ -2003,9 +2541,28 @@ pub mod encode {
     /// `rotqbyi rt, ra, imm7` — rotate quadword left by imm7 bytes.
     #[must_use]
     pub const fn rotqbyi(rt: u32, ra: u32, imm7: i8) -> u32 { pack_ri7(0x1FC, rt, ra, imm7) }
-    /// `shlqbyi rt, ra, imm7` — shift left quadword by imm7 bytes.
+    /// R5.11b — `rotqby rt, ra, rb` (RR-form sibling of rotqbyi 0x1FC).
+    /// Rotate quadword left by (rb_preferred_slot & 0x0F) bytes.
     #[must_use]
-    pub const fn shlqbyi(rt: u32, ra: u32, imm7: i8) -> u32 { pack_ri7(0x1FB, rt, ra, imm7) }
+    pub const fn rotqby(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x1DC, rt, ra, rb) }
+    /// R5.10m — `shlqbyi rt, ra, imm7` — quadword LEFT-shift by `imm7
+    /// & 0x1F` BYTES (zero-fill). Pre-R5.10m this packed `0x1FB`,
+    /// which was actually SHLQBII per RPCS3; the primary is now
+    /// corrected to `0x1FF` (the real SHLQBYI). See R5.10l diagnose
+    /// for the full labeling-bug story.
+    #[must_use]
+    pub const fn shlqbyi(rt: u32, ra: u32, imm7: i8) -> u32 { pack_ri7(0x1FF, rt, ra, imm7) }
+    /// R5.10m — `shlqbii rt, ra, imm7` — quadword LEFT-shift by `imm7
+    /// & 0x7` BITS (zero-fill). Distinct from SHLQBYI (byte-shift).
+    /// New helper at the correct RPCS3 primary `0x1FB`.
+    #[must_use]
+    pub const fn shlqbii(rt: u32, ra: u32, imm7: i8) -> u32 { pack_ri7(0x1FB, rt, ra, imm7) }
+    /// R5.10m — `rotqmbyi rt, ra, imm7` — quadword RIGHT-shift by
+    /// `(0 - imm7) & 0x1F` BYTES (zero-fill from high end). The "M"
+    /// stands for "mask" (zero-fill), NOT "rotate"; the mnemonic is
+    /// inherited from the SPU ISA spec. Primary `0x1FD` per RPCS3.
+    #[must_use]
+    pub const fn rotqmbyi(rt: u32, ra: u32, imm7: i8) -> u32 { pack_ri7(0x1FD, rt, ra, imm7) }
 
     // ---- Iter-4: float-point single-precision (4-lane) --------------
 
@@ -2019,13 +2576,21 @@ pub mod encode {
     #[must_use]
     pub const fn fm(rt: u32, ra: u32, rb: u32) -> u32 { pack_rr(0x2C6, rt, ra, rb) }
 
-    // ---- RRR-form (iter-5): primary 4 | rc 7 | rb 7 | ra 7 | rt 7 ----
+    // ---- RRR-form (iter-5): primary 4 | rt 7 | rb 7 | ra 7 | rc 7 ----
+    // R5.11b — corrected from prior (rt and rc swapped) form which made
+    // encoder + decoder self-consistent but diverged from real SPU
+    // encoding. The actual SPU RRR-form has `rt` (target) at bits 4..10
+    // and `rc` (4th source / mask) at bits 25..31. Caught by the
+    // single_spu_loadstore_v1 fixture whose captured `shufb $12, $6,
+    // $11, $7` (= 0xB182C307) puts $12 in bits 4..10 and $7 in bits
+    // 25..31; the prior decoder swapped them, making shufb write to
+    // r7 (wiping the cwd output) instead of r12.
     const fn pack_rrr(primary_4: u32, rt: u32, ra: u32, rb: u32, rc: u32) -> u32 {
         ((primary_4 & 0xF) << 28)
-            | ((rc & 0x7F) << 21)
+            | ((rt & 0x7F) << 21)
             | ((rb & 0x7F) << 14)
             | ((ra & 0x7F) << 7)
-            | (rt & 0x7F)
+            | (rc & 0x7F)
     }
 
     /// `selb rt, ra, rb, rc` — bit-wise select (rc & rb) | (!rc & ra).
@@ -2155,6 +2720,19 @@ pub mod encode {
     /// `fsm rt, ra` — form select mask (word).
     #[must_use]
     pub const fn fsm(rt: u32, ra: u32) -> u32 { pack_rr_unary(0x1B4, rt, ra) }
+    /// R5.10f — `fsmh rt, ra` — form select mask (halfword).
+    #[must_use]
+    pub const fn fsmh(rt: u32, ra: u32) -> u32 { pack_rr_unary(0x1B5, rt, ra) }
+    /// R5.10f — `fsmb rt, ra` — form select mask (byte).
+    #[must_use]
+    pub const fn fsmb(rt: u32, ra: u32) -> u32 { pack_rr_unary(0x1B6, rt, ra) }
+    /// R5.10f — `fsmbi rt, imm16` — form select mask (byte) from
+    /// 16-bit immediate. RI16-form, p9=0x065. Encoding: bits 0..8 =
+    /// primary 0x065, bits 9..24 = imm16, bits 25..31 = rt.
+    #[must_use]
+    pub const fn fsmbi(rt: u32, imm16: u16) -> u32 {
+        ((0x065u32) << 23) | ((imm16 as u32) << 7) | (rt & 0x7F)
+    }
 
     // ---- Iter-8: indexed load/store ---------------------------------
 
@@ -2562,6 +3140,179 @@ mod tests {
         assert_eq!(split_lanes(spu.gpr[3]), [0xFFFF_FFFF, 0, 0xFFFF_FFFF, 0]);
     }
 
+    // --- R5.10k: Class-A wider RI10 subfamily --------------------
+
+    /// Regression-lock against the EXACT v4 instruction the R5.10i
+    /// diagnostic surfaced at pc=0x6F0: `clgti r32, r3, 31` =
+    /// `0x5C07C1A0`. Verifies BOTH the encoder bit pattern AND the
+    /// runtime semantics: per-word UNSIGNED compare against 31.
+    #[test]
+    fn clgti_regression_v4_0x5C07C1A0() {
+        assert_eq!(encode::clgti(32, 3, 31), 0x5C07C1A0);
+
+        // Mix signed-negative-as-unsigned-large (0xFFFFFFFE = ~4 billion
+        // > 31 unsigned), small (5 < 31), boundary (31 not >, 32 >).
+        let mut spu = make_env(&[encode::clgti(32, 3, 31)]);
+        spu.gpr[3] = join_lanes([0xFFFF_FFFE, 5, 31, 32]);
+        step_ok(&mut spu);
+        assert_eq!(
+            split_lanes(spu.gpr[32]),
+            [0xFFFF_FFFF, 0, 0, 0xFFFF_FFFF],
+            "clgti must compare UNSIGNED — negative ints (large unsigned) > 31",
+        );
+    }
+
+    /// Distinguishes CLGTI (unsigned) from CGTI (signed): a negative
+    /// value is < 0 signed but > 31 unsigned. Anti-regression for any
+    /// future copy-paste between the two arms.
+    #[test]
+    fn clgti_distinct_from_cgti_for_negative_values() {
+        // Same input as cgti_compares_signed but result is different
+        // because of unsigned semantics:
+        //   ra lanes = [10, 5, 6, 0xFFFF_FFFA] (= [10, 5, 6, -6 signed])
+        //   imm = 5
+        //   CGTI signed: [10>5, 5>5, 6>5, -6>5]   = [T, F, T, F]
+        //   CLGTI unsigned: [10>5, 5>5, 6>5, big>5] = [T, F, T, T]
+        let mut spu = make_env(&[encode::clgti(3, 4, 5)]);
+        spu.gpr[4] = join_lanes([10, 5, 6, 0xFFFF_FFFA]);
+        step_ok(&mut spu);
+        assert_eq!(
+            split_lanes(spu.gpr[3]),
+            [0xFFFF_FFFF, 0, 0xFFFF_FFFF, 0xFFFF_FFFF],
+        );
+    }
+
+    /// SFI: imm minus ra (NOT ra minus imm). Boundary cases include
+    /// signed wrap (imm=10, ra=0xFFFFFFFE → 10 - (-2) = 12 if
+    /// interpreted signed; 10u32.wrapping_sub(0xFFFFFFFE) = 12 unsigned
+    /// wrap matches), and `imm=0, ra=1 → -1 = 0xFFFFFFFF`.
+    #[test]
+    fn sfi_subtracts_ra_from_imm_with_wrapping() {
+        let mut spu = make_env(&[encode::sfi(3, 4, 10)]);
+        spu.gpr[4] = join_lanes([3, 0xFFFF_FFFE, 1, 0]);
+        step_ok(&mut spu);
+        assert_eq!(
+            split_lanes(spu.gpr[3]),
+            // 10-3=7; 10u32.wrapping_sub(0xFFFFFFFE) = 12; 10-1=9; 10-0=10
+            [7, 12, 9, 10],
+        );
+    }
+
+    /// SFI with negative immediate (sign-extended): `sfi rt, ra, -1`
+    /// means rt = -1 - ra. For ra=0 → -1 = 0xFFFFFFFF; for ra=5 → -6.
+    #[test]
+    fn sfi_with_negative_immediate() {
+        let mut spu = make_env(&[encode::sfi(3, 4, -1)]);
+        spu.gpr[4] = join_lanes([0, 5, 0xFFFF_FFFF, 100]);
+        step_ok(&mut spu);
+        // -1 - 0 = -1 = 0xFFFFFFFF
+        // -1 - 5 = -6 = 0xFFFFFFFA
+        // -1 - 0xFFFFFFFF = -1u32.wrapping_sub(0xFFFFFFFF) = 0
+        // -1 - 100 = -101 = 0xFFFFFF9B
+        assert_eq!(
+            split_lanes(spu.gpr[3]),
+            [0xFFFF_FFFFu32, 0xFFFF_FFFA, 0, 0xFFFF_FF9B],
+        );
+    }
+
+    /// AHI: per-halfword add. Tests boundary halfword wrap (0xFFFF +
+    /// 1 = 0x0000) and negative immediate sign-extension to i16.
+    #[test]
+    fn ahi_per_halfword_add_with_wrap() {
+        // imm = 1 → every halfword += 1
+        let mut spu = make_env(&[encode::ahi(3, 4, 1)]);
+        spu.gpr[4] = pack_halves([0, 1, 0xFFFE, 0xFFFF, 100, 200, 0x7FFF, 0x8000]);
+        step_ok(&mut spu);
+        assert_eq!(
+            unpack_halves(spu.gpr[3]),
+            [1, 2, 0xFFFF, 0x0000, 101, 201, 0x8000, 0x8001],
+            "halfword add must wrap at 0xFFFF→0x0000",
+        );
+    }
+
+    #[test]
+    fn ahi_with_negative_immediate_subtracts() {
+        // imm = -3 (sign-extended to i16 = 0xFFFD) — adds 0xFFFD per
+        // halfword, which is equivalent to subtract 3 with wrap.
+        let mut spu = make_env(&[encode::ahi(3, 4, -3)]);
+        spu.gpr[4] = pack_halves([10, 3, 2, 0, 100, 0xFFFF, 0x8000, 0x7FFF]);
+        step_ok(&mut spu);
+        assert_eq!(
+            unpack_halves(spu.gpr[3]),
+            [
+                7,                                    // 10 - 3
+                0,                                    // 3 - 3
+                0xFFFFu16,                            // 2 - 3 wraps
+                0xFFFDu16,                            // 0 - 3 wraps
+                97,                                   // 100 - 3
+                0xFFFCu16,                            // 0xFFFF - 3
+                0x7FFDu16,                            // 0x8000 - 3
+                0x7FFCu16,                            // 0x7FFF - 3
+            ],
+        );
+    }
+
+    /// MPYI: per-word signed 16x16->32 multiply. The HIGH 16 bits of
+    /// each ra word must NOT contribute (the C++ uses `_mm_madd_epi16`
+    /// against `set1_epi32(si10 & 0xFFFF)` which puts 0 in the high
+    /// 16 of each broadcast lane). Sign-extension matters for both
+    /// the source low-half and the immediate.
+    #[test]
+    fn mpyi_signed_low_halfword_multiply() {
+        // imm = -3 → multiply each ra-low-i16 by -3.
+        // Lanes of ra: 0xDEAD_0005 (low=5),  0xCAFE_FFFE (low=-2 signed),
+        //              0x0000_7FFF (low=32767), 0x1234_8000 (low=-32768).
+        let mut spu = make_env(&[encode::mpyi(3, 4, -3)]);
+        spu.gpr[4] = join_lanes([0xDEAD_0005, 0xCAFE_FFFE, 0x0000_7FFF, 0x1234_8000]);
+        step_ok(&mut spu);
+        assert_eq!(
+            split_lanes(spu.gpr[3]),
+            [
+                (5_i32 * -3) as u32,           // -15 = 0xFFFF_FFF1
+                ((-2_i32) * -3) as u32,        // 6
+                (32767_i32 * -3) as u32,       // -98301 = 0xFFFE_8003
+                ((-32768_i32) * -3) as u32,    // 98304 = 0x0001_8000
+            ],
+        );
+    }
+
+    /// MPYUI: per-word UNSIGNED 16x16->32 multiply. Negative-as-signed
+    /// inputs must be treated as large unsigned u16 values; the
+    /// product fills the full 32-bit lane.
+    #[test]
+    fn mpyui_unsigned_low_halfword_multiply() {
+        // imm = 3 → multiply each ra-low-u16 by 3.
+        let mut spu = make_env(&[encode::mpyui(3, 4, 3)]);
+        spu.gpr[4] = join_lanes([0xDEAD_FFFF, 0xCAFE_8000, 0x0000_0001, 0x1234_5555]);
+        step_ok(&mut spu);
+        assert_eq!(
+            split_lanes(spu.gpr[3]),
+            [
+                0xFFFF_u32 * 3,        // 0x0002_FFFD
+                0x8000_u32 * 3,        // 0x0001_8000
+                0x0001_u32 * 3,        // 3
+                0x5555_u32 * 3,        // 0x0000_FFFF
+            ],
+        );
+    }
+
+    /// Cross-check: MPYUI vs MPYI on the SAME input must differ when
+    /// the low halfword has high bit set (interpreted as negative
+    /// signed vs large unsigned). Anti-regression.
+    #[test]
+    fn mpyui_distinct_from_mpyi_for_high_bit_set() {
+        // Low halfword = 0xFFFF: signed -1, unsigned 65535. Multiply
+        // by 3:  signed → -3 = 0xFFFFFFFD; unsigned → 0x0002FFFD.
+        let mut spu = make_env(&[encode::mpyi(5, 4, 3), encode::mpyui(6, 4, 3)]);
+        spu.gpr[4] = join_lanes([0xAAAA_FFFF, 0xAAAA_FFFF, 0xAAAA_FFFF, 0xAAAA_FFFF]);
+        step_ok(&mut spu);
+        step_ok(&mut spu);
+        assert_eq!(spu.gpr[5], join_lanes([0xFFFF_FFFD; 4]),
+                   "MPYI signed: -1 * 3 = -3");
+        assert_eq!(spu.gpr[6], join_lanes([0x0002_FFFD; 4]),
+                   "MPYUI unsigned: 65535 * 3 = 196605");
+    }
+
     // --- iter-2: add-immediate ------------------------------------
 
     #[test]
@@ -2721,6 +3472,46 @@ mod tests {
         assert_eq!(spu.gpr[3].to_be_bytes()[0], 0xA1);
     }
 
+    /// R5.11b — RR-form rotqby. Same byte-rotate semantics as
+    /// rotqbyi but the shift count comes from the low 4 bits of rb's
+    /// preferred slot (top 32 bits of the u128). Surfaced by GCC -O2
+    /// codegen for runtime-indexed extraction of a 4-byte slot from
+    /// a 16-byte aligned LS load (single_spu_loadstore_v1 fixture).
+    #[test]
+    fn rotqby_rotates_quadword_left_by_rb_low_nibble() {
+        let mut spu = make_env(&[encode::rotqby(3, 4, 5)]);
+        spu.gpr[4] = u128::from_be_bytes([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        ]);
+        // rb's preferred slot = 4 → rotate by 4 bytes (same outcome
+        // as rotqbyi rt, ra, 4).
+        spu.gpr[5] = (4u128) << 96;
+        step_ok(&mut spu);
+        assert_eq!(
+            spu.gpr[3].to_be_bytes(),
+            [
+                0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
+                0x0C, 0x0D, 0x0E, 0x0F, 0x00, 0x01, 0x02, 0x03,
+            ],
+        );
+    }
+
+    /// rotqby ignores high bits of rb's preferred slot — only the
+    /// low 4 bits matter. This mirrors rotqbyi's 0x0F mask.
+    #[test]
+    fn rotqby_modulo_16_bytes_in_rb_preferred_slot() {
+        let mut spu = make_env(&[encode::rotqby(3, 4, 5)]);
+        spu.gpr[4] = u128::from_be_bytes([
+            0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+            0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF,
+        ]);
+        // rb preferred slot = 0xFF11 → low 4 bits = 1 → rotate by 1.
+        spu.gpr[5] = (0xFF11u128) << 96;
+        step_ok(&mut spu);
+        assert_eq!(spu.gpr[3].to_be_bytes()[0], 0xA1);
+    }
+
     #[test]
     fn shlqbyi_zero_fills_right_tail() {
         let mut spu = make_env(&[encode::shlqbyi(3, 4, 3)]);
@@ -2735,6 +3526,169 @@ mod tests {
             0xCC, 0xDD, 0xEE, 0xFF, 0x00,
         ]);
         assert_eq!(&out[13..], &[0, 0, 0]);
+    }
+
+    // --- R5.10m: ROTQMBYI + SHLQBYI/SHLQBII labeling fix ----------
+
+    /// R5.10m regression — exact v4 instance at pc=0x72C.
+    /// `rotqmbyi r22, r29, 0x7C` (= -4 signed) produces a right-shift
+    /// of `(0 - (-4)) & 0x1F = 4` bytes (zero-fill from the high end).
+    #[test]
+    fn rotqmbyi_shift_right_by_4_bytes_v4_regression() {
+        assert_eq!(encode::rotqmbyi(22, 29, -4), 0x3FBF0E96);
+
+        let mut spu = make_env(&[encode::rotqmbyi(22, 29, -4)]);
+        spu.gpr[29] = u128::from_be_bytes([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        ]);
+        step_ok(&mut spu);
+        // After right-shift by 4 bytes: high 4 bytes = 0; rest = a's
+        // bytes 0..11.
+        assert_eq!(spu.gpr[22].to_be_bytes(), [
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0A, 0x0B,
+        ]);
+    }
+
+    /// `imm7 = 0` → effective shift count `(0 - 0) & 0x1F = 0` →
+    /// identity (rt = ra unchanged).
+    #[test]
+    fn rotqmbyi_zero_immediate_is_identity() {
+        let mut spu = make_env(&[encode::rotqmbyi(3, 4, 0)]);
+        let payload: u128 = 0xCAFE_F00D_DEAD_BEEF_1234_5678_9ABC_DEF0;
+        spu.gpr[4] = payload;
+        step_ok(&mut spu);
+        assert_eq!(spu.gpr[3], payload);
+    }
+
+    /// Positive `imm7 = 4` → shift count `(0 - 4) & 0x1F = 28` → ≥ 16 →
+    /// output is all zeros (the entire quadword falls off the high end).
+    #[test]
+    fn rotqmbyi_positive_immediate_zeroes_when_shift_ge_16() {
+        let mut spu = make_env(&[encode::rotqmbyi(3, 4, 4)]);
+        spu.gpr[4] = u128::MAX;
+        step_ok(&mut spu);
+        assert_eq!(spu.gpr[3], 0);
+    }
+
+    /// Boundary: `imm7 = -1` → shift count = 1 → bytes shift right
+    /// by exactly 1, with byte 0 = 0 and byte 15 = a's byte 14.
+    #[test]
+    fn rotqmbyi_minus_one_shifts_right_one_byte() {
+        let mut spu = make_env(&[encode::rotqmbyi(3, 4, -1)]);
+        spu.gpr[4] = u128::from_be_bytes([
+            0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+            0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF,
+        ]);
+        step_ok(&mut spu);
+        assert_eq!(spu.gpr[3].to_be_bytes(), [
+            0x00, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6,
+            0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE,
+        ]);
+    }
+
+    /// R5.10m anti-regression — encode::shlqbyi MUST pack primary
+    /// `0x1FF`, NOT `0x1FB`. Pre-R5.10m the helper packed `0x1FB`
+    /// (which is SHLQBII per RPCS3) producing a wire-format mismatch.
+    #[test]
+    fn shlqbyi_uses_primary_0x1ff_not_0x1fb() {
+        let inst = encode::shlqbyi(3, 4, 5);
+        let p11 = inst >> 21;
+        assert_eq!(
+            p11, 0x1FF,
+            "shlqbyi must encode at primary 0x1FF (SHLQBYI per RPCS3); \
+             pre-R5.10m it was incorrectly 0x1FB (which is SHLQBII)",
+        );
+        assert_ne!(p11, 0x1FB, "0x1FB is SHLQBII, NOT SHLQBYI");
+    }
+
+    /// R5.10m — SHLQBII at the corrected primary 0x1FB performs a
+    /// 128-bit LEFT-SHIFT BY BITS (not bytes). For `imm7 = 4`, mask
+    /// `& 0x7 = 4` → shift by 4 bits. Pre-R5.10m the 0x1FB arm
+    /// performed BYTE-shift (was mislabeled "shlqbyi") which is wrong
+    /// by 8x for any non-zero count.
+    #[test]
+    fn shlqbii_bit_shift_left_distinct_from_byte_shift() {
+        let mut spu = make_env(&[encode::shlqbii(3, 4, 4)]);
+        spu.gpr[4] = u128::from_be_bytes([
+            0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        ]);
+        step_ok(&mut spu);
+        // 4-bit left-shift: 0x80...01 << 4 = 0x80<<4 | low_carry...
+        // Actually: u128 left-shift by 4. The MSB byte 0x80 becomes
+        // 0x00 (the 1-bit carries out of the u128 entirely), and the
+        // rest shifts up. Trace by hand:
+        //   input  hex = 0x80000000_00000000_00000000_00000001
+        //   << 4       = 0x00000000_00000000_00000000_00000010
+        // (the 0x80 bit shifts out, only the low 0x01 bit shifts up
+        //  to 0x10 in the same byte).
+        assert_eq!(spu.gpr[3].to_be_bytes(), [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+        ]);
+        // Anti-regression: this MUST NOT be byte-shift-by-4 result
+        // (which would have produced 0x00<<4 = 0x00000000_00000001_...
+        // with byte 4 nonzero).
+        assert_ne!(
+            spu.gpr[3],
+            // What pre-R5.10m would have produced (byte-shift by
+            // `imm7 & 0x1F = 4`):
+            u128::from_be_bytes([
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            ]),
+        );
+    }
+
+    /// SHLQBII bit-shift `imm7 = 0` → identity.
+    #[test]
+    fn shlqbii_zero_immediate_is_identity() {
+        let mut spu = make_env(&[encode::shlqbii(3, 4, 0)]);
+        let payload: u128 = 0xCAFE_F00D_DEAD_BEEF_1234_5678_9ABC_DEF0;
+        spu.gpr[4] = payload;
+        step_ok(&mut spu);
+        assert_eq!(spu.gpr[3], payload);
+    }
+
+    /// Anti-regression: SHLQBYI (byte-shift) at 0x1FF and SHLQBII
+    /// (bit-shift) at 0x1FB MUST produce DIFFERENT results for the
+    /// same `imm7=2` against the same input. Pre-R5.10m these were
+    /// conflated (both byte-shift) at primary 0x1FB.
+    #[test]
+    fn shlqbyi_distinct_from_shlqbii_for_same_input() {
+        let payload = u128::from_be_bytes([
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        ]);
+        // SHLQBYI imm7=2: byte-shift left by 2 bytes — 14 leading 0xFF
+        // bytes + 2 trailing zeros.
+        let mut spu_a = make_env(&[encode::shlqbyi(3, 4, 2)]);
+        spu_a.gpr[4] = payload;
+        step_ok(&mut spu_a);
+        let byte_shift_result = spu_a.gpr[3];
+
+        // SHLQBII imm7=2: bit-shift left by 2 bits — every byte
+        // becomes 0xFC (= 0xFF & 0xFC after bit-shift) except the LSB
+        // which loses its bottom 2 bits.
+        let mut spu_b = make_env(&[encode::shlqbii(3, 4, 2)]);
+        spu_b.gpr[4] = payload;
+        step_ok(&mut spu_b);
+        let bit_shift_result = spu_b.gpr[3];
+
+        assert_ne!(byte_shift_result, bit_shift_result);
+        assert_eq!(byte_shift_result.to_be_bytes(), [
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00,
+        ]);
+        // bit-shift left by 2: each pair of consecutive bits carries.
+        // u128 0xFF...FF << 2 = 0xFF...FC (top 2 bits shift out).
+        assert_eq!(bit_shift_result.to_be_bytes(), [
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC,
+        ]);
     }
 
     // --- iter-3: multiply ----------------------------------------
@@ -3176,15 +4130,19 @@ mod tests {
 
     #[test]
     fn rdch_signal1_clears_after_read() {
+        // R5.11: SNR reads now match Cell BE semantics (block when
+        // count == 0), so a second consecutive rdch on a drained SNR
+        // would park instead of returning 0. Test now: signal once,
+        // read once, assert value + that the channel was cleared
+        // (both the read result and the channels.snr[0] state).
         let mut spu = make_env(&[
             encode::rdch(3, ch::SPU_RDSIGNOTIFY1),
-            encode::rdch(4, ch::SPU_RDSIGNOTIFY1),
             encode::stop(0),
         ]);
         spu.channels.signal(0, 0xA5A5);
         run_n(&mut spu, 10).unwrap();
         assert_eq!(split_lanes(spu.gpr[3])[0], 0xA5A5);
-        assert_eq!(split_lanes(spu.gpr[4])[0], 0, "signal cleared after first read");
+        assert_eq!(spu.channels.snr[0], 0, "snr[0] cleared after read");
     }
 
     #[test]
@@ -3354,6 +4312,118 @@ mod tests {
         assert_eq!(split_lanes(spu.gpr[3]), [0xFFFF_FFFF, 0, 0xFFFF_FFFF, 0]);
     }
 
+    // --- R5.10f: rest of FSM family (FSMH / FSMB / FSMBI) -------------
+
+    #[test]
+    fn fsmh_expands_8_bits_to_8_halfwords() {
+        // ra preferred low 8 = 0b10100110:
+        //   bit 7 (=1) → halfword 0 = 0xFFFF
+        //   bit 6 (=0) → halfword 1 = 0x0000
+        //   bit 5 (=1) → halfword 2 = 0xFFFF
+        //   bit 4 (=0) → halfword 3 = 0x0000
+        //   bit 3 (=0) → halfword 4 = 0x0000
+        //   bit 2 (=1) → halfword 5 = 0xFFFF
+        //   bit 1 (=1) → halfword 6 = 0xFFFF
+        //   bit 0 (=0) → halfword 7 = 0x0000
+        let mut spu = make_env(&[encode::fsmh(3, 4)]);
+        set_lane(&mut spu, 4, [0b1010_0110, 0, 0, 0]);
+        step_ok(&mut spu);
+        let expected: [u8; 16] = [
+            0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00,
+            0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00,
+        ];
+        assert_eq!(spu.gpr[3], u128::from_be_bytes(expected));
+    }
+
+    #[test]
+    fn fsmh_all_zero_yields_all_zero_mask() {
+        let mut spu = make_env(&[encode::fsmh(3, 4)]);
+        set_lane(&mut spu, 4, [0, 0, 0, 0]);
+        step_ok(&mut spu);
+        assert_eq!(spu.gpr[3], 0);
+    }
+
+    #[test]
+    fn fsmh_all_ones_yields_all_ones_mask() {
+        // Low 8 bits = 0xFF → all 8 halfwords = 0xFFFF.
+        let mut spu = make_env(&[encode::fsmh(3, 4)]);
+        set_lane(&mut spu, 4, [0xFF, 0, 0, 0]);
+        step_ok(&mut spu);
+        assert_eq!(spu.gpr[3], u128::MAX);
+    }
+
+    #[test]
+    fn fsmb_expands_16_bits_to_16_bytes() {
+        // ra preferred low 16 = 0x8001 = 0b1000_0000_0000_0001:
+        //   bit 15 → SPU byte 0 = 0xFF
+        //   bit 0  → SPU byte 15 = 0xFF
+        //   all others = 0x00
+        let mut spu = make_env(&[encode::fsmb(3, 4)]);
+        set_lane(&mut spu, 4, [0x8001, 0, 0, 0]);
+        step_ok(&mut spu);
+        let expected: [u8; 16] = [
+            0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
+        ];
+        assert_eq!(spu.gpr[3], u128::from_be_bytes(expected));
+    }
+
+    #[test]
+    fn fsmb_ignores_high_bits_of_ra() {
+        // Bits 16+ of ra preferred slot must NOT affect the mask;
+        // FSMB only reads the low 16. We set high bits to non-zero
+        // and expect the same all-zero result.
+        let mut spu = make_env(&[encode::fsmb(3, 4)]);
+        set_lane(&mut spu, 4, [0xFFFF_0000, 0, 0, 0]);
+        step_ok(&mut spu);
+        assert_eq!(spu.gpr[3], 0);
+    }
+
+    #[test]
+    fn fsmbi_regression_v4_0x32880003_at_pc_864() {
+        // R5.10f regression — exact value the v4 diagnostic at pc=0x864
+        // hit before this iteration. Encoding: fsmbi r3, 0x1000 →
+        //   inst hex = 0x32880003 (decimal 847_773_699).
+        // Expected mask: only bit 12 of imm16 set → only SPU byte 3
+        // becomes 0xFF; the other 15 bytes stay 0x00.
+        assert_eq!(encode::fsmbi(3, 0x1000), 0x32880003);
+        let mut spu = make_env(&[encode::fsmbi(3, 0x1000)]);
+        step_ok(&mut spu);
+        let expected: [u8; 16] = [
+            0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(spu.gpr[3], u128::from_be_bytes(expected));
+    }
+
+    #[test]
+    fn fsmbi_all_zero_yields_all_zero_mask() {
+        let mut spu = make_env(&[encode::fsmbi(7, 0x0000)]);
+        step_ok(&mut spu);
+        assert_eq!(spu.gpr[7], 0);
+    }
+
+    #[test]
+    fn fsmbi_all_ones_yields_all_ones_mask() {
+        let mut spu = make_env(&[encode::fsmbi(9, 0xFFFF)]);
+        step_ok(&mut spu);
+        assert_eq!(spu.gpr[9], u128::MAX);
+    }
+
+    #[test]
+    fn fsmbi_v4_imm_0x0202_pattern() {
+        // Another i16 pattern observed in v4 (.spuimg first FSMBI
+        // sites). 0x0202 = bits 9 and 1 set →
+        //   bit 9 → SPU byte 6 = 0xFF
+        //   bit 1 → SPU byte 14 = 0xFF
+        let mut spu = make_env(&[encode::fsmbi(5, 0x0202)]);
+        step_ok(&mut spu);
+        let mut expected = [0u8; 16];
+        expected[6]  = 0xFF;
+        expected[14] = 0xFF;
+        assert_eq!(spu.gpr[5], u128::from_be_bytes(expected));
+    }
+
     // --- Iter-8: indexed load/store ------------------------------
 
     #[test]
@@ -3376,6 +4446,572 @@ mod tests {
         set_lane(&mut spu, 5, [0x20, 0, 0, 0]);
         step_ok(&mut spu);
         assert_eq!(read_qword_be(&spu, 0xA0).unwrap(), spu.gpr[3]);
+    }
+
+    // --- R5.10b: lqr (load qword PC-relative) ----------------------
+
+    /// Place an `lqr r7, +0x10` at pc=0x100. The PC-relative target
+    /// is `(0x100 + (0x10 << 2)) & 0x3FFF0 = 0x140`. Pre-load a known
+    /// payload at 0x140; step; assert gpr[7] receives the payload AND
+    /// pc advances by 4 (lqr is not a branch).
+    #[test]
+    fn lqr_loads_quadword_from_pc_relative_target() {
+        let mut spu = SpuThread::new(0);
+        let pc = 0x100u32;
+        let inst = encode::lqr(7, 0x10);
+        assert!(spu.ls_write(pc, &inst.to_be_bytes()));
+
+        // Payload at the resolved target.
+        let payload: u128 = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210;
+        assert!(spu.ls_write(0x140, &payload.to_be_bytes()));
+
+        spu.pc = pc;
+        let outcome = step(&mut spu).expect("lqr must succeed");
+        assert!(matches!(outcome, StepOutcome::Continue));
+        assert_eq!(spu.gpr[7], payload, "gpr[rt] receives the loaded qword");
+        assert_eq!(spu.pc, pc + 4, "pc advances by 4 (lqr is not a branch)");
+    }
+
+    /// Wrap-around: `lqr r3, -16` from pc=0x10 produces target
+    /// `(0x10 + (-16 << 2)) & 0x3FFF0 = (0x10 - 0x40) & 0x3FFF0`
+    /// `= 0xFFFFFFD0 & 0x3FFF0 = 0x3FFD0` (top of LS, 16-byte aligned).
+    /// Verifies the LS-mask + 16-byte align contract matches RPCS3
+    /// C++ `spu_ls_target`. The same instruction MUST also work when
+    /// the target falls cleanly in the LS without wrapping.
+    #[test]
+    fn lqr_wraps_to_ls_bounds() {
+        let mut spu = SpuThread::new(0);
+        let pc = 0x10u32;
+        let imm16: i16 = -16; // -16 halfwords = -64 bytes
+        let target = 0x3FFD0u32; // (0x10 - 0x40) wrapped = 0x3FFD0
+
+        let inst = encode::lqr(3, imm16);
+        assert!(spu.ls_write(pc, &inst.to_be_bytes()));
+
+        // Place a distinct payload at the wrapped target.
+        let payload: u128 = 0xCAFE_F00D_DEAD_BEEF_1234_5678_9ABC_DEF0;
+        assert!(spu.ls_write(target, &payload.to_be_bytes()));
+
+        spu.pc = pc;
+        step(&mut spu).expect("wrapped lqr must succeed");
+        assert_eq!(
+            spu.gpr[3], payload,
+            "lqr should load from wrapped target 0x{target:X}",
+        );
+        assert_eq!(spu.pc, pc + 4);
+    }
+
+    /// 16-byte alignment: an `lqr` whose pure arithmetic target has
+    /// bottom-4 bits set MUST land on the 16-byte-floored address.
+    /// Constructed by encoding `lqr r5, +0x11` at pc=0x100:
+    /// `(0x100 + (0x11 << 2)) & 0x3FFF0 = (0x100 + 0x44) & 0x3FFF0`
+    /// `= 0x144 & 0x3FFF0 = 0x140` — bottom 4 bits cleared.
+    #[test]
+    fn lqr_aligns_target_to_16_bytes() {
+        let mut spu = SpuThread::new(0);
+        let pc = 0x100u32;
+        let inst = encode::lqr(5, 0x11);
+        assert!(spu.ls_write(pc, &inst.to_be_bytes()));
+
+        // Two distinct payloads: one at the aligned address (which the
+        // load MUST hit), one at the would-be-unaligned address (which
+        // the load MUST NOT hit). If the alignment is wrong, the test
+        // catches it because the loaded qword would be the unaligned
+        // payload.
+        let aligned_payload: u128 = 0x1111_2222_3333_4444_5555_6666_7777_8888;
+        let stray_payload: u128 = 0xAAAA_BBBB_CCCC_DDDD_EEEE_FFFF_0000_1111;
+        assert!(spu.ls_write(0x140, &aligned_payload.to_be_bytes()));
+        // "Unaligned" payload at 0x144 — overlaps the aligned region's
+        // last 12 bytes; we just need the high bytes to differ so the
+        // mismatch is detectable. A read from 0x144 (unaligned) would
+        // produce the bytes starting at 0x144 (= last 12 of aligned +
+        // first 4 of stray); a read from 0x140 (aligned) produces
+        // exactly aligned_payload. We compare against aligned_payload.
+        assert!(spu.ls_write(0x150, &stray_payload.to_be_bytes()));
+
+        spu.pc = pc;
+        step(&mut spu).expect("aligned lqr must succeed");
+        assert_eq!(
+            spu.gpr[5], aligned_payload,
+            "lqr must load from 0x140 (aligned) not 0x144 (unaligned)",
+        );
+        assert_eq!(spu.pc, pc + 4);
+    }
+
+    // --- R5.10g: STQR (Store Quadword PC-Relative) -----------------
+    //
+    // Direct mirror of LQR (R5.10b): same `spu_ls_target(pc, imm16) =
+    // (pc + (imm16<<2)) & 0x3FFF0` address contract; just the
+    // direction reverses (LS receives gpr[rt]).
+
+    /// Round-trip: prepare gpr[rt] with a known qword, encode an STQR,
+    /// step, and assert LS at the resolved target receives the exact
+    /// 16 bytes (and that pc advances by 4 — STQR is not a branch).
+    #[test]
+    fn stqr_stores_quadword_to_pc_relative_target() {
+        let mut spu = make_env(&[encode::stqr(7, 0x10)]);
+
+        // make_env starts pc at 0 → target = (0 + (0x10<<2)) & 0x3FFF0
+        // = 0x40 (already 16-byte aligned).
+        let payload: u128 = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210;
+        spu.gpr[7] = payload;
+
+        let pc_before = spu.pc;
+        step_ok(&mut spu);
+
+        assert_eq!(
+            read_qword_be(&spu, 0x40).unwrap(), payload,
+            "LS at 0x40 must equal the gpr[7] payload",
+        );
+        assert_eq!(spu.pc, pc_before + 4, "pc advances by 4 (stqr is not a branch)");
+    }
+
+    /// Wrap-around: same shape as `lqr_wraps_to_ls_bounds` but for the
+    /// store side. From pc=0x10 with imm16=-16, target wraps to the
+    /// top of LS at 0x3FFD0. Verifies the LS-mask + 16-byte align
+    /// contract matches RPCS3 C++ `spu_ls_target` for negative offsets.
+    #[test]
+    fn stqr_wraps_to_ls_bounds() {
+        let mut spu = SpuThread::new(0);
+        let pc = 0x10u32;
+        let imm16: i16 = -16;
+        let target = 0x3FFD0u32;
+
+        // Hand-place the inst at pc=0x10 (make_env always uses 0x100).
+        let inst = encode::stqr(3, imm16);
+        assert!(spu.ls_write(pc, &inst.to_be_bytes()));
+
+        let payload: u128 = 0xCAFE_F00D_DEAD_BEEF_1234_5678_9ABC_DEF0;
+        spu.gpr[3] = payload;
+
+        spu.pc = pc;
+        step(&mut spu).expect("wrapped stqr must succeed");
+
+        assert_eq!(
+            read_qword_be(&spu, target).unwrap(), payload,
+            "stqr should write to wrapped target 0x{target:X}",
+        );
+        assert_eq!(spu.pc, pc + 4);
+    }
+
+    /// 16-byte alignment: `stqr r5, +0x11` at pc=0 (make_env default)
+    /// → arithmetic target 0x44 (bottom 4 bits set), aligned target
+    /// 0x40. The store MUST land at 0x40 AND must not stray into the
+    /// adjacent qword at 0x50.
+    #[test]
+    fn stqr_aligns_target_to_16_bytes() {
+        let mut spu = make_env(&[encode::stqr(5, 0x11)]);
+
+        // Pre-fill 0x50 with a sentinel to detect off-by-16 stores.
+        // (0x40 will be overwritten by the store under test.)
+        let sentinel: u128 = 0xDEAD_FACE_CAFE_BABE_0000_1111_2222_3333;
+        write_qword_be(&mut spu, 0x50, sentinel).unwrap();
+
+        let payload: u128 = 0x1111_2222_3333_4444_5555_6666_7777_8888;
+        spu.gpr[5] = payload;
+
+        let pc_before = spu.pc;
+        step_ok(&mut spu);
+
+        assert_eq!(
+            read_qword_be(&spu, 0x40).unwrap(), payload,
+            "stqr must write at 0x40 (aligned), not 0x44 (unaligned)",
+        );
+        assert_eq!(
+            read_qword_be(&spu, 0x50).unwrap(), sentinel,
+            "stqr must NOT touch the next qword at 0x50",
+        );
+        assert_eq!(spu.pc, pc_before + 4);
+    }
+
+    /// Regression-lock against the EXACT v4 instruction the R5.10f
+    /// diagnostic surfaced at pc=0x868 (decimal 2152): `stqr r2, -426`
+    /// = inst hex `0x23FF2B02` (decimal 603,925,250). Resolved target
+    /// is 0x1C0 (= (0x868 + (-426 * 4)) & 0x3FFF0). Verifies the
+    /// encode helper produces the exact bit pattern AND that the
+    /// interpreter actually performs the store there.
+    #[test]
+    fn stqr_real_v4_inst_at_pc_868() {
+        assert_eq!(
+            encode::stqr(2, -426), 0x23FF2B02,
+            "encoder must produce the exact v4 bit pattern",
+        );
+
+        let mut spu = SpuThread::new(0);
+        let pc = 0x868u32;
+        assert!(spu.ls_write(pc, &(0x23FF2B02u32).to_be_bytes()));
+
+        let payload: u128 = 0xA0A1_A2A3_A4A5_A6A7_B0B1_B2B3_B4B5_B6B7;
+        spu.gpr[2] = payload;
+
+        spu.pc = pc;
+        step(&mut spu).expect("v4 stqr must succeed");
+
+        assert_eq!(
+            read_qword_be(&spu, 0x1C0).unwrap(), payload,
+            "real v4 stqr must store at 0x1C0",
+        );
+        assert_eq!(spu.pc, 0x86C);
+    }
+
+    // --- R5.10o: LQA / STQA (Absolute qword load/store) ------------
+    //
+    // Same RI16 encoding form as LQR/STQR but address is PC-independent:
+    //   target = (imm16 << 2) & 0x3FFF0
+    // Negative imm16 wraps via the `& 0x3FFF0` mask onto the top of LS
+    // (the standard prologue/epilogue save-restore pattern uses negative
+    // imm16 values to address the top scratch area).
+
+    /// Round-trip: prepare gpr[rt] with a known qword, encode an STQA,
+    /// step, and assert LS at the absolute resolved target receives
+    /// the exact 16 bytes (and pc advances by 4).
+    #[test]
+    fn stqa_stores_quadword_to_absolute_target() {
+        let mut spu = make_env(&[encode::stqa(7, 0x10)]);
+        // pc=0 doesn't matter — STQA target ignores pc.
+        // target = (0x10 << 2) & 0x3FFF0 = 0x40.
+        let payload: u128 = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210;
+        spu.gpr[7] = payload;
+        let pc_before = spu.pc;
+        step_ok(&mut spu);
+        assert_eq!(
+            read_qword_be(&spu, 0x40).unwrap(), payload,
+            "stqa must write at absolute address 0x40 (PC-independent)",
+        );
+        assert_eq!(spu.pc, pc_before + 4, "stqa advances pc by 4");
+    }
+
+    /// Negative imm16 wrap to top of LS — the standard pattern for v4
+    /// prologue saves. From any pc, `imm16=-12` → target = `(-12<<2) &
+    /// 0x3FFF0` = `0xFFFFFFD0 & 0x3FFF0` = `0x3FFD0` (matches the v4
+    /// site at pc=0x734).
+    #[test]
+    fn stqa_wraps_negative_absolute_address_to_top_of_ls() {
+        let mut spu = make_env(&[encode::stqa(9, -12)]);
+        let payload: u128 = 0xCAFE_F00D_DEAD_BEEF_1234_5678_9ABC_DEF0;
+        spu.gpr[9] = payload;
+        step_ok(&mut spu);
+        assert_eq!(
+            read_qword_be(&spu, 0x3FFD0).unwrap(), payload,
+            "stqa imm16=-12 must wrap to top of LS at 0x3FFD0",
+        );
+    }
+
+    /// LQA happy-path: write a qword to LS at an absolute target, then
+    /// LQA from the same target → gpr[rt] receives the exact bytes.
+    #[test]
+    fn lqa_loads_quadword_from_absolute_target() {
+        let mut spu = make_env(&[encode::lqa(5, 0x20)]);
+        // target = (0x20 << 2) & 0x3FFF0 = 0x80.
+        let payload: u128 = 0x1111_2222_3333_4444_5555_6666_7777_8888;
+        write_qword_be(&mut spu, 0x80, payload).unwrap();
+        let pc_before = spu.pc;
+        step_ok(&mut spu);
+        assert_eq!(spu.gpr[5], payload, "lqa must load from 0x80");
+        assert_eq!(spu.pc, pc_before + 4);
+    }
+
+    /// LQA with negative imm16 wrap — same pattern as v4 epilogue
+    /// restore. `imm16=-8` → target = `0x3FFE0`.
+    #[test]
+    fn lqa_wraps_negative_absolute_address_to_top_of_ls() {
+        let mut spu = make_env(&[encode::lqa(4, -8)]);
+        let payload: u128 = 0xDEAD_FACE_CAFE_BABE_0000_1111_2222_3333;
+        write_qword_be(&mut spu, 0x3FFE0, payload).unwrap();
+        step_ok(&mut spu);
+        assert_eq!(
+            spu.gpr[4], payload,
+            "lqa imm16=-8 must read from top-of-LS at 0x3FFE0",
+        );
+    }
+
+    /// LQA + STQA round-trip: store a payload to top-of-LS via STQA,
+    /// then load it back via LQA from the same address. Byte-exact.
+    /// Mirrors the v4 prologue/epilogue save-restore pattern.
+    #[test]
+    fn lqa_stqa_roundtrip_absolute_top_of_ls() {
+        let mut spu = make_env(&[
+            encode::stqa(3, -12), // store r3 → 0x3FFD0
+            encode::lqa(8, -12),  // load 0x3FFD0 → r8
+        ]);
+        let payload: u128 = 0xFEEDFACECAFEBABEDEADBEEF12345678;
+        spu.gpr[3] = payload;
+        step_ok(&mut spu);
+        step_ok(&mut spu);
+        assert_eq!(
+            spu.gpr[8], payload,
+            "lqa→stqa round-trip at top-of-LS must be byte-identical",
+        );
+        assert_eq!(
+            read_qword_be(&spu, 0x3FFD0).unwrap(), payload,
+            "LS at 0x3FFD0 must hold the stored payload",
+        );
+    }
+
+    /// Anti-regression: LQR (pc-relative) MUST still use pc; running
+    /// the same imm16 from two different pcs produces two different
+    /// targets. Anti-regression locks the LQR semantics distinct from
+    /// LQA (PC=0).
+    #[test]
+    fn lqr_remains_pc_relative_after_lqa_landing() {
+        let payload_a: u128 = 0xAAAAAAAAAAAAAAAA0000000000000000;
+        let payload_b: u128 = 0xBBBBBBBBBBBBBBBB0000000000000000;
+
+        // LQR with imm16=0x10 from pc=0: target = (0 + 0x40) & 0x3FFF0 = 0x40.
+        let mut spu_a = SpuThread::new(0);
+        let inst = encode::lqr(7, 0x10);
+        assert!(spu_a.ls_write(0, &inst.to_be_bytes()));
+        write_qword_be(&mut spu_a, 0x40, payload_a).unwrap();
+        spu_a.pc = 0;
+        step(&mut spu_a).expect("lqr at pc=0");
+        assert_eq!(spu_a.gpr[7], payload_a, "lqr from pc=0, imm=0x10 → target 0x40");
+
+        // LQR with imm16=0x10 from pc=0x100: target = (0x100 + 0x40) & 0x3FFF0 = 0x140.
+        let mut spu_b = SpuThread::new(0);
+        assert!(spu_b.ls_write(0x100, &inst.to_be_bytes()));
+        write_qword_be(&mut spu_b, 0x140, payload_b).unwrap();
+        spu_b.pc = 0x100;
+        step(&mut spu_b).expect("lqr at pc=0x100");
+        assert_eq!(spu_b.gpr[7], payload_b, "lqr from pc=0x100, imm=0x10 → target 0x140");
+
+        // Critically: LQR's behaviour is pc-dependent.
+        assert_ne!(payload_a, payload_b, "test sanity");
+    }
+
+    /// Anti-regression: STQR (pc-relative) MUST still use pc. Same
+    /// shape as the LQR test above.
+    #[test]
+    fn stqr_remains_pc_relative_after_stqa_landing() {
+        let payload: u128 = 0xCAFEBABEDEADBEEFFEEDFACECAFEFACE;
+
+        // STQR imm16=0x10 from pc=0: target = 0x40.
+        let mut spu_a = SpuThread::new(0);
+        assert!(spu_a.ls_write(0, &encode::stqr(7, 0x10).to_be_bytes()));
+        spu_a.gpr[7] = payload;
+        spu_a.pc = 0;
+        step(&mut spu_a).expect("stqr at pc=0");
+        assert_eq!(read_qword_be(&spu_a, 0x40).unwrap(), payload);
+
+        // STQR imm16=0x10 from pc=0x100: target = 0x140.
+        let mut spu_b = SpuThread::new(0);
+        assert!(spu_b.ls_write(0x100, &encode::stqr(7, 0x10).to_be_bytes()));
+        spu_b.gpr[7] = payload;
+        spu_b.pc = 0x100;
+        step(&mut spu_b).expect("stqr at pc=0x100");
+        assert_eq!(read_qword_be(&spu_b, 0x140).unwrap(), payload);
+    }
+
+    // --- R5.10d: C-family insert-control opcodes -------------------
+    //
+    // Default mask (SPU big-endian byte order):
+    //   bytes 0..7  = 0x18 0x19 0x1A 0x1B 0x1C 0x1D 0x1E 0x1F
+    //   bytes 8..15 = 0x10 0x11 0x12 0x13 0x14 0x15 0x16 0x17
+    // Granularity-aligned offset within the qword is `addr & mask`,
+    // where `mask` is 0xF (Byte) / 0xE (Halfword) / 0xC (Word) /
+    // 0x8 (Doubleword). The corresponding `g` consecutive bytes of
+    // the default mask are overwritten with `0x00 0x01 ... (g-1)`.
+    //
+    // The tests below assert the EXACT 16-byte mask values produced.
+
+    /// CDD with `(imm7 + ra_lane0) & 0x8 == 0` (the "low" doubleword
+    /// case): the granularity bytes are written at offset 0 → mask
+    /// covers SPU bytes 0..7 with `0x00..0x07`.
+    #[test]
+    fn cdd_generates_low_doubleword_insert_mask() {
+        let mut spu = SpuThread::new(0);
+        let pc = 0x100u32;
+        let inst = encode::cdd(/*rt=*/3, /*ra=*/2, /*imm7=*/0);
+        assert!(spu.ls_write(pc, &inst.to_be_bytes()));
+        // ra_lane0 = 0 → addr = 0 → addr & 0x8 = 0 → offset 0.
+        spu.gpr[2] = 0;
+        spu.pc = pc;
+        step(&mut spu).expect("cdd must succeed");
+
+        // R5.11b — default mask in SPU-BE is 0x10..0x1F linear; offset 0
+        // overrides bytes 0..7 with 0x00..0x07.
+        let expected: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+        ];
+        assert_eq!(spu.gpr[3].to_be_bytes(), expected);
+        assert_eq!(spu.pc, pc + 4);
+    }
+
+    /// CDD with `(imm7 + ra_lane0) & 0x8 != 0` (the "high" doubleword
+    /// case): mask covers SPU bytes 8..15 with `0x00..0x07`.
+    /// We pre-load lane 0 of ra with bit 3 set (= 0x08).
+    #[test]
+    fn cdd_generates_high_doubleword_insert_mask() {
+        let mut spu = SpuThread::new(0);
+        let pc = 0x100u32;
+        let inst = encode::cdd(/*rt=*/3, /*ra=*/2, /*imm7=*/0);
+        assert!(spu.ls_write(pc, &inst.to_be_bytes()));
+        // ra_lane0 = 0x08 → addr = 0x08 → addr & 0x8 = 0x8 → offset 8.
+        // Lane 0 = high u32 of u128, so v = 0x08 << 96.
+        spu.gpr[2] = 0x08u128 << 96;
+        spu.pc = pc;
+        step(&mut spu).expect("cdd must succeed");
+
+        // R5.11b — default mask in SPU-BE is 0x10..0x1F linear; offset 8
+        // overrides bytes 8..15 with 0x00..0x07.
+        let expected: [u8; 16] = [
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        ];
+        assert_eq!(spu.gpr[3].to_be_bytes(), expected);
+        assert_eq!(spu.pc, pc + 4);
+    }
+
+    /// CWD: addr=4 → offset 4 (word-aligned via `& 0xC`). Mask covers
+    /// SPU bytes 4..7 with `0x00 0x01 0x02 0x03` (insert preferred
+    /// word of A); rest unchanged.
+    #[test]
+    fn cwd_generates_word_insert_mask() {
+        let mut spu = SpuThread::new(0);
+        let pc = 0x100u32;
+        let inst = encode::cwd(/*rt=*/4, /*ra=*/2, /*imm7=*/4);
+        assert!(spu.ls_write(pc, &inst.to_be_bytes()));
+        spu.gpr[2] = 0; // ra_lane0=0 → addr = imm7 = 4 → 4 & 0xC = 4.
+        spu.pc = pc;
+        step(&mut spu).expect("cwd must succeed");
+
+        // R5.11b — default mask in SPU-BE is 0x10..0x1F linear; offset 4
+        // overrides bytes 4..7 with 0x00..0x03.
+        let expected: [u8; 16] = [
+            0x10, 0x11, 0x12, 0x13, // bytes 0..3: unchanged
+            0x00, 0x01, 0x02, 0x03, // bytes 4..7: inserted word
+            0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+        ];
+        assert_eq!(spu.gpr[4].to_be_bytes(), expected);
+        assert_eq!(spu.pc, pc + 4);
+    }
+
+    /// CHD: addr=10 (& 0xE = 10). Mask covers SPU bytes 10..11 with
+    /// `0x02 0x03` (the preferred halfword of A is at A's bytes 2..3).
+    #[test]
+    fn chd_generates_halfword_insert_mask() {
+        let mut spu = SpuThread::new(0);
+        let pc = 0x100u32;
+        let inst = encode::chd(/*rt=*/5, /*ra=*/2, /*imm7=*/10);
+        assert!(spu.ls_write(pc, &inst.to_be_bytes()));
+        spu.gpr[2] = 0;
+        spu.pc = pc;
+        step(&mut spu).expect("chd must succeed");
+
+        // R5.11b — default mask in SPU-BE is 0x10..0x1F linear; offset 10
+        // overrides bytes 10..11 with 0x02..0x03.
+        let expected: [u8; 16] = [
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, // bytes 8..9: unchanged
+            0x02, 0x03, // bytes 10..11: inserted halfword
+            0x1C, 0x1D, 0x1E, 0x1F,
+        ];
+        assert_eq!(spu.gpr[5].to_be_bytes(), expected);
+        assert_eq!(spu.pc, pc + 4);
+    }
+
+    /// CBD: single-byte insert. addr=3 → offset 3. Mask byte at SPU
+    /// byte 3 = 0x03 (insert byte 3 of A's preferred word, i.e., the
+    /// low byte of the preferred slot).
+    #[test]
+    fn cbd_generates_byte_insert_mask() {
+        let mut spu = SpuThread::new(0);
+        let pc = 0x100u32;
+        let inst = encode::cbd(/*rt=*/6, /*ra=*/2, /*imm7=*/3);
+        assert!(spu.ls_write(pc, &inst.to_be_bytes()));
+        spu.gpr[2] = 0;
+        spu.pc = pc;
+        step(&mut spu).expect("cbd must succeed");
+
+        // R5.11b — default mask in SPU-BE is 0x10..0x1F linear; offset 3
+        // overrides byte 3 with A's preferred byte (= 0x03).
+        let expected: [u8; 16] = [
+            0x10, 0x11, 0x12, 0x03, // byte 3 overridden
+            0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+        ];
+        assert_eq!(spu.gpr[6].to_be_bytes(), expected);
+        assert_eq!(spu.pc, pc + 4);
+    }
+
+    /// CBX (RR-form) — addr = ra_lane0 + rb_lane0. Verifies the RR
+    /// dispatch path uses `rb` instead of imm7. Pre-load ra=2, rb=5
+    /// with values that combine to a known offset.
+    #[test]
+    fn cbx_uses_rb_plus_ra_source() {
+        let mut spu = SpuThread::new(0);
+        let pc = 0x100u32;
+        let inst = encode::cbx(/*rt=*/7, /*ra=*/2, /*rb=*/5);
+        assert!(spu.ls_write(pc, &inst.to_be_bytes()));
+        // ra_lane0 = 0x4, rb_lane0 = 0x9 → addr = 0xD → 0xD & 0xF = 0xD.
+        spu.gpr[2] = 0x04u128 << 96;
+        spu.gpr[5] = 0x09u128 << 96;
+        spu.pc = pc;
+        step(&mut spu).expect("cbx must succeed");
+
+        // R5.11b — default mask in SPU-BE is 0x10..0x1F linear; offset 13
+        // overrides byte 13 with 0x03.
+        let expected: [u8; 16] = [
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1A, 0x1B, 0x1C,
+            0x03, // byte 13 overridden
+            0x1E, 0x1F,
+        ];
+        assert_eq!(spu.gpr[7].to_be_bytes(), expected);
+        assert_eq!(spu.pc, pc + 4);
+    }
+
+    /// CDD with the EXACT v4 instruction word from the R5.10b
+    /// diagnostic: 0x3EE00085 at pc=0x854, with ra=1 (stack pointer)
+    /// arriving at this site with a 16-byte-aligned value. We use a
+    /// 16-byte-aligned SP that has bit 3 set (→ "high" doubleword
+    /// case). This is the v4 path the SPU thread executes immediately
+    /// after the LQR at pc=0x850; if it produces the right mask, the
+    /// pipeline can advance to pc=0x858.
+    #[test]
+    /// R5.11b — cwd with the EXACT addr from `single_spu_loadstore_v1`'s
+    /// final iteration (i=7): r10=0x4000C, imm7=0. Expected lane 0 =
+    /// 0x10111213 (matches captured trace's r7 final value).
+    #[test]
+    fn cwd_loadstore_v1_final_iter_matches_captured_trace() {
+        let mut spu = SpuThread::new(0);
+        let pc = 0x100u32;
+        let inst = encode::cwd(/*rt=*/7, /*ra=*/10, /*imm7=*/0);
+        assert!(spu.ls_write(pc, &inst.to_be_bytes()));
+        spu.gpr[10] = 0x4000Cu128 << 96; // r10 lane0 = 0x4000C
+        spu.pc = pc;
+        step(&mut spu).expect("cwd must succeed");
+
+        // addr=0x4000C, & 0xC = 0xC → p_byte=12. Bytes 12..15 → 0x00..0x03.
+        // Default mask in SPU-BE: 0x10..0x1F linear.
+        // Final mask bytes 0..3 (lane 0) = 0x10, 0x11, 0x12, 0x13.
+        let lane0 = (spu.gpr[7] >> 96) as u32;
+        assert_eq!(lane0, 0x10111213,
+            "cwd lane 0 must match captured RPCS3 r7 = 0x10111213; got 0x{lane0:08x}");
+    }
+
+    fn cdd_real_v4_inst_at_pc_854() {
+        let mut spu = SpuThread::new(0);
+        // Place the v4 inst at pc=0x100 (any aligned slot — pc=0x854
+        // would also work but is not material to the test). The
+        // important bit is that the inst word equals 0x3EE00085 and
+        // the SPU dispatches it correctly.
+        let pc = 0x100u32;
+        let inst: u32 = 0x3EE00085;
+        assert!(spu.ls_write(pc, &inst.to_be_bytes()));
+        // SP = 0x3FFE8 (16-byte aligned, bit 3 set).
+        spu.gpr[1] = 0x3FFE8u128 << 96;
+        spu.pc = pc;
+        step(&mut spu).expect("CDD on real v4 inst must succeed");
+
+        // R5.11b — (imm7=0 + sp_lane0=0x3FFE8) & 0x8 = 0x8 → high-doubleword
+        // case; default mask is 0x10..0x1F linear.
+        let expected: [u8; 16] = [
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        ];
+        assert_eq!(spu.gpr[5].to_be_bytes(), expected);
+        assert_eq!(spu.pc, pc + 4);
     }
 
     // --- Iter-8: indirect branches -------------------------------
@@ -3799,6 +5435,142 @@ mod tests {
         assert_eq!(r, [0, 0, 0xFFFF, 0xFFFF, 0, 0xFFFF, 0, 0xFFFF]);
     }
 
+    // --- R5.10i: byte-immediate RI10 family --------------------------
+
+    /// Regression-lock against the EXACT v4 instruction the R5.10g
+    /// diagnostic surfaced at pc=0x86C: `andbi r3, r3, 0x20` =
+    /// `0x16080183` (decimal 369,623,427). Two assertions:
+    /// 1. `encode::andbi(3, 3, 0x20)` produces the exact bit pattern
+    ///    (proves the encoder + decoder bit layout match RPCS3).
+    /// 2. Stepping the inst against a known gpr[3] payload masks each
+    ///    byte with 0x20 — i.e. the i8 value flowing through is 0x20,
+    ///    not the buggy 0x08 the pre-R5.10i decoder produced.
+    #[test]
+    fn andbi_regression_v4_0x16080183() {
+        assert_eq!(encode::andbi(3, 3, 0x20), 0x16080183);
+
+        let mut spu = make_env(&[encode::andbi(3, 3, 0x20)]);
+        // Byte pattern: 0xFF in every byte → result must be 0x20 in
+        // every byte after AND with broadcast(0x20).
+        spu.gpr[3] = u128::MAX;
+        step_ok(&mut spu);
+        let expected = u128::from_be_bytes([0x20; 16]);
+        assert_eq!(spu.gpr[3], expected, "andbi must AND each byte with 0x20");
+    }
+
+    /// Regression-lock against the off-by-2-bits decoder bug. Build a
+    /// byte-imm inst whose i8 differs depending on the extraction
+    /// shift: i8=0xA5 with the upper 2 bits of the 10-bit imm slot
+    /// forced to 0 (which `pack_8_i8` does). Wrong extraction would
+    /// give 0x29 (= 0xA5 >> 2), correct extraction gives 0xA5.
+    /// Verifies the decoder fix at the interpreter dispatch layer too
+    /// (since the interpreter reads `(inst >> 14) & 0xFF` directly).
+    #[test]
+    fn byte_imm_uses_bits_14_21_not_16_23() {
+        let mut spu = make_env(&[encode::andbi(7, 4, 0xA5u8 as i8)]);
+        spu.gpr[4] = u128::from_be_bytes([0xFF; 16]);
+        step_ok(&mut spu);
+        let result_bytes = spu.gpr[7].to_be_bytes();
+        for (k, &b) in result_bytes.iter().enumerate() {
+            assert_eq!(
+                b, 0xA5,
+                "byte {k}: expected 0xA5 (i8 from bits 14..21), got 0x{b:02X}",
+            );
+            assert_ne!(
+                b, 0x29,
+                "byte {k}: bug regression — i8 was extracted from bits 16..23",
+            );
+        }
+    }
+
+    #[test]
+    fn orbi_broadcasts_i8_to_all_bytes() {
+        let mut spu = make_env(&[encode::orbi(3, 4, 0x0F)]);
+        spu.gpr[4] = u128::from_be_bytes([
+            0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70,
+            0x80, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0,
+        ]);
+        step_ok(&mut spu);
+        // Each byte | 0x0F sets the low 4 bits.
+        let expected = u128::from_be_bytes([
+            0x0F, 0x1F, 0x2F, 0x3F, 0x4F, 0x5F, 0x6F, 0x7F,
+            0x8F, 0x9F, 0xAF, 0xBF, 0xCF, 0xDF, 0xEF, 0xFF,
+        ]);
+        assert_eq!(spu.gpr[3], expected);
+    }
+
+    #[test]
+    fn xorbi_broadcasts_i8_to_all_bytes() {
+        let mut spu = make_env(&[encode::xorbi(3, 4, 0xAA_u8 as i8)]);
+        spu.gpr[4] = u128::from_be_bytes([0xFF; 16]);
+        step_ok(&mut spu);
+        // 0xFF ^ 0xAA = 0x55 in every byte.
+        assert_eq!(spu.gpr[3], u128::from_be_bytes([0x55; 16]));
+    }
+
+    #[test]
+    fn ceqbi_sets_ff_for_equal_bytes() {
+        let mut spu = make_env(&[encode::ceqbi(3, 4, 0x42)]);
+        spu.gpr[4] = u128::from_be_bytes([
+            0x42, 0x41, 0x42, 0x43, 0x00, 0x42, 0xFF, 0x42,
+            0x42, 0x42, 0x00, 0x42, 0x42, 0x43, 0x42, 0x40,
+        ]);
+        step_ok(&mut spu);
+        let expected = u128::from_be_bytes([
+            0xFF, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF,
+            0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0x00, 0xFF, 0x00,
+        ]);
+        assert_eq!(spu.gpr[3], expected);
+    }
+
+    #[test]
+    fn clgtbi_unsigned_compare() {
+        // i8 = 0x80 (= 128 unsigned). Bytes > 128 unsigned: 0x81..0xFF
+        // → 0xFF; bytes ≤ 128: 0x00.
+        let mut spu = make_env(&[encode::clgtbi(3, 4, 0x80_u8 as i8)]);
+        spu.gpr[4] = u128::from_be_bytes([
+            0x00, 0x7F, 0x80, 0x81, 0xFE, 0xFF, 0x40, 0xC0,
+            0x01, 0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+        ]);
+        step_ok(&mut spu);
+        let expected = u128::from_be_bytes([
+            0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0x00, 0xFF,
+            0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        ]);
+        assert_eq!(spu.gpr[3], expected);
+    }
+
+    #[test]
+    fn cgtbi_signed_compare() {
+        // i8 = -5 (signed). Bytes signed > -5: -4..127 → 0xFF;
+        // bytes ≤ -5 (= 0x80..0xFB unsigned): 0x00.
+        let mut spu = make_env(&[encode::cgtbi(3, 4, -5)]);
+        spu.gpr[4] = u128::from_be_bytes([
+            0x00, // 0   > -5 → T
+            0xFB, // -5  > -5 → F
+            0xFC, // -4  > -5 → T
+            0x80, // -128 > -5 → F
+            0x7F, // 127 > -5 → T
+            0xFF, // -1  > -5 → T
+            0xF0, // -16 > -5 → F
+            0x05, // 5   > -5 → T
+            0xFA, // -6  > -5 → F
+            0xFB, // -5 again
+            0x01, // 1   > -5 → T
+            0xFE, // -2  > -5 → T
+            0xC0, // -64 > -5 → F
+            0x40, // 64  > -5 → T
+            0x80, // -128
+            0x7F, // 127
+        ]);
+        step_ok(&mut spu);
+        let expected = u128::from_be_bytes([
+            0xFF, 0x00, 0xFF, 0x00, 0xFF, 0xFF, 0x00, 0xFF,
+            0x00, 0x00, 0xFF, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
+        ]);
+        assert_eq!(spu.gpr[3], expected);
+    }
+
     // --- Iter-11: halfword shifts ------------------------------
 
     #[test]
@@ -3917,5 +5689,308 @@ mod tests {
         spu.gpr[4] = pack_halves([0x1234; 8]);
         step_ok(&mut spu);
         assert_eq!(unpack_halves(spu.gpr[3]), [0x2341; 8]);
+    }
+
+    // =================================================================
+    // R5.4a — Channel parking model in interpreter step()
+    // =================================================================
+
+    /// `rdch ch=29` (SPU_RDINMBOX) on empty mailbox returns
+    /// ChannelStall outcome AND sets the SPU's `park_state` to
+    /// `ChannelRead { channel: 29 }` at the rdch's pc.
+    #[test]
+    fn step_rdch_empty_inmbox_parks_thread() {
+        let rdch = |rt: u32, ch: u32| (0x00Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let mut spu = make_env(&[rdch(3, 29)]);
+        let pc_before = spu.pc;
+
+        match step(&mut spu) {
+            Ok(StepOutcome::ChannelStall { channel, is_write: false }) => {
+                assert_eq!(channel, 29);
+            }
+            other => panic!("expected ChannelStall, got {other:?}"),
+        }
+
+        assert!(spu.is_parked(), "rdch on empty inmbox must park the thread");
+        assert_eq!(spu.parked_pc(), Some(pc_before),
+                   "park PC must equal rdch's pc, NOT pc+4");
+        assert_eq!(spu.parked_reason(),
+                   Some(SpuParkReason::ChannelRead { channel: 29 }));
+        // PC was NOT advanced — rdch must be re-runnable from the
+        // same pc once the parking condition resolves.
+        assert_eq!(spu.pc, pc_before, "stall must NOT advance pc");
+    }
+
+    /// `wrch ch=28` (SPU_WROUTMBOX) on full mailbox parks with
+    /// `ChannelWrite { channel: 28 }`.
+    #[test]
+    fn step_wrch_full_outmbox_parks_thread() {
+        let wrch = |rt: u32, ch: u32| (0x10Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let mut spu = make_env(&[wrch(3, 28)]);
+        spu.gpr[3] = 0x99u128;  // value to write
+        spu.channels.out_mbox = Some(0xAAA);  // pre-fill so wrch stalls
+        let pc_before = spu.pc;
+
+        match step(&mut spu) {
+            Ok(StepOutcome::ChannelStall { channel, is_write: true }) => {
+                assert_eq!(channel, 28);
+            }
+            other => panic!("expected ChannelStall, got {other:?}"),
+        }
+
+        assert!(spu.is_parked());
+        assert_eq!(spu.parked_pc(), Some(pc_before));
+        assert_eq!(spu.parked_reason(),
+                   Some(SpuParkReason::ChannelWrite { channel: 28 }));
+        // out_mbox unchanged — wrch on stall does not mutate.
+        assert_eq!(spu.channels.out_mbox, Some(0xAAA));
+    }
+
+    /// `rdch` against a bad channel (e.g. 100) must NOT park —
+    /// it returns `Err(Unimplemented)`. `BadChannel` is distinguished
+    /// from `WouldStall` semantically; only the latter parks.
+    #[test]
+    fn step_rdch_bad_channel_does_not_park() {
+        let rdch = |rt: u32, ch: u32| (0x00Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let mut spu = make_env(&[rdch(3, 100)]);
+
+        match step(&mut spu) {
+            Err(Error::Unimplemented { reason, .. }) => {
+                assert!(reason.contains("rdch"));
+            }
+            other => panic!("expected Unimplemented, got {other:?}"),
+        }
+
+        assert!(!spu.is_parked(),
+                "BadChannel must NOT park (only WouldStall does)");
+        assert!(spu.park_state.is_none());
+    }
+
+    /// Successful `rdch` on a channel with a value available does
+    /// NOT park (and advances pc, returns Continue).
+    #[test]
+    fn step_rdch_success_does_not_park() {
+        let rdch = |rt: u32, ch: u32| (0x00Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        // SPU_RDDEC always returns Ok (count = 1 always-readable).
+        let mut spu = make_env(&[rdch(3, 8 /* SPU_RDDEC */)]);
+        spu.channels.decrementer = 0xDEADBEEF;
+        let pc_before = spu.pc;
+        step_ok(&mut spu);
+        assert!(!spu.is_parked());
+        assert_eq!(spu.pc, pc_before.wrapping_add(4));
+        // rdch writes `join_lanes([value, 0, 0, 0])` — value lands
+        // in lane 0 (high u32) of the u128 register.
+        assert_eq!(spu.gpr[3] >> 96, 0xDEADBEEF_u128);
+    }
+
+    /// Resume flow: park on rdch → external code injects a value
+    /// into the mailbox → clear_park → re-run → rdch consumes the
+    /// value and continues normally.
+    #[test]
+    fn manual_resume_flow_after_park_and_inject() {
+        let rdch = |rt: u32, ch: u32| (0x00Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop = 0xAAu32 & 0x3FFF;
+        let mut spu = make_env(&[rdch(3, 29), stop]);
+
+        // First run: stall, park, no progress on pc.
+        let r1 = run_n(&mut spu, 100).unwrap();
+        match r1 {
+            (n, StepOutcome::ChannelStall { channel: 29, is_write: false }) => {
+                assert!(n <= 1, "interpreter should stop on the rdch step");
+            }
+            other => panic!("expected ChannelStall, got {other:?}"),
+        }
+        assert!(spu.is_parked());
+        let parked_pc = spu.parked_pc().unwrap();
+
+        // Inject a value externally (PPU side).
+        assert!(spu.channels.ppu_push_inmbox(0x12345));
+
+        // Clear the park state.
+        spu.clear_park();
+        assert!(!spu.is_parked());
+
+        // Second run: same pc, but now mailbox has a value. rdch
+        // consumes it, advances pc, hits stop.
+        let (_n, outcome) = run_n(&mut spu, 100).unwrap();
+        match outcome {
+            StepOutcome::Stop(0xAA) => {}
+            other => panic!("expected Stop, got {other:?}"),
+        }
+        assert_eq!(spu.gpr[3] >> 96, 0x12345u128,
+                   "rdch must have consumed the injected value");
+        // rdch advances pc to parked_pc+4; stop leaves pc at its own
+        // address (= parked_pc+4). So final pc is parked_pc+4.
+        assert_eq!(spu.pc, parked_pc + 4,
+                   "rdch must have advanced past itself; stop holds pc");
+        // Mailbox drained.
+        assert_eq!(spu.channels.in_mbox, None);
+    }
+
+    // =====================================================================
+    // R5.4b — wake API integration tests (interpreter side)
+    //
+    // Verifies the explicit wake handshake is byte-exact against the
+    // existing manual flow (clear_park + run_n) for the same program.
+    // =====================================================================
+
+    /// Resume after wake on rdch SPU_RDINMBOX:
+    /// 1. First run parks (channel empty).
+    /// 2. `ppu_push_inmbox_and_try_wake` returns `Ready { pc }` at the
+    ///    rdch's pc.
+    /// 3. `run_n` from that pc consumes the value, advances, and stops.
+    /// 4. Final SpuThread state matches the manual `clear_park + run_n`
+    ///    flow byte-for-byte.
+    #[test]
+    fn wake_api_resume_rdch_inmbox_matches_manual_flow() {
+        use rpcs3_spu_thread::SpuWakeResult;
+        let rdch = |rt: u32, ch: u32| (0x00Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop = encode::stop(0xAB);
+        let program = [rdch(3, 29), stop];
+
+        // ---- A) wake-API flow ------------------------------------
+        let mut spu_a = make_env(&program);
+        let r1 = run_n(&mut spu_a, 100).unwrap();
+        match r1 {
+            (_, StepOutcome::ChannelStall { channel: 29, is_write: false }) => {}
+            other => panic!("expected ChannelStall, got {other:?}"),
+        }
+        assert!(spu_a.is_parked());
+        let parked_pc = spu_a.parked_pc().unwrap();
+
+        let wake = spu_a.ppu_push_inmbox_and_try_wake(0xCAFEBABE);
+        match wake {
+            SpuWakeResult::Ready { pc } => assert_eq!(pc, parked_pc),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        assert!(!spu_a.is_parked(), "Ready must clear park_state");
+        // Resume from the returned pc by running directly — pc was
+        // never altered by the stall, so run_n picks it up.
+        assert_eq!(spu_a.pc, parked_pc);
+        let (_n, outcome) = run_n(&mut spu_a, 100).unwrap();
+        match outcome {
+            StepOutcome::Stop(0xAB) => {}
+            other => panic!("expected Stop(0xAB), got {other:?}"),
+        }
+        assert_eq!(spu_a.gpr[3] >> 96, 0xCAFEBABE_u128);
+        assert_eq!(spu_a.pc, parked_pc + 4);
+        assert_eq!(spu_a.channels.in_mbox, None);
+
+        // ---- B) manual flow (existing R5.4a baseline) -------------
+        let mut spu_b = make_env(&program);
+        let _ = run_n(&mut spu_b, 100).unwrap();
+        assert!(spu_b.channels.ppu_push_inmbox(0xCAFEBABE));
+        spu_b.clear_park();
+        let _ = run_n(&mut spu_b, 100).unwrap();
+
+        // ---- C) byte-exact equivalence ---------------------------
+        assert_eq!(spu_a.pc, spu_b.pc, "pc must match");
+        assert_eq!(spu_a.gpr, spu_b.gpr, "gpr must match");
+        assert_eq!(spu_a.channels, spu_b.channels, "channels must match");
+        assert_eq!(spu_a.ls, spu_b.ls, "local store must match");
+    }
+
+    /// Resume after wake on wrch SPU_WROUTMBOX:
+    /// 1. Pre-fill `out_mbox` so wrch parks.
+    /// 2. PPU drains via `ppu_pop_outmbox_and_try_wake` → wake returns
+    ///    Ready, drained value is the pre-fill value.
+    /// 3. Resume executes wrch; new value lands in `out_mbox`.
+    #[test]
+    fn wake_api_resume_wrch_outmbox_matches_manual_flow() {
+        use rpcs3_spu_thread::SpuWakeResult;
+        let wrch = |rt: u32, ch: u32| (0x10Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop = encode::stop(0xCD);
+        // r3 = 0x9999; wrch r3 -> SPU_WROUTMBOX(28); stop 0xCD
+        let program = [encode::il(3, 0x1234), wrch(3, 28), stop];
+
+        // ---- A) wake-API flow ------------------------------------
+        let mut spu_a = make_env(&program);
+        spu_a.channels.out_mbox = Some(0xAAAA_BBBB); // pre-fill — wrch will park
+        let r1 = run_n(&mut spu_a, 100).unwrap();
+        match r1 {
+            (_, StepOutcome::ChannelStall { channel: 28, is_write: true }) => {}
+            other => panic!("expected ChannelStall, got {other:?}"),
+        }
+        assert!(spu_a.is_parked());
+        let parked_pc = spu_a.parked_pc().unwrap();
+
+        let (drained, wake) = spu_a.ppu_pop_outmbox_and_try_wake();
+        assert_eq!(drained, Some(0xAAAA_BBBB));
+        match wake {
+            SpuWakeResult::Ready { pc } => assert_eq!(pc, parked_pc),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        assert!(!spu_a.is_parked());
+        assert_eq!(spu_a.pc, parked_pc);
+        let (_n, outcome) = run_n(&mut spu_a, 100).unwrap();
+        match outcome {
+            StepOutcome::Stop(0xCD) => {}
+            other => panic!("expected Stop, got {other:?}"),
+        }
+        // wrch wrote r3's preferred-slot (lane 0 of 0x1234 sign-extended
+        // to u128) into out_mbox.
+        assert_eq!(spu_a.channels.out_mbox, Some(0x1234));
+
+        // ---- B) manual flow --------------------------------------
+        let mut spu_b = make_env(&program);
+        spu_b.channels.out_mbox = Some(0xAAAA_BBBB);
+        let _ = run_n(&mut spu_b, 100).unwrap();
+        let _ = spu_b.channels.ppu_pop_outmbox();
+        spu_b.clear_park();
+        let _ = run_n(&mut spu_b, 100).unwrap();
+
+        // ---- C) byte-exact equivalence ---------------------------
+        assert_eq!(spu_a.pc, spu_b.pc);
+        assert_eq!(spu_a.gpr, spu_b.gpr);
+        assert_eq!(spu_a.channels, spu_b.channels);
+        assert_eq!(spu_a.ls, spu_b.ls);
+    }
+
+    /// Wake without satisfied condition does NOT alter GPRs, LS, or
+    /// channel state (other than the helper's own primary side effect).
+    /// Specifically: calling `signal_and_try_wake` while parked on
+    /// rdch INMBOX (different channel) returns `StillBlocked` and
+    /// leaves everything except `snr[slot]` untouched.
+    #[test]
+    fn wake_api_still_blocked_does_not_advance_state() {
+        use rpcs3_spu_thread::SpuWakeResult;
+        let rdch = |rt: u32, ch: u32| (0x00Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let mut spu = make_env(&[rdch(3, 29)]);
+        let _ = run_n(&mut spu, 100).unwrap();
+        assert!(spu.is_parked());
+
+        let pc_before = spu.pc;
+        let gpr_before = spu.gpr;
+        let park_before = spu.park_state;
+        let inmbox_before = spu.channels.in_mbox;
+
+        // Wrong wake path: signal slot 0 — park is on RDINMBOX, not
+        // RDSIGNOTIFY. Wake must return StillBlocked.
+        let wake = spu.signal_and_try_wake(0, 0xFF);
+        assert_eq!(wake, SpuWakeResult::StillBlocked);
+
+        assert!(spu.is_parked());
+        assert_eq!(spu.park_state, park_before);
+        assert_eq!(spu.pc, pc_before);
+        assert_eq!(spu.gpr, gpr_before);
+        assert_eq!(spu.channels.in_mbox, inmbox_before);
+        // The signal landed (helper's primary side effect) — that is
+        // expected and not part of the "no advance" guarantee.
+        assert_eq!(spu.channels.snr[0], 0xFF);
+    }
+
+    /// Pre-existing fixtures (no parking) must continue to terminate
+    /// cleanly without ever touching `park_state`.
+    #[test]
+    fn fixtures_without_channel_ops_never_park() {
+        // il r3, 0x42 ; stop 0
+        let mut spu = make_env(&[encode::il(3, 0x42), encode::stop(0)]);
+        let (_n, outcome) = run_n(&mut spu, 100).unwrap();
+        match outcome {
+            StepOutcome::Stop(0) => {}
+            other => panic!("expected Stop, got {other:?}"),
+        }
+        assert!(!spu.is_parked());
+        assert!(spu.park_state.is_none());
     }
 }

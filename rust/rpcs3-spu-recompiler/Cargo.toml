@@ -14,6 +14,10 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 rpcs3-spu-decoder = { path = "../rpcs3-spu-decoder" }
 rpcs3-spu-differential = { path = "../rpcs3-spu-differential" }
+# R5.2 needs the SpuChannels type directly so the JIT can hold a
+# `*mut SpuChannels` in JitState and call `extern "C"` helpers that
+# operate on the real channel state.
+rpcs3-spu-thread = { path = "../rpcs3-spu-thread" }
 
 # Cranelift JIT — pure-Rust assembler + register allocator.
 # Chosen over LLVM/inkwell per SPU_RECOMPILER_PLAN.md D1: easier

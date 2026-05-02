@@ -109,6 +109,62 @@ pub enum SpuInstKind {
     LoadStoreIndexed { rt: u8, ra: u8, rb: u8, is_store: bool },
     /// D-form load `lqd rt, imm10*16(ra)` or store `stqd`.
     LoadStoreDForm { rt: u8, ra: u8, offset: i16, is_store: bool },
+    /// R5.10b — PC-relative load `lqr rt, imm16` (RI16-form, primary 0x67).
+    /// `target_pc` is pre-computed as `(pc + (imm16 << 2)) & 0x3FFF0` —
+    /// matches RPCS3 C++ `spu_ls_target(pc, imm16)` (LS-mask + 16-byte
+    /// align). Used by `lqr` today; `stqr` (primary 0x47) is NOT covered
+    /// by this variant in R5.10b — adding STQR is a separate slice.
+    /// Compare with `LoadStoreDForm` (register-base) and `LoadStoreIndexed`
+    /// (register+register): this is the third address-mode for qword
+    /// load/store, the PC-relative one.
+    LoadRel { rt: u8, target_pc: u32 },
+    /// R5.10g — `stqr rt, imm16` (Store Quadword PC-Relative, primary
+    /// `p9 = 0x047`, RI16-form). Direct mirror of `LoadRel`/LQR (R5.10b)
+    /// — same `target_pc = (pc + (imm16 << 2)) & 0x3FFF0` computation,
+    /// just `LS[target..target+16] = gpr[rt]` instead of the read.
+    /// **Pure store** — no channels, no DMA, no FP, no atomics, no
+    /// branches. C++ ref: `rpcs3/Emu/Cell/SPUInterpreter.cpp:1634`.
+    StoreRel { rt: u8, target_pc: u32 },
+    /// R5.10o — `lqa rt, imm16` (Load Quadword Absolute, primary
+    /// `p9 = 0x061`, RI16-form). Like `LoadRel` (LQR) but with PC=0
+    /// in the address calc: `target_pc = (imm16 << 2) & 0x3FFF0`
+    /// (no PC contribution, hence "Absolute"). The `Rel` variant
+    /// would be a semantic lie, so a distinct `LoadAbs` is used; the
+    /// JIT/interpreter discriminate on the raw 9-bit primary anyway.
+    /// **Pure LS access** — no channels, no DMA, no FP, no atomics,
+    /// no branches. C++ ref: `rpcs3/Emu/Cell/SPUInterpreter.cpp:1648`.
+    LoadAbs { rt: u8, target_pc: u32 },
+    /// R5.10o — `stqa rt, imm16` (Store Quadword Absolute, primary
+    /// `p9 = 0x041`, RI16-form). Mirror of `LoadAbs` with reversed
+    /// direction. Same `target_pc = (imm16 << 2) & 0x3FFF0` formula
+    /// (PC=0). **Pure store**. C++ ref:
+    /// `rpcs3/Emu/Cell/SPUInterpreter.cpp:1594`.
+    StoreAbs { rt: u8, target_pc: u32 },
+    /// R5.10f — `fsmbi rt, imm16` (Form Select Mask for Bytes Immediate,
+    /// `p9 = 0x065`, RI16-form). Builds a 16-byte mask from the 16-bit
+    /// immediate: byte `k` of `rt` becomes `0xFF` iff bit `(15 - k)` of
+    /// `imm16` is set, else `0x00`. **Pure compute** — no `ra`/`rb`/LS
+    /// access, no channels, no DMA, no FP, no atomics, no branches.
+    /// Distinct from the RR-form FSMB (`p11 = 0x1B6`, source = ra-bits)
+    /// only in where the 16 source bits come from. C++ ref:
+    /// `rpcs3/Emu/Cell/SPUInterpreter.cpp:1671`.
+    FormSelectMaskImm { rt: u8, imm16: u16 },
+    /// R5.10d — C-family insert-control opcodes (8 mnemonics):
+    /// CBX/CHX/CWX/CDX (primaries 0x1D4..0x1D7, RR-form, source RegRb)
+    /// and CBD/CHD/CWD/CDD (primaries 0x1F4..0x1F7, RI7-form, source
+    /// ImmI7). All 8 build a 16-byte `shufb` mask that, when used with
+    /// a subsequent `shufb`, inserts `granularity` bytes (1/2/4/8) of
+    /// source A's preferred slot into source B at a runtime-computed
+    /// byte offset within the destination qword. **Pure compute**: no
+    /// channels, no DMA, no FP, no atomics, no LS access. C++ refs in
+    /// `rpcs3/Emu/Cell/SPUInterpreter.cpp` lines 772 (CBX) through 942
+    /// (CDD).
+    InsertControl {
+        rt: u8,
+        ra: u8,
+        source: InsertControlSource,
+        granularity: InsertGranularity,
+    },
     /// Channel access: `rdch`, `wrch`, `rchcnt`. `rt`/`channel` slots
     /// are the same as ra/rt in encoding; we surface them flat.
     Channel { rt: u8, channel: u32, kind: ChannelOp },
@@ -145,6 +201,37 @@ pub enum ChannelOp {
     Read,
     Write,
     ReadCount,
+}
+
+/// R5.10d — How a C-family insert-control opcode forms its address.
+/// `RegRb` is the RR-form (CBX/CHX/CWX/CDX); `ImmI7` is the RI7-form
+/// (CBD/CHD/CWD/CDD). The two forms share the same mask-construction
+/// logic — only the address source differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum InsertControlSource {
+    /// CBD/CHD/CWD/CDD — addr = `gpr[ra]_lane0 + sext(imm7)`.
+    ImmI7 { imm7: i8 },
+    /// CBX/CHX/CWX/CDX — addr = `gpr[ra]_lane0 + gpr[rb]_lane0`.
+    RegRb { rb: u8 },
+}
+
+/// R5.10d — How many bytes of source A get inserted at the computed
+/// position. The granularity also dictates the alignment mask applied
+/// to the address: `Byte` uses `& 0xF`, `Halfword` uses `& 0xE`,
+/// `Word` uses `& 0xC`, `Doubleword` uses `& 0x8`. Mirrors the
+/// `_u8`/`_u16`/`_u32`/`_u64` writes in the RPCS3 C++ implementations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum InsertGranularity {
+    /// CBX/CBD — 1 byte, alignment mask `0xF`.
+    Byte,
+    /// CHX/CHD — 2 bytes, alignment mask `0xE`.
+    Halfword,
+    /// CWX/CWD — 4 bytes, alignment mask `0xC`.
+    Word,
+    /// CDX/CDD — 8 bytes, alignment mask `0x8`.
+    Doubleword,
 }
 
 /// Where a basic block sends control next.
@@ -299,6 +386,34 @@ fn classify(raw: u32, pc: u32) -> SpuInstKind {
         return SpuInstKind::Unary { rt: rt(raw), ra: ra(raw) };
     }
 
+    // R5.10d — C-family insert-control (8 opcodes).
+    // RR-form (CBX/CHX/CWX/CDX) and RI7-form (CBD/CHD/CWD/CDD) share
+    // the same `InsertControl` variant; the form is encoded in the
+    // `source` field. Granularity is derived from the low 2 bits of
+    // the 11-bit primary.
+    if matches!(p11, 0x1D4 | 0x1D5 | 0x1D6 | 0x1D7 | 0x1F4 | 0x1F5 | 0x1F6 | 0x1F7) {
+        let granularity = match p11 & 0x3 {
+            0x0 => InsertGranularity::Byte,
+            0x1 => InsertGranularity::Halfword,
+            0x2 => InsertGranularity::Word,
+            0x3 => InsertGranularity::Doubleword,
+            _ => unreachable!(),
+        };
+        let source = if (p11 & 0x020) != 0 {
+            // 0x1Fx — RI7-form (CBD/CHD/CWD/CDD)
+            InsertControlSource::ImmI7 { imm7: i7_signed(raw) }
+        } else {
+            // 0x1Dx — RR-form (CBX/CHX/CWX/CDX)
+            InsertControlSource::RegRb { rb: rb(raw) }
+        };
+        return SpuInstKind::InsertControl {
+            rt: rt(raw),
+            ra: ra(raw),
+            source,
+            granularity,
+        };
+    }
+
     // Channel access (11-bit primary)
     match p11 {
         0x00D => return SpuInstKind::Channel { rt: rt(raw), channel: ra(raw) as u32 & 0x7F, kind: ChannelOp::Read },
@@ -326,7 +441,13 @@ fn classify(raw: u32, pc: u32) -> SpuInstKind {
     if matches!(p11,
         0x078 | 0x079 | 0x07A | 0x07B  // word shifts (roti/rotmi/rotmai/shli)
         | 0x07C | 0x07D | 0x07E | 0x07F  // halfword shifts (rothi/rothmi/rotmahi/shlhi)
-        | 0x1FC | 0x1FF | 0x1FB  // quadword bit/byte shifts (rotqbyi/shlqbyi/etc)
+        // Quadword shift-imm family. Per RPCS3 SPUOpcodes.h:
+        //   0x1FB = SHLQBII (bit-shift left immediate)
+        //   0x1FC = ROTQBYI (byte-rotate immediate)
+        //   0x1FD = ROTQMBYI (byte-shift-right-with-zero-fill immediate, R5.10m)
+        //   0x1FF = SHLQBYI (byte-shift left immediate)
+        // ROTQBII (0x1F8) and ROTQMBII (0x1F9) are NOT yet covered (no v4 use).
+        | 0x1FB | 0x1FC | 0x1FD | 0x1FF
     ) {
         return SpuInstKind::AluImm7 { rt: rt(raw), ra: ra(raw), imm7: i7_signed(raw) };
     }
@@ -353,6 +474,55 @@ fn classify(raw: u32, pc: u32) -> SpuInstKind {
                 target: branch_relative_target(pc, i16_signed(raw)),
             };
         }
+        0x067 => {
+            // R5.10b — lqr rt, imm16 — PC-relative qword load.
+            // Target = (pc + (imm16 << 2)) & 0x3FFF0 mirroring the C++
+            // `spu_ls_target(pc, imm16)` semantics: LS-mask AND 16-byte
+            // align (the bottom 4 bits of the address are forced to 0
+            // because qwords are aligned). Distinct from
+            // `branch_relative_target` (which only LS-masks).
+            let imm = i16_signed(raw) as i32;
+            let target = ((pc as i32).wrapping_add(imm.wrapping_mul(4)) as u32) & 0x3FFF0;
+            return SpuInstKind::LoadRel {
+                rt: rt(raw),
+                target_pc: target,
+            };
+        }
+        // R5.10g — stqr rt, imm16 — PC-relative qword store. Direct
+        // mirror of LQR (0x067) — same `spu_ls_target` computation,
+        // just store-direction. Variant kept separate from `LoadRel` to
+        // preserve R5.10b's existing test surface.
+        0x047 => {
+            let imm = i16_signed(raw) as i32;
+            let target = ((pc as i32).wrapping_add(imm.wrapping_mul(4)) as u32) & 0x3FFF0;
+            return SpuInstKind::StoreRel {
+                rt: rt(raw),
+                target_pc: target,
+            };
+        }
+        // R5.10o — lqa rt, imm16 — Load Quadword Absolute. Same
+        // `spu_ls_target` formula as LQR but with PC=0:
+        //   target = (imm16 << 2) & 0x3FFF0
+        // Distinct variant `LoadAbs` to avoid the misleading `Rel`
+        // name; same numeric layout.
+        0x061 => {
+            let imm = i16_signed(raw) as i32;
+            let target = (imm.wrapping_mul(4) as u32) & 0x3FFF0;
+            return SpuInstKind::LoadAbs {
+                rt: rt(raw),
+                target_pc: target,
+            };
+        }
+        // R5.10o — stqa rt, imm16 — Store Quadword Absolute. Mirror
+        // of LQA above with store direction.
+        0x041 => {
+            let imm = i16_signed(raw) as i32;
+            let target = (imm.wrapping_mul(4) as u32) & 0x3FFF0;
+            return SpuInstKind::StoreAbs {
+                rt: rt(raw),
+                target_pc: target,
+            };
+        }
         0x042 | 0x040 => {
             // brnz/brz rt, i16
             return SpuInstKind::BranchCond {
@@ -364,6 +534,17 @@ fn classify(raw: u32, pc: u32) -> SpuInstKind {
         0x081 | 0x082 | 0x083 | 0x0C1 => {
             let _ = i16_unsigned(raw); // imm extracted by backend if needed
             return SpuInstKind::LoadImm { rt: rt(raw) };
+        }
+        // R5.10f — fsmbi rt, imm16 (Form Select Mask for Bytes Immediate).
+        // Distinct from FSM/FSMH/FSMB (RR-form, p11=0x1B4..0x1B6) — the
+        // 16 source bits come from `imm16` instead of `ra`'s preferred
+        // slot. Pure compute; backend (interpreter) discriminates by the
+        // variant tag.
+        0x065 => {
+            return SpuInstKind::FormSelectMaskImm {
+                rt: rt(raw),
+                imm16: i16_unsigned(raw),
+            };
         }
         _ => {}
     }
@@ -401,11 +582,17 @@ fn classify(raw: u32, pc: u32) -> SpuInstKind {
         | 0x1D | 0x0C => {
             return SpuInstKind::AluImm { rt: rt(raw), ra: ra(raw), imm10: i10_signed(raw) };
         }
-        // byte-immediate ops: andbi/orbi/xorbi/ceqbi/cgtbi/clgtbi.
-        // The 8-bit imm sits at MSB-0 bits 8..15 (= LSB-0 16..23). We
-        // sign-extend it to i16 so we can re-use the AluImm carrier.
+        // byte-immediate ops: orbi/andbi/xorbi/cgtbi/clgtbi/ceqbi.
+        // Per RPCS3 `bf_t<u32, 14, 8> i8` (SPUOpcodes.h), the 8-bit
+        // immediate occupies LSB-0 bits 14..21 (= MSB-0 bits 10..17),
+        // matching `(raw >> 14) & 0xFF`. R5.10i corrected the prior
+        // `(raw >> 16) & 0xFF` extraction which was off by 2 bits and
+        // produced silently-wrong values for any non-zero `i8` (the
+        // interpreter had no byte-imm arm to surface the bug, but the
+        // JIT inherited it via `imm10`). We sign-extend to i16 so the
+        // existing `AluImm { imm10 }` carrier still works.
         0x06 | 0x16 | 0x46 | 0x4E | 0x5E | 0x7E => {
-            let imm8 = ((raw >> 16) & 0xFF) as u8 as i8;
+            let imm8 = ((raw >> 14) & 0xFF) as u8 as i8;
             return SpuInstKind::AluImm { rt: rt(raw), ra: ra(raw), imm10: imm8 as i16 };
         }
         _ => {}
@@ -451,8 +638,10 @@ fn is_unary_rr_11bit(p11: u32) -> bool {
         p11,
         // sign-extend variants
         0x2A5 | 0x2A6 | 0x2AE | 0x2B4 | 0x2B6
-        // form-select-mask
-        | 0x1B4
+        // form-select-mask: word (FSM, R5.x), halfword (FSMH, R5.10f),
+        // byte (FSMB, R5.10f). Same RR-unary shape; semantics differ
+        // only in granularity. Interpreter discriminates on p11.
+        | 0x1B4 | 0x1B5 | 0x1B6
         // reciprocal estimates
         | 0x1B8 | 0x1B9
         // or-across
@@ -749,6 +938,394 @@ mod tests {
         match i.kind {
             SpuInstKind::BranchIndirect { ra } => assert_eq!(ra, 4),
             other => panic!("expected BranchIndirect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_lqr_pc_relative_negative_offset() {
+        // R5.10b regression — the exact instruction surfaced by the
+        // R5.9e.5 v4 diagnostic at pc=0x850 in the spurs_test image:
+        //   inst   = 0x33FF2E08
+        //   rt     = 8
+        //   imm16  = 0xFE5C (signed -420)
+        //   target = (0x850 + (-420 << 2)) & 0x3FFF0
+        //          = (0x850 - 0x690) & 0x3FFF0 = 0x1C0
+        //
+        // Pre-R5.10b this returned `Unclassified`; post-R5.10b it
+        // resolves to `LoadRel { rt: 8, target_pc: 0x1C0 }`.
+        let i = decode_inst(0x33FF2E08, 0x850);
+        match i.kind {
+            SpuInstKind::LoadRel { rt, target_pc } => {
+                assert_eq!(rt, 8, "rt is bottom 7 bits of inst");
+                assert_eq!(target_pc, 0x1C0, "PC-relative target");
+            }
+            other => panic!("expected LoadRel, got {other:?}"),
+        }
+        assert!(
+            !matches!(i.kind, SpuInstKind::Unclassified),
+            "LQR must no longer be Unclassified",
+        );
+    }
+
+    #[test]
+    fn decode_cdd_real_v4_opcode() {
+        // R5.10d regression — the exact instruction surfaced by the
+        // R5.10b v4 diagnostic at pc=0x854 in the spurs_test image:
+        //   inst   = 0x3EE00085
+        //   p11    = 0x1F7 (CDD, RI7-form, granularity Doubleword)
+        //   rt     = 5
+        //   ra     = 1
+        //   imm7   = 0
+        //
+        // Pre-R5.10d this returned `Unclassified`; post-R5.10d it
+        // resolves to InsertControl with the matching fields.
+        let i = decode_inst(0x3EE00085, 0x854);
+        match i.kind {
+            SpuInstKind::InsertControl {
+                rt,
+                ra,
+                source: InsertControlSource::ImmI7 { imm7 },
+                granularity: InsertGranularity::Doubleword,
+            } => {
+                assert_eq!(rt, 5);
+                assert_eq!(ra, 1);
+                assert_eq!(imm7, 0);
+            }
+            other => panic!("expected InsertControl(CDD), got {other:?}"),
+        }
+        assert!(
+            !matches!(i.kind, SpuInstKind::Unclassified),
+            "CDD must no longer be Unclassified",
+        );
+    }
+
+    #[test]
+    fn decode_full_c_family_classification() {
+        // Lock-in: every one of the 8 C-family primaries decodes to
+        // `InsertControl` with the right granularity + source form.
+        // Encoding: 11-bit primary at bits 0..10 = top 11 bits of the
+        // 32-bit instruction word. We use rt=4, ra=2 throughout, and
+        // rb=6 (RR-form) or imm7=3 (RI7-form) so any field-extraction
+        // bug surfaces.
+        struct Case {
+            primary: u32,
+            granularity: InsertGranularity,
+            is_imm: bool,
+        }
+        let cases = [
+            Case { primary: 0x1D4, granularity: InsertGranularity::Byte,       is_imm: false }, // CBX
+            Case { primary: 0x1D5, granularity: InsertGranularity::Halfword,   is_imm: false }, // CHX
+            Case { primary: 0x1D6, granularity: InsertGranularity::Word,       is_imm: false }, // CWX
+            Case { primary: 0x1D7, granularity: InsertGranularity::Doubleword, is_imm: false }, // CDX
+            Case { primary: 0x1F4, granularity: InsertGranularity::Byte,       is_imm: true  }, // CBD
+            Case { primary: 0x1F5, granularity: InsertGranularity::Halfword,   is_imm: true  }, // CHD
+            Case { primary: 0x1F6, granularity: InsertGranularity::Word,       is_imm: true  }, // CWD
+            Case { primary: 0x1F7, granularity: InsertGranularity::Doubleword, is_imm: true  }, // CDD
+        ];
+        for c in &cases {
+            // Build inst: primary << 21 | rb<<14 | ra<<7 | rt.
+            // For RI7 form, the rb-slot holds the 7-bit immediate.
+            let body = if c.is_imm { 3u32 << 14 } else { 6u32 << 14 };
+            let raw = (c.primary << 21) | body | (2u32 << 7) | 4u32;
+            let i = decode_inst(raw, 0);
+            match i.kind {
+                SpuInstKind::InsertControl { rt, ra, source, granularity } => {
+                    assert_eq!(rt, 4, "primary=0x{:x}", c.primary);
+                    assert_eq!(ra, 2, "primary=0x{:x}", c.primary);
+                    assert_eq!(granularity, c.granularity, "primary=0x{:x}", c.primary);
+                    match (c.is_imm, source) {
+                        (true, InsertControlSource::ImmI7 { imm7 }) => {
+                            assert_eq!(imm7, 3, "primary=0x{:x}", c.primary);
+                        }
+                        (false, InsertControlSource::RegRb { rb }) => {
+                            assert_eq!(rb, 6, "primary=0x{:x}", c.primary);
+                        }
+                        (true, _) => panic!("expected ImmI7 for primary 0x{:x}", c.primary),
+                        (false, _) => panic!("expected RegRb for primary 0x{:x}", c.primary),
+                    }
+                }
+                other => panic!("primary 0x{:x} expected InsertControl, got {other:?}", c.primary),
+            }
+        }
+    }
+
+    #[test]
+    fn decode_stqa_real_v4_opcode() {
+        // R5.10o regression — exact instruction surfaced by the
+        // R5.10m v4 diagnostic at pc=0x734 in the spurs_test image:
+        //   inst   = 0x20FFFA09 (decimal 553_646_601)
+        //   p9     = 0x041 (STQA, RI16 absolute store)
+        //   rt     = 9
+        //   imm16  = 0xFFF4 (signed -12)
+        //   target = (-12 << 2) & 0x3FFF0
+        //          = (-48) & 0x3FFF0
+        //          = 0xFFFFFFD0 & 0x3FFF0
+        //          = 0x3FFD0
+        // Pre-R5.10o this returned `Unclassified`; post-R5.10o it
+        // resolves to `StoreAbs { rt: 9, target_pc: 0x3FFD0 }`.
+        let i = decode_inst(0x20FFFA09, 0x734);
+        match i.kind {
+            SpuInstKind::StoreAbs { rt, target_pc } => {
+                assert_eq!(rt, 9);
+                assert_eq!(target_pc, 0x3FFD0);
+            }
+            other => panic!("expected StoreAbs(STQA), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_lqa_absolute_negative_offset() {
+        // R5.10o regression — one of the 5 v4 LQA sites:
+        //   pc=0x07AC inst=0x30FFFC04 lqa r4, imm16=-8
+        //   target = (-8 << 2) & 0x3FFF0 = 0xFFFFFFE0 & 0x3FFF0 = 0x3FFE0
+        let i = decode_inst(0x30FFFC04, 0x07AC);
+        match i.kind {
+            SpuInstKind::LoadAbs { rt, target_pc } => {
+                assert_eq!(rt, 4);
+                assert_eq!(target_pc, 0x3FFE0);
+            }
+            other => panic!("expected LoadAbs(LQA), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_lqa_stqa_target_independent_of_pc() {
+        // R5.10o anti-regression: LQA / STQA must use PC=0 (absolute)
+        // — the same imm16 must produce the SAME target regardless of
+        // the pc parameter passed to decode_inst. Anti-regression
+        // against accidentally pc-adding the imm16 like LQR/STQR do.
+        let raw_lqa  = (0x061u32 << 23) | ((0x0010u16 as u32) << 7) | 5;  // lqa r5, +0x10
+        let raw_stqa = (0x041u32 << 23) | ((0x0010u16 as u32) << 7) | 6;  // stqa r6, +0x10
+        // Expected target is purely from imm16: (0x10 << 2) & 0x3FFF0 = 0x40.
+        for pc in &[0x0u32, 0x100, 0x1234, 0x3FFF8] {
+            let il = decode_inst(raw_lqa, *pc);
+            let is = decode_inst(raw_stqa, *pc);
+            match il.kind {
+                SpuInstKind::LoadAbs { target_pc, .. } => {
+                    assert_eq!(target_pc, 0x40, "LQA target must be PC-independent (pc=0x{pc:x})");
+                }
+                other => panic!("LQA pc=0x{pc:x}: {other:?}"),
+            }
+            match is.kind {
+                SpuInstKind::StoreAbs { target_pc, .. } => {
+                    assert_eq!(target_pc, 0x40, "STQA target must be PC-independent (pc=0x{pc:x})");
+                }
+                other => panic!("STQA pc=0x{pc:x}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn decode_lqr_stqr_remain_pc_relative_after_lqa_stqa_landing() {
+        // R5.10o anti-regression: LQR (0x067) and STQR (0x047) must
+        // STILL be PC-relative — landing LQA/STQA must NOT have
+        // accidentally changed their dispatch to absolute.
+        let raw_lqr = (0x067u32 << 23) | ((0x0010u16 as u32) << 7) | 5; // lqr r5, +0x10
+        let raw_stqr = (0x047u32 << 23) | ((0x0010u16 as u32) << 7) | 6; // stqr r6, +0x10
+        // For PC=0x100, target = (0x100 + (0x10 << 2)) & 0x3FFF0 = 0x140.
+        let il = decode_inst(raw_lqr, 0x100);
+        let is = decode_inst(raw_stqr, 0x100);
+        match il.kind {
+            SpuInstKind::LoadRel { target_pc, .. } => {
+                assert_eq!(target_pc, 0x140, "LQR must remain PC-relative");
+            }
+            other => panic!("LQR regressed: {other:?}"),
+        }
+        match is.kind {
+            SpuInstKind::StoreRel { target_pc, .. } => {
+                assert_eq!(target_pc, 0x140, "STQR must remain PC-relative");
+            }
+            other => panic!("STQR regressed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_rotqmbyi_real_v4_opcode() {
+        // R5.10m regression — exact instruction surfaced by the
+        // R5.10k v4 diagnostic at pc=0x72C in the spurs_test image:
+        //   inst   = 0x3FBF0E96 (decimal 1_069_485_718)
+        //   p11    = 0x1FD (ROTQMBYI)
+        //   rt     = 22, ra = 29, imm7 = 0x7C (= -4 signed)
+        // Pre-R5.10m this returned `Unclassified`; post-R5.10m it
+        // resolves to `AluImm7 { rt:22, ra:29, imm7:-4 }` (the i7
+        // helper sign-extends; backend discriminates ROTQMBYI vs
+        // ROTQBYI/SHLQBYI/SHLQBII on the raw primary).
+        let i = decode_inst(0x3FBF0E96, 0x72C);
+        match i.kind {
+            SpuInstKind::AluImm7 { rt, ra, imm7 } => {
+                assert_eq!(rt, 22);
+                assert_eq!(ra, 29);
+                assert_eq!(imm7, -4, "imm7 0x7C signed = -4");
+            }
+            other => panic!("expected AluImm7(ROTQMBYI), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_quadword_shift_family_primaries_resolve_to_aluimm7() {
+        // R5.10m: lock-in for the 4 RI7-form quadword shift primaries
+        // covered today (SHLQBII 0x1FB, ROTQBYI 0x1FC, ROTQMBYI 0x1FD,
+        // SHLQBYI 0x1FF). Each must resolve to AluImm7 (the backend
+        // discriminates by raw primary). ROTQBII (0x1F8) and ROTQMBII
+        // (0x1F9) are intentionally NOT in the set yet (no v4 use)
+        // and must remain Unclassified to avoid silent dispatch.
+        for &p11 in &[0x1FBu32, 0x1FC, 0x1FD, 0x1FF] {
+            let raw = (p11 << 21) | (5u32 << 14) | (3u32 << 7) | 7u32; // imm7=5, ra=3, rt=7
+            let i = decode_inst(raw, 0);
+            assert!(
+                matches!(i.kind, SpuInstKind::AluImm7 { .. }),
+                "p11=0x{p11:03x} must decode to AluImm7, got {:?}", i.kind,
+            );
+        }
+        // Anti-regression: 0x1F8 ROTQBII and 0x1F9 ROTQMBII must NOT
+        // be silently accepted. They currently lack a Rust impl.
+        for &p11 in &[0x1F8u32, 0x1F9] {
+            let raw = (p11 << 21) | (5u32 << 14);
+            let i = decode_inst(raw, 0);
+            assert!(
+                matches!(i.kind, SpuInstKind::Unclassified),
+                "p11=0x{p11:03x} must remain Unclassified pre-implementation; got {:?}", i.kind,
+            );
+        }
+    }
+
+    #[test]
+    fn decode_andbi_real_v4_opcode_extracts_i8_from_bits_14_21() {
+        // R5.10i regression — the exact instruction the R5.10g v4
+        // diagnostic surfaced at pc=0x86C in the spurs_test image:
+        //   inst   = 0x16080183 (= decimal 369_623_427)
+        //   p8     = 0x16 (ANDBI, RI10 byte-immediate)
+        //   rt     = 3
+        //   ra     = 3
+        //   i8     = 0x20 per RPCS3 `bf_t<u32, 14, 8>`
+        //            (= LSB-0 bits 14..21 = `(raw >> 14) & 0xFF`)
+        //
+        // Pre-R5.10i the decoder used `(raw >> 16) & 0xFF` and produced
+        // `imm10 = 0x08` — silently wrong (no interpreter byte-imm arm
+        // existed to surface a differential mismatch, but the JIT
+        // inherited the wrong byte). Post-R5.10i it produces
+        // `imm10 = 0x20` matching the C++ reference.
+        let i = decode_inst(0x16080183, 0x86C);
+        match i.kind {
+            SpuInstKind::AluImm { rt, ra, imm10 } => {
+                assert_eq!(rt, 3);
+                assert_eq!(ra, 3);
+                assert_eq!(
+                    imm10, 0x20,
+                    "i8 must come from bits 14..21, NOT 16..23 (regression-lock)",
+                );
+            }
+            other => panic!("expected AluImm(ANDBI), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_byte_imm_family_extracts_i8_correctly() {
+        // Spot-check the off-by-2-bits regression across all 6 byte-imm
+        // primaries with a non-zero `i8` that differs between the right
+        // and the wrong extraction. Build the inst by hand: primary at
+        // bits 0..7 (MSB-0), i8 at bits 10..17 (MSB-0 = LSB-0 14..21),
+        // ra at bits 18..24, rt at bits 25..31. Choose i8=0xA5 because
+        // every bit is set/cleared distinctly so any 2-bit shift would
+        // produce a visibly different value.
+        for &p8 in &[0x06u32, 0x16, 0x46, 0x4E, 0x5E, 0x7E] {
+            let i8_field: u32 = 0xA5;
+            let raw = (p8 << 24) | (i8_field << 14) | (4u32 << 7) | 5u32; // ra=4, rt=5
+            let i = decode_inst(raw, 0);
+            match i.kind {
+                SpuInstKind::AluImm { rt, ra, imm10 } => {
+                    assert_eq!(rt, 5,  "p8=0x{p8:02X}");
+                    assert_eq!(ra, 4,  "p8=0x{p8:02X}");
+                    // 0xA5 sign-extended via i8 → i16 = 0xFFA5 (-91).
+                    let expected = 0xA5u8 as i8 as i16;
+                    assert_eq!(
+                        imm10, expected,
+                        "p8=0x{p8:02X}: i8 extraction must take bits 14..21 (= 0xA5)",
+                    );
+                }
+                other => panic!("p8=0x{p8:02X} expected AluImm, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn decode_stqr_real_v4_opcode() {
+        // R5.10g regression — exact instruction surfaced by the R5.10f
+        // v4 diagnostic at pc=0x868 in the spurs_test image:
+        //   inst   = 0x23FF2B02 (= decimal 603_925_250, what the
+        //            `--ignored` real_trace_diagnostic literally prints)
+        //   p9     = 0x047 (STQR, RI16-form)
+        //   rt     = 2
+        //   imm16  = 0xFE56 (signed -426)
+        //   target = (pc + (imm16<<2)) & 0x3FFF0
+        //          = (0x868 + (-426 * 4)) & 0x3FFF0
+        //          = (0x868 - 0x6A8)     & 0x3FFF0
+        //          = 0x1C0               & 0x3FFF0
+        //          = 0x1C0
+        //
+        // Pre-R5.10g this returned `Unclassified`; post-R5.10g it
+        // resolves to StoreRel with the matching fields.
+        let i = decode_inst(0x23FF2B02, 0x868);
+        match i.kind {
+            SpuInstKind::StoreRel { rt, target_pc } => {
+                assert_eq!(rt, 2);
+                assert_eq!(target_pc, 0x1C0);
+            }
+            other => panic!("expected StoreRel(STQR), got {other:?}"),
+        }
+        assert!(
+            !matches!(i.kind, SpuInstKind::Unclassified),
+            "STQR must no longer be Unclassified",
+        );
+    }
+
+    #[test]
+    fn decode_fsmbi_real_v4_opcode() {
+        // R5.10f regression — the exact instruction surfaced by the
+        // R5.10e v4 diagnostic at pc=0x864 in the spurs_test image:
+        //   inst   = 0x32880003 (= decimal 847_773_699, what the
+        //            `--ignored` real_trace_diagnostic literally prints)
+        //   p9     = 0x065 (FSMBI, RI16-form)
+        //   rt     = 3
+        //   imm16  = 0x1000
+        //
+        // Pre-R5.10f this returned `Unclassified`; post-R5.10f it
+        // resolves to FormSelectMaskImm with the matching fields.
+        let i = decode_inst(0x32880003, 0x864);
+        match i.kind {
+            SpuInstKind::FormSelectMaskImm { rt, imm16 } => {
+                assert_eq!(rt, 3);
+                assert_eq!(imm16, 0x1000);
+            }
+            other => panic!("expected FormSelectMaskImm(FSMBI), got {other:?}"),
+        }
+        assert!(
+            !matches!(i.kind, SpuInstKind::Unclassified),
+            "FSMBI must no longer be Unclassified",
+        );
+    }
+
+    #[test]
+    fn decode_fsm_family_rr_classification() {
+        // Lock-in: FSM (0x1B4), FSMH (0x1B5), FSMB (0x1B6) all decode
+        // to `Unary { rt, ra }` (preserving the JIT codegen pathway for
+        // the already-supported FSM at 0x1B4). The interpreter
+        // discriminates on the 11-bit primary; the JIT marks 0x1B5/0x1B6
+        // as Unsupported and routes them through R5 partial fallback.
+        for &p11 in &[0x1B4u32, 0x1B5, 0x1B6] {
+            let raw = (p11 << 21) | (3u32 << 7) | 5u32; // rt=5, ra=3
+            let i = decode_inst(raw, 0);
+            match i.kind {
+                SpuInstKind::Unary { rt, ra } => {
+                    assert_eq!(rt, 5, "p11=0x{p11:03x}");
+                    assert_eq!(ra, 3, "p11=0x{p11:03x}");
+                }
+                other => panic!("p11=0x{p11:03x} expected Unary, got {other:?}"),
+            }
+            assert!(
+                !matches!(i.kind, SpuInstKind::Unclassified),
+                "p11=0x{p11:03x} must not be Unclassified",
+            );
         }
     }
 

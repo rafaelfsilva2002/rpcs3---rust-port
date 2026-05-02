@@ -239,6 +239,15 @@ pub struct SpuThread {
 
     /// Channel state exposed to `rdch`/`wrch`/`rchcnt` opcodes.
     pub channels: SpuChannels,
+
+    /// R5.4a: explicit parking model. `Some(state)` when the SPU
+    /// thread is parked on a channel op waiting for the counterpart
+    /// (mailbox refill / drain) to land. `None` otherwise. The
+    /// interpreter sets this when `step()` would have stalled; an
+    /// external scheduler (or test) clears it via `clear_park()` once
+    /// the parking condition is resolved. R5.4a does NOT implement a
+    /// concurrent scheduler — this field is just the data model.
+    pub park_state: Option<SpuParkState>,
 }
 
 // =====================================================================
@@ -261,6 +270,25 @@ pub mod ch {
     pub const SPU_WRDEC: u32 = 7;
     /// Read decrementer.
     pub const SPU_RDDEC: u32 = 8;
+    // R6.7 C.1 — MFC param + cmd + tag-stat channels for replay-mode
+    // GET-only DMA support. The C++ side (`rpcs3/Emu/Cell/SPUThread.cpp`)
+    // implements full MFC semantics; here we only model the subset
+    // needed to let a captured GET trace replay byte-identical via a
+    // pre-applied `MfcReplayState` (see crate `rpcs3-spu-differential`'s
+    // `mfc_replay::apply_mfc_dma_pre_replay`). Runtime-mode MFC (a
+    // live game dispatching real DMA) is out of scope — wrch ch21 in
+    // runtime mode is a no-op here, and rdch ch24 stalls if the
+    // replay pre-population didn't seed a value.
+    pub const MFC_LSA: u32 = 16;
+    pub const MFC_EAH: u32 = 17;
+    pub const MFC_EAL: u32 = 18;
+    pub const MFC_SIZE: u32 = 19;
+    pub const MFC_TAG_ID: u32 = 20;
+    pub const MFC_CMD: u32 = 21;
+    pub const MFC_WR_TAG_MASK: u32 = 22;
+    pub const MFC_WR_TAG_UPDATE: u32 = 23;
+    pub const MFC_RD_TAG_STAT: u32 = 24;
+    pub const MFC_RD_TAG_MASK: u32 = 25;
     /// Read event mask.
     pub const SPU_RDEVENTMASK: u32 = 22;
     /// Read machine status.
@@ -275,7 +303,7 @@ pub mod ch {
 
 /// State behind the SPU channel namespace. Dispatch reads/writes via
 /// [`SpuChannels::read`] / [`SpuChannels::write`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SpuChannels {
     /// Event status bitmap (read via RDEVENTSTAT).
     pub event_stat: u32,
@@ -293,6 +321,39 @@ pub struct SpuChannels {
     pub in_mbox: Option<u32>,
     /// Outgoing interrupt mailbox (SPU → PPU, with IRQ).
     pub out_intr_mbox: Option<u32>,
+
+    // R6.7 C.2 — MFC channel state. These fields back wrch ch16-23 and
+    // rdch ch24-25 so a captured GET trace can replay end-to-end through
+    // the SPU executor. They are populated either by the SPU's own
+    // wrch instructions (the ch16-20, 22, 23 cases) OR by a pre-replay
+    // helper (`mfc_replay::apply_mfc_dma_pre_replay` in crate
+    // `rpcs3-spu-differential`) that walks the captured event stream
+    // before the SPU starts running.
+    /// MFC LSA (ch16). Set by `wrch ch16`. The R6.7 C.3 design
+    /// pre-applies the GET DMA at this LS offset before the SPU runs,
+    /// so subsequent `wrch ch21` (MFC_Cmd) is a no-op.
+    pub mfc_lsa: u32,
+    /// MFC EAH (ch17). Always 0 in PSL1GHT user-space scope.
+    pub mfc_eah: u32,
+    /// MFC EAL (ch18). Caller-supplied effective address low half.
+    pub mfc_eal: u32,
+    /// MFC Size (ch19). Transfer size in bytes (1, 2, 4, 8, or
+    /// multiple of 16 in [16, 16384]).
+    pub mfc_size: u32,
+    /// MFC TagID (ch20). 5-bit tag (0..32).
+    pub mfc_tag_id: u32,
+    /// MFC WrTagMask (ch22 in write direction). Bitmask of tags the
+    /// next rdch ch24 will inspect.
+    pub mfc_wr_tag_mask: u32,
+    /// MFC WrTagUpdate (ch23 in write direction). 0=Immediate /
+    /// 1=Any / 2=All wait mode.
+    pub mfc_wr_tag_update: u32,
+    /// Pre-populated queue of `rdch ch24 (RdTagStat)` values, in the
+    /// order the SPU reads them. Each rdch ch24 pops one value. Empty
+    /// queue + the SPU calling rdch ch24 → `WouldStall` (the SPU
+    /// parks; runtime-mode MFC is out of R6.7 scope so this is the
+    /// expected halting behaviour for any unanticipated read).
+    pub mfc_tag_stat_queue: std::collections::VecDeque<u32>,
 }
 
 /// Outcome of a channel op when the channel is empty/full. Matches
@@ -304,6 +365,58 @@ pub enum ChannelStatus {
     Ok,
     WouldStall,
     BadChannel,
+}
+
+/// R5.4a: why an SPU thread is currently parked. The variant carries
+/// the channel id so a future scheduler can route mailbox/signal
+/// arrivals to the right parked thread. `BadChannel` and other error
+/// outcomes are NOT modeled here — those still surface as
+/// `Error::Unimplemented` from the interpreter without parking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpuParkReason {
+    /// Parked on `rdch ch=channel` waiting for a value to arrive.
+    /// Cleared when an external producer pushes to the channel.
+    ChannelRead { channel: u32 },
+    /// Parked on `wrch ch=channel` waiting for capacity to drain.
+    /// Cleared when an external consumer drains the channel.
+    ChannelWrite { channel: u32 },
+}
+
+/// R5.4a: captured state of a parked SPU thread. PC is the address of
+/// the channel op the thread parked on — re-running from this PC
+/// after the parking condition resolves will retry the same channel
+/// op (the original semantics of "blocking" SPU channel reads/writes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpuParkState {
+    /// Address of the `rdch`/`wrch` instruction the thread parked on.
+    pub pc: u32,
+    /// Why the thread parked.
+    pub reason: SpuParkReason,
+}
+
+/// R5.4b: outcome of a wake attempt against a parked SPU thread.
+///
+/// Wake never executes the parked instruction itself — it only checks
+/// whether the parking condition is now satisfied (because some
+/// external producer/consumer touched the channel) and, if so, clears
+/// `park_state` and returns the saved PC so the caller can re-run.
+/// The caller is responsible for actually running the SPU from `pc`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpuWakeResult {
+    /// `park_state == None` — no wake was warranted. The wake helper
+    /// is a no-op in this case (modulo any side effect from the
+    /// helper's primary action — e.g., `ppu_push_inmbox` still pushes).
+    NotParked,
+    /// `park_state` exists, but the channel's blocking condition is
+    /// still unmet (mailbox still empty / full, signal still 0). The
+    /// thread stays parked, `park_state` is unchanged.
+    StillBlocked,
+    /// `park_state` was satisfied. `park_state` is cleared and the
+    /// saved PC is returned so the caller can re-run the channel op
+    /// from its original address. **Re-execution of the channel op is
+    /// the caller's job** — wake itself does not advance PC or
+    /// consume any value.
+    Ready { pc: u32 },
 }
 
 impl SpuChannels {
@@ -344,12 +457,26 @@ impl SpuChannels {
             SPU_RDEVENTSTAT => Ok(self.event_stat & self.event_mask),
             SPU_RDEVENTMASK => Ok(self.event_mask),
             SPU_RDSIGNOTIFY1 => {
+                // R5.11: match Cell BE semantics — rdch on an unsignaled
+                // SNR channel must stall (count == 0). The R5.11 signal
+                // fixture (`single_spu_signal_v1`) needs this to park
+                // the SPU on its initial `rdch ch3` so the captured
+                // `ppu_signal` event has something to wake; without
+                // this, replay races past the read with snr=0 and the
+                // backends diverge from the captured OUT_MBOX value.
+                // Same shape as IN_MBOX read.
+                if self.snr[0] == 0 {
+                    return Err(ChannelStatus::WouldStall);
+                }
                 let v = self.snr[0];
                 self.snr[0] = 0;
                 self.event_stat &= !0x00000001;
                 Ok(v)
             }
             SPU_RDSIGNOTIFY2 => {
+                if self.snr[1] == 0 {
+                    return Err(ChannelStatus::WouldStall);
+                }
                 let v = self.snr[1];
                 self.snr[1] = 0;
                 self.event_stat &= !0x00000002;
@@ -363,6 +490,19 @@ impl SpuChannels {
                     None => Err(ChannelStatus::WouldStall),
                 }
             }
+            // R6.7 C.4 — RdTagStat (ch24): pop the next pre-populated
+            // tag-stat value. Empty queue → `WouldStall` (the SPU
+            // parks; runtime-mode MFC is out of R6.7 scope, so an
+            // unexpected empty-queue read indicates the captured
+            // trace's pre-replay setup is incomplete or the SPU
+            // diverged from the trace).
+            ch::MFC_RD_TAG_STAT => match self.mfc_tag_stat_queue.pop_front() {
+                Some(v) => Ok(v),
+                None => Err(ChannelStatus::WouldStall),
+            },
+            // R6.7 C.4 — RdTagMask (ch25): stateless read of the
+            // current tag-mask register.
+            ch::MFC_RD_TAG_MASK => Ok(self.mfc_wr_tag_mask),
             _ => Err(ChannelStatus::BadChannel),
         }
     }
@@ -388,6 +528,27 @@ impl SpuChannels {
                 self.out_intr_mbox = Some(value);
                 Ok(())
             }
+            // R6.7 C.2 — MFC param channels. ch16-20 are simple
+            // stash-only stores; ch22 / ch23 set the wait-mask /
+            // wait-mode for the matching RdTagStat read. None of
+            // these stall (the C++ side never stalls on these
+            // channels either — they're write-only register slots).
+            MFC_LSA => { self.mfc_lsa = value; Ok(()) }
+            MFC_EAH => { self.mfc_eah = value; Ok(()) }
+            MFC_EAL => { self.mfc_eal = value; Ok(()) }
+            MFC_SIZE => { self.mfc_size = value; Ok(()) }
+            MFC_TAG_ID => { self.mfc_tag_id = value; Ok(()) }
+            MFC_WR_TAG_MASK => { self.mfc_wr_tag_mask = value; Ok(()) }
+            MFC_WR_TAG_UPDATE => { self.mfc_wr_tag_update = value; Ok(()) }
+            // R6.7 C.3 — wrch ch21 (MFC_Cmd). In replay mode the DMA
+            // has ALREADY been pre-applied to LS by
+            // `apply_mfc_dma_pre_replay`, so the actual cmd dispatch
+            // is a no-op here — we just acknowledge the write so the
+            // SPU's wrch instruction completes and PC advances.
+            // Runtime-mode MFC (live game) is out of R6.7 scope; a
+            // future C.D phase would dispatch via FFI back to RPCS3
+            // vm:: accessors here.
+            MFC_CMD => Ok(()),
             _ => Err(ChannelStatus::BadChannel),
         }
     }
@@ -406,6 +567,20 @@ impl SpuChannels {
             SPU_WREVENTMASK | SPU_WREVENTACK | SPU_WRDEC => 1,
             SPU_WROUTMBOX => if self.out_mbox.is_none() { 1 } else { 0 },
             SPU_WROUTINTRMBOX => if self.out_intr_mbox.is_none() { 1 } else { 0 },
+            // R6.7 C.2 — MFC param channels are always writable
+            // (single-slot register stores, never stall). MFC_CMD
+            // is also always writable in replay mode. ch22 and ch23
+            // (MFC_WR_TAG_MASK / MFC_WR_TAG_UPDATE) deliberately
+            // omitted from this arm — those channel numbers are
+            // already covered by SPU_RDEVENTMASK / SPU_RDMACHSTAT
+            // above, and the SPU ABI permits the same channel id
+            // to serve different roles in the read vs write
+            // direction.
+            MFC_LSA | MFC_EAH | MFC_EAL | MFC_SIZE | MFC_TAG_ID | MFC_CMD => 1,
+            // R6.7 C.4 — RdTagStat readable count = queue depth;
+            // RdTagMask is always readable (count = 1).
+            MFC_RD_TAG_STAT => self.mfc_tag_stat_queue.len() as u32,
+            MFC_RD_TAG_MASK => 1,
             _ => return Err(ChannelStatus::BadChannel),
         };
         Ok(count)
@@ -449,7 +624,121 @@ impl SpuThread {
             ch_stall_mask: 0,
             snr_config: 0,
             channels: SpuChannels::default(),
+            park_state: None,
         }
+    }
+
+    /// R5.4a: true iff this SPU thread is currently parked on a
+    /// channel op waiting for the counterpart to refill/drain.
+    #[must_use]
+    pub fn is_parked(&self) -> bool {
+        self.park_state.is_some()
+    }
+
+    /// R5.4a: record that this SPU thread parked at `pc` for `reason`.
+    /// The interpreter calls this from `step()` when an `rdch` would
+    /// block on an empty channel or a `wrch` on a full one. PC is the
+    /// address of the channel-op instruction itself (NOT pc+4) — that's
+    /// the correct address to re-run once the parking condition is
+    /// resolved.
+    pub fn park_on_channel(&mut self, pc: u32, reason: SpuParkReason) {
+        self.park_state = Some(SpuParkState { pc, reason });
+    }
+
+    /// R5.4a: clear any park state. Caller is responsible for calling
+    /// this once the parking condition has been resolved (e.g. a value
+    /// was pushed into `in_mbox`, a slot was drained from `out_mbox`)
+    /// and the SPU should be allowed to re-execute the channel op.
+    /// Does not touch GPRs / LS / SpuChannels.
+    pub fn clear_park(&mut self) {
+        self.park_state = None;
+    }
+
+    /// R5.4a: PC at which the thread parked, or `None` if not parked.
+    #[must_use]
+    pub fn parked_pc(&self) -> Option<u32> {
+        self.park_state.map(|p| p.pc)
+    }
+
+    /// R5.4a: reason the thread parked, or `None` if not parked.
+    #[must_use]
+    pub fn parked_reason(&self) -> Option<SpuParkReason> {
+        self.park_state.map(|p| p.reason)
+    }
+
+    /// R5.4b: check whether the channel condition behind a parked
+    /// state is now satisfied; clear `park_state` and return the saved
+    /// PC if it is. **Does not execute or advance PC.** The caller
+    /// must re-run the SPU from the returned PC to actually retry the
+    /// channel op.
+    ///
+    /// Returns:
+    /// - `NotParked` if `park_state == None`.
+    /// - `StillBlocked` if parked but the condition is still unmet.
+    /// - `Ready { pc }` if the condition is satisfied; `park_state`
+    ///   is cleared as a side effect.
+    ///
+    /// Conditions per parking reason:
+    /// - `ChannelRead { 29 }` (RDINMBOX): `in_mbox.is_some()`.
+    /// - `ChannelRead { 3 }` (RDSIGNOTIFY1): `snr[0] != 0`.
+    /// - `ChannelRead { 4 }` (RDSIGNOTIFY2): `snr[1] != 0`.
+    /// - `ChannelWrite { 28 }` (WROUTMBOX): `out_mbox.is_none()`.
+    /// - `ChannelWrite { 30 }` (WROUTINTRMBOX): `out_intr_mbox.is_none()`.
+    /// - Any other channel: stays `StillBlocked` (no resolution path
+    ///   defined; defensive).
+    pub fn try_resolve_park(&mut self) -> SpuWakeResult {
+        let park = match self.park_state {
+            Some(p) => p,
+            None => return SpuWakeResult::NotParked,
+        };
+        use ch::*;
+        let satisfied = match park.reason {
+            SpuParkReason::ChannelRead { channel } => match channel {
+                SPU_RDINMBOX => self.channels.in_mbox.is_some(),
+                SPU_RDSIGNOTIFY1 => self.channels.snr[0] != 0,
+                SPU_RDSIGNOTIFY2 => self.channels.snr[1] != 0,
+                _ => false,
+            },
+            SpuParkReason::ChannelWrite { channel } => match channel {
+                SPU_WROUTMBOX => self.channels.out_mbox.is_none(),
+                SPU_WROUTINTRMBOX => self.channels.out_intr_mbox.is_none(),
+                _ => false,
+            },
+        };
+        if satisfied {
+            self.clear_park();
+            SpuWakeResult::Ready { pc: park.pc }
+        } else {
+            SpuWakeResult::StillBlocked
+        }
+    }
+
+    /// R5.4b: PPU-side helper that pushes `value` to `in_mbox` (if
+    /// empty) and then attempts to wake any thread parked on
+    /// `rdch ch=29`. The push is best-effort — if `in_mbox` was
+    /// already full the push is a no-op, but the wake check still
+    /// runs (which would normally find the existing value satisfies
+    /// the park condition).
+    pub fn ppu_push_inmbox_and_try_wake(&mut self, value: u32) -> SpuWakeResult {
+        let _ = self.channels.ppu_push_inmbox(value);
+        self.try_resolve_park()
+    }
+
+    /// R5.4b: PPU-side helper that drains `out_mbox` (returns the old
+    /// value) and then attempts to wake any thread parked on
+    /// `wrch ch=28`. Returns `(drained_value, wake_result)`.
+    pub fn ppu_pop_outmbox_and_try_wake(&mut self) -> (Option<u32>, SpuWakeResult) {
+        let drained = self.channels.ppu_pop_outmbox();
+        let wake = self.try_resolve_park();
+        (drained, wake)
+    }
+
+    /// R5.4b: PPU-side helper that pushes a signal into `snr[slot]`
+    /// (OR-merged per SPU semantics) and then attempts to wake any
+    /// thread parked on the corresponding `rdch ch=3/4`.
+    pub fn signal_and_try_wake(&mut self, slot: usize, value: u32) -> SpuWakeResult {
+        let _ = self.channels.signal(slot, value);
+        self.try_resolve_park()
     }
 
     /// SPU discriminant from thread id (high byte). Always `Spu` for
@@ -696,5 +985,225 @@ mod tests {
         let mut t = SpuThread::new(0);
         t.gpr[7] = 0x1122_3344_5566_7788_99AA_BBCC_DDEE_FF00;
         assert_eq!(t.gpr[7], 0x1122_3344_5566_7788_99AA_BBCC_DDEE_FF00);
+    }
+
+    // =================================================================
+    // R5.4a — Channel parking model
+    // =================================================================
+
+    #[test]
+    fn park_state_is_none_for_fresh_thread() {
+        let t = SpuThread::new(0);
+        assert!(!t.is_parked());
+        assert!(t.park_state.is_none());
+        assert!(t.parked_pc().is_none());
+        assert!(t.parked_reason().is_none());
+    }
+
+    #[test]
+    fn park_on_channel_records_pc_and_reason() {
+        let mut t = SpuThread::new(0);
+        t.park_on_channel(0x108, SpuParkReason::ChannelRead { channel: 29 });
+        assert!(t.is_parked());
+        assert_eq!(t.parked_pc(), Some(0x108));
+        assert_eq!(t.parked_reason(),
+                   Some(SpuParkReason::ChannelRead { channel: 29 }));
+    }
+
+    #[test]
+    fn park_on_channel_overwrites_previous_park() {
+        let mut t = SpuThread::new(0);
+        t.park_on_channel(0x100, SpuParkReason::ChannelRead { channel: 29 });
+        t.park_on_channel(0x200, SpuParkReason::ChannelWrite { channel: 28 });
+        // Latest wins.
+        assert_eq!(t.parked_pc(), Some(0x200));
+        assert_eq!(t.parked_reason(),
+                   Some(SpuParkReason::ChannelWrite { channel: 28 }));
+    }
+
+    #[test]
+    fn clear_park_does_not_touch_other_state() {
+        let mut t = SpuThread::new(0);
+        t.gpr[3] = 0xCAFE;
+        t.pc = 0x100;
+        let _ = t.ls_write(0x40, &[0xAA, 0xBB, 0xCC, 0xDD]);
+        t.channels.event_mask = 0x12345;
+        t.park_on_channel(0x108, SpuParkReason::ChannelWrite { channel: 28 });
+
+        t.clear_park();
+
+        assert!(!t.is_parked());
+        assert_eq!(t.parked_pc(), None);
+        assert_eq!(t.parked_reason(), None);
+        // Untouched:
+        assert_eq!(t.gpr[3], 0xCAFE);
+        assert_eq!(t.pc, 0x100);
+        assert_eq!(t.ls_read(0x40, 4), Some([0xAA, 0xBB, 0xCC, 0xDD].as_ref()));
+        assert_eq!(t.channels.event_mask, 0x12345);
+    }
+
+    #[test]
+    fn park_state_round_trip_through_clone() {
+        // SpuParkReason and SpuParkState are Copy + PartialEq, so the
+        // park_state Option<...> survives a clone of SpuThread's
+        // shape via the same patterns used in snapshots.
+        let original = SpuParkState {
+            pc: 0x10C,
+            reason: SpuParkReason::ChannelRead { channel: 4 },
+        };
+        let copy = original;
+        assert_eq!(copy, original);
+    }
+
+    // =================================================================
+    // R5.4b — Explicit wake API
+    // =================================================================
+
+    #[test]
+    fn try_resolve_park_not_parked_returns_not_parked() {
+        let mut t = SpuThread::new(0);
+        assert_eq!(t.try_resolve_park(), SpuWakeResult::NotParked);
+        assert!(!t.is_parked());
+    }
+
+    #[test]
+    fn try_resolve_park_rdch_inmbox_empty_still_blocked() {
+        let mut t = SpuThread::new(0);
+        t.park_on_channel(0x108, SpuParkReason::ChannelRead { channel: ch::SPU_RDINMBOX });
+        // in_mbox is None (empty) — still blocked.
+        assert_eq!(t.try_resolve_park(), SpuWakeResult::StillBlocked);
+        assert!(t.is_parked(), "park_state must NOT be cleared on StillBlocked");
+        assert_eq!(t.parked_pc(), Some(0x108));
+    }
+
+    #[test]
+    fn try_resolve_park_rdch_inmbox_filled_returns_ready() {
+        let mut t = SpuThread::new(0);
+        t.park_on_channel(0x108, SpuParkReason::ChannelRead { channel: ch::SPU_RDINMBOX });
+        // External producer pushes a value.
+        assert!(t.channels.ppu_push_inmbox(0xABCD));
+        match t.try_resolve_park() {
+            SpuWakeResult::Ready { pc } => assert_eq!(pc, 0x108),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        assert!(!t.is_parked(), "park_state must be cleared on Ready");
+        // Mailbox value is still there for the SPU to consume on resume.
+        assert_eq!(t.channels.in_mbox, Some(0xABCD));
+    }
+
+    #[test]
+    fn try_resolve_park_wrch_outmbox_full_still_blocked() {
+        let mut t = SpuThread::new(0);
+        t.channels.out_mbox = Some(0xAA);  // pre-fill
+        t.park_on_channel(0x10C, SpuParkReason::ChannelWrite { channel: ch::SPU_WROUTMBOX });
+        assert_eq!(t.try_resolve_park(), SpuWakeResult::StillBlocked);
+        assert!(t.is_parked());
+    }
+
+    #[test]
+    fn try_resolve_park_wrch_outmbox_drained_returns_ready() {
+        let mut t = SpuThread::new(0);
+        t.channels.out_mbox = Some(0xAA);
+        t.park_on_channel(0x10C, SpuParkReason::ChannelWrite { channel: ch::SPU_WROUTMBOX });
+        // External consumer drains.
+        assert_eq!(t.channels.ppu_pop_outmbox(), Some(0xAA));
+        match t.try_resolve_park() {
+            SpuWakeResult::Ready { pc } => assert_eq!(pc, 0x10C),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        assert!(!t.is_parked());
+    }
+
+    #[test]
+    fn try_resolve_park_signotify_no_signal_still_blocked() {
+        // signotify never stalls in our interpreter, but the wake API
+        // is defined for it (defensive — manual park works).
+        let mut t = SpuThread::new(0);
+        t.park_on_channel(0x110, SpuParkReason::ChannelRead { channel: ch::SPU_RDSIGNOTIFY1 });
+        // snr[0] = 0 → still blocked.
+        assert_eq!(t.try_resolve_park(), SpuWakeResult::StillBlocked);
+    }
+
+    #[test]
+    fn try_resolve_park_signotify_after_signal_returns_ready() {
+        let mut t = SpuThread::new(0);
+        t.park_on_channel(0x110, SpuParkReason::ChannelRead { channel: ch::SPU_RDSIGNOTIFY1 });
+        assert!(t.channels.signal(0, 0xDEADBEEF));
+        match t.try_resolve_park() {
+            SpuWakeResult::Ready { pc } => assert_eq!(pc, 0x110),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        assert!(!t.is_parked());
+        assert_eq!(t.channels.snr[0], 0xDEADBEEF);
+    }
+
+    #[test]
+    fn try_resolve_park_unknown_channel_stays_blocked() {
+        // Park on a channel without a defined resolution — defensive
+        // fallback: stays StillBlocked, never auto-clears.
+        let mut t = SpuThread::new(0);
+        t.park_on_channel(0x100, SpuParkReason::ChannelRead { channel: 99 });
+        assert_eq!(t.try_resolve_park(), SpuWakeResult::StillBlocked);
+        assert!(t.is_parked());
+    }
+
+    #[test]
+    fn ppu_push_inmbox_and_try_wake_resolves_park() {
+        let mut t = SpuThread::new(0);
+        t.park_on_channel(0x108, SpuParkReason::ChannelRead { channel: ch::SPU_RDINMBOX });
+        match t.ppu_push_inmbox_and_try_wake(0x12345) {
+            SpuWakeResult::Ready { pc } => assert_eq!(pc, 0x108),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        assert!(!t.is_parked());
+        assert_eq!(t.channels.in_mbox, Some(0x12345));
+    }
+
+    #[test]
+    fn ppu_pop_outmbox_and_try_wake_drains_and_resolves() {
+        let mut t = SpuThread::new(0);
+        t.channels.out_mbox = Some(0xCAFE);
+        t.park_on_channel(0x10C, SpuParkReason::ChannelWrite { channel: ch::SPU_WROUTMBOX });
+        let (drained, wake) = t.ppu_pop_outmbox_and_try_wake();
+        assert_eq!(drained, Some(0xCAFE));
+        match wake {
+            SpuWakeResult::Ready { pc } => assert_eq!(pc, 0x10C),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        assert!(!t.is_parked());
+    }
+
+    #[test]
+    fn signal_and_try_wake_resolves_signotify_park() {
+        let mut t = SpuThread::new(0);
+        t.park_on_channel(0x114, SpuParkReason::ChannelRead { channel: ch::SPU_RDSIGNOTIFY2 });
+        match t.signal_and_try_wake(1, 0xFACE) {
+            SpuWakeResult::Ready { pc } => assert_eq!(pc, 0x114),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ppu_push_inmbox_and_try_wake_when_not_parked_is_noop_for_park() {
+        let mut t = SpuThread::new(0);
+        // Not parked. Push still happens (returns NotParked).
+        let r = t.ppu_push_inmbox_and_try_wake(0x42);
+        assert_eq!(r, SpuWakeResult::NotParked);
+        assert_eq!(t.channels.in_mbox, Some(0x42),
+                   "push must still happen even if no park to resolve");
+    }
+
+    #[test]
+    fn wake_does_not_alter_gpr_or_ls_if_still_blocked() {
+        let mut t = SpuThread::new(0);
+        t.gpr[5] = 0xFEEDFACE;
+        let _ = t.ls_write(0x40, &[0xAA, 0xBB, 0xCC, 0xDD]);
+        t.park_on_channel(0x108, SpuParkReason::ChannelRead { channel: ch::SPU_RDINMBOX });
+        // No producer; in_mbox empty — StillBlocked.
+        assert_eq!(t.try_resolve_park(), SpuWakeResult::StillBlocked);
+        // Untouched:
+        assert_eq!(t.gpr[5], 0xFEEDFACE);
+        assert_eq!(t.ls_read(0x40, 4), Some([0xAA, 0xBB, 0xCC, 0xDD].as_ref()));
+        assert!(t.is_parked());
     }
 }

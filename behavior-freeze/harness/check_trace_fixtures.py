@@ -37,12 +37,15 @@ TRACE_DIR = REPO_ROOT / "behavior-freeze" / "fixtures" / "spu" / "traces"
 # Until then, the directory is expected to contain only README.md.
 #
 # Flipped True at R5.9e.7 (2026-04-29) when single_spu_mailbox_v1
-# became the first replay-validated SPU trace fixture: captured from
-# RPCS3 against a CC0 PSL1GHT homebrew, parser/transformer/replay
-# accepted byte-identically across InterpreterExecutor and
-# RecompilerExecutor. See:
-# `rust/rpcs3-spu-recompiler/tests/single_spu_mailbox_v1_replay.rs`
-# and the matching `.notes.md` next to the JSONL.
+# became the first replay-validated SPU trace fixture. Two more
+# fixtures landed in R5.11 (oracle suite expansion, post-R5
+# closure additive layer): single_spu_branch_loop_v1 (Fibonacci-via-
+# branch+loop) and single_spu_signal_v1 (PPU signal-notification +
+# SPU SNR1 read). All three captured from RPCS3 against CC0 PSL1GHT
+# homebrews, replay-validated byte-identically across
+# InterpreterExecutor and RecompilerExecutor. See:
+# `rust/rpcs3-spu-recompiler/tests/single_spu_*_replay.rs`
+# and the matching `.notes.md` next to each JSONL.
 REPLAY_VALIDATED_TRACE_EXISTS = True
 
 

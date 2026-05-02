@@ -1,0 +1,20 @@
+[package]
+name = "rpcs3-spu-ffi"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C-ABI bindings around the Rust SPU stack (interpreter + recompiler + lockstep driver). R6.0 scaffolding for the live RPCS3 C++ ↔ Rust SPU bridge. The C++ side that consumes this crate lands in R6.1+."
+
+[lib]
+name = "rpcs3_spu_ffi"
+# staticlib for linking into the RPCS3 C++ binary; rlib so workspace
+# tests can call the C-ABI from Rust as if from C.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-spu-thread = { path = "../rpcs3-spu-thread" }
+rpcs3-spu-interpreter = { path = "../rpcs3-spu-interpreter" }
+rpcs3-spu-differential = { path = "../rpcs3-spu-differential" }
+rpcs3-spu-recompiler = { path = "../rpcs3-spu-recompiler" }

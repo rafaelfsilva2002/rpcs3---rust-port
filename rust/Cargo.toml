@@ -42,6 +42,7 @@ members = [
     "rpcs3-spu-differential",
     "rpcs3-spu-decoder",
     "rpcs3-spu-recompiler",
+    "rpcs3-spu-ffi",
     "spu-runner",
     "rpcs3-lv2-spu-group",
     "rpcs3-hle-cellspurs",

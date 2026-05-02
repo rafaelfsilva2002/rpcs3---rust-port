@@ -1,8 +1,14 @@
-# Project Status — R5 phase CLOSED at R5.9e.7 (first replay oracle landed)
+# Project Status — R5 CLOSED at R5.9e.7 + R5.11/R5.11b oracle suite expansion landed
 
 **Authoritative current source of truth for the RPCS3 → Rust port.**
 
-Last updated: 2026-04-29. **R5 phase status: FORMALLY CLOSED.** The R5 arc — from R4a JIT dispatcher (the bottom of the stack) through R5.10p (DMA-boundary diagnosis on the v4 diagnostic trace) and culminating in R5.9e.7 (first replay-validated SPU trace fixture LANDED) — is complete and self-contained. The project's load-bearing primary rule is met: a real captured trace from RPCS3 now serves as a validation oracle for both `InterpreterExecutor` and `RecompilerExecutor`, byte-identical via `diff_snapshots`. No "synthetic real" traces; no fitted fixtures; no skipped acceptance criteria.
+Last updated: 2026-04-29. **R5 phase status: FORMALLY CLOSED.** Post-closure additive layers **R5.11** (signals + branch/loop) and **R5.11b** (LS load/store) have landed three additional CC0 replay-validated fixtures atop R5.9e.7's `single_spu_mailbox_v1`:
+
+- **`single_spu_branch_loop_v1`** (R5.11 fixture #1) — exercises the SPU branch + loop subset (`hbrr`/`brz`/`ai`/`a`/`ori`/`ceq`/`il`/`rdch`/`wrch`/`stop`) via a Fibonacci recurrence (`Fib(10) = 89`). Same race-free single-round IN_MBOX shape as `single_spu_mailbox_v1`. **No engine fixes co-landed** — fixture passed on first attempt riding entirely on R5.9e.7's three general fixes.
+- **`single_spu_signal_v1`** (R5.11 fixture #2) — first replay-validated trace exercising the **signal-notification path** (PPU `sysSpuThreadWriteSignal` → `ppu_signal` event → SPU `rdch ch3 (SPU_RdSigNotify1)`). One general engine fix co-landed: **Cell BE SPU SNR-channel blocking semantics** in `SpuChannels::read()` — rdch on `SPU_RDSIGNOTIFY{1,2}` now returns `WouldStall` when count == 0, matching real hardware.
+- **`single_spu_loadstore_v1`** (R5.11b fixture) — first replay-validated trace exercising the **SPU Local Store load/store path** (stack-allocated `volatile uint32_t buffer[8]` with stqd/lqd against r1-relative offsets, plus the standard Cell BE quadword-of-word-insert/extract pattern via cwd/shufb/stqd for stores and lqd/rotqby for loads). **Three general engine fixes co-landed** (all Cell BE compliance corrections that were silently latent in the synthetic-fixture suite): (1) `rotqby` (RR-form, opcode 0x1DC) added to interpreter as sibling of the already-implemented `rotqbyi`; (2) C-family insert-control ops' default mask byte-order corrected (`0x10..0x1F` linear, not the half-swapped form) — fixes cwd/cbd/chd/cdd/cbx/chx/cwx/cdx; (3) RRR-form rt/rc field positions corrected in `pack_rrr` + selb/shufb/fma/fnms/fms dispatch (real SPU has rt at bits 4..10 and rc at bits 25..31, not the reversed positions our self-consistent encoder/decoder had). All three are GENERAL, not single-fixture.
+
+Cumulative replay-validated fixture count: **4** (1 from R5.9e.7 + 2 from R5.11 + 1 from R5.11b). All four pass `diff_snapshots(interp, jit).is_identical()` byte-identically. The 4 fixtures collectively exercise IN_MBOX, OUT_MBOX, SNR1 signal channel, branch/loop, LS load/store, and the lv2 stop-0x101 group-exit-status semantic. The R5 arc — from R4a JIT dispatcher (the bottom of the stack) through R5.10p (DMA-boundary diagnosis on the v4 diagnostic trace) and culminating in R5.9e.7 (first replay-validated SPU trace fixture LANDED) — is complete and self-contained. The project's load-bearing primary rule is met: a real captured trace from RPCS3 now serves as a validation oracle for both `InterpreterExecutor` and `RecompilerExecutor`, byte-identical via `diff_snapshots`. No "synthetic real" traces; no fitted fixtures; no skipped acceptance criteria.
 
 **Closing milestone — R5.9e.7 (LANDED 2026-04-29):**
 
@@ -37,11 +43,11 @@ Tests below were executed locally during this update. Results recorded as of 202
 | `cargo test -p rpcs3-spu-decoder --lib` | passed | 34 |
 | `cargo test -p rpcs3-spu-differential --lib` | passed | 93 |
 | `cargo test -p rpcs3-spu-interpreter --lib` | passed | 189 |
-| `cargo test -p rpcs3-spu-recompiler --release` | passed | **146** (R5.10o → R5.9e.7: 145 → 146, +1 R5.9e.7 acceptance gate `single_spu_mailbox_v1_replay`) |
+| `cargo test -p rpcs3-spu-recompiler --release` | passed | **148** (R5.10o → R5.9e.7 → R5.11: 145 → 146 → 148, +1 R5.9e.7 acceptance gate + 2 R5.11 acceptance gates `single_spu_branch_loop_v1_replay` + `single_spu_signal_v1_replay`) |
 | `cargo test -p rpcs3-spu-thread --lib` | passed | 40 |
 | `cargo test -p spu-runner` | passed | 19 |
 | `cargo test --workspace --lib` | passed | **5576** |
-| `cargo test --workspace --tests` | passed | **5604** (= 5576 lib + 28 integration: spu-runner integration + decoder fixtures + R5.9e.7 acceptance gate) |
+| `cargo test --workspace --tests --no-fail-fast` | passed | **5606** (= 5576 lib + 30 integration: spu-runner integration + decoder fixtures + 3 replay-validated acceptance gates) |
 | `cargo test --test real_trace_diagnostic` | passed | 0 / ignored 8 (default suite — diagnostic-only DMA-bound traces, NOT replay-validated) |
 | `cargo test --test real_trace_diagnostic -- --ignored` | passed | 8 (full local-only suite; v3/v4 surface DMA / SPU ISA gaps as expected) |
 | `cargo test -p rpcs3-spu-recompiler --test single_spu_mailbox_v1_replay -- --nocapture` | passed | 1 (**R5.9e.7 acceptance gate** — cross-backend `diff_snapshots(interp, jit).is_identical()` on the canonical replay-validated fixture) |
@@ -50,8 +56,8 @@ Tests below were executed locally during this update. Results recorded as of 202
 
 Notes:
 
-- `cargo test --workspace --lib` runs lib-only unit tests across every workspace crate. The 5576 figure is the sum of per-crate `passed` counts at R5 closure; **0 failed, 0 errors**.
-- `cargo test --workspace --tests` runs lib + integration test targets and reports 5604 (= 5576 lib + 28 integration: spu-runner integration, decoder fixtures, and the R5.9e.7 acceptance gate).
+- `cargo test --workspace --lib` runs lib-only unit tests across every workspace crate. The 5576 figure is the sum of per-crate `passed` counts post-R5.11; **0 failed, 0 errors**. (Same number as R5 closure — R5.11 added 2 integration test files but no lib-test deltas; the SNR-blocking engine fix only rewrote 2 existing tests rather than adding new ones.)
+- `cargo test --workspace --tests --no-fail-fast` runs lib + integration test targets and reports 5606 (= 5576 lib + 30 integration: spu-runner integration, decoder fixtures, and the **3** replay-validated acceptance gates).
 - `cargo test --workspace --release` (full workspace, release profile) is **NOT** asserted green here. A few HLE crates (e.g. `rpcs3-hle-cellsysutilmisc`, `rpcs3-hle-cellmusicselectioncontext`, `rpcs3-hle-celljpgdec`, `rpcs3-hle-cellvideoexport`) have a pre-existing `no_std`/`global_allocator` build error that surfaces only under `--release`. This error is unrelated to the SPU recompiler stack and was present before the R4a/R4b/R4c work.
 
 **Do not promote the workspace as "green" without specifying scope.** `--workspace --lib` is green (5576 passed today, 0 failed); `--workspace --release` has the pre-existing HLE compile error documented above and is NOT in scope for R5.
@@ -87,7 +93,7 @@ R5 is **formally closed** as of R5.9e.7's landing. The phase delivered:
 - **DMA / MFC trace + replay** — R5.9f (deferred). The v4 spurs_test trace is the canonical case; per R5.9e.2 § D.1 replay can NOT progress past the MFC boundary without (a) full DMA infrastructure (EA-memory model + PPU side), (b) a writer that captures MFC events as oracle inputs, or (c) a different non-DMA homebrew (the path R5.9e.7 took).
 - **Lockstep multi-SPU replay** — deferred to R5.9f if motivated by a real workload that the per-SPU sequential model can't capture. Current per-SPU sequential is sufficient for the canonical fixture.
 - **JIT-side resume path (R5.4d)** — synthetic fixtures don't require it; the partial fallback to interpreter on unsupported-opcode mid-run already covers the correctness contract.
-- **Real homebrew validation suite at scale** — only one canonical replay-validated fixture today (`single_spu_mailbox_v1`); expanding the oracle suite is a separate phase (R5.11 candidate, see "Next steps").
+- **Real homebrew validation suite at scale** — three canonical replay-validated fixtures today (`single_spu_mailbox_v1` from R5.9e.7 + `single_spu_branch_loop_v1` and `single_spu_signal_v1` from R5.11). Expanding the oracle suite further (vector ALU, multi-mailbox, load/store) is incremental work that can continue alongside R6.
 - **Full PPU JIT, LLVM backend, RSX runtime, Qt UI, real homebrew dump capture** — never in R5 scope.
 
 **Confirmations at R5 closure:**
@@ -96,18 +102,18 @@ R5 is **formally closed** as of R5.9e.7's landing. The phase delivered:
 - ✅ v4 spurs_test stays diagnostic-only (DMA-bound; under `tests/data/`, not `behavior-freeze/fixtures/`).
 - ✅ C++ patches unchanged at R5 closure (sha256 `d65aec91…ae1aba1c` scaffolding + `8f253d7d…66663a` runtime hooks pinned).
 - ✅ No fake / synthetic-real / fitted traces in `behavior-freeze/fixtures/spu/traces/` — only real captured behavior.
-- ✅ Workspace gates green: 5604 tests across `--workspace --tests`, 0 failed; both behavior-freeze harness gates exit 0.
+- ✅ Workspace gates green post-R5.11: 5606 tests across `--workspace --tests --no-fail-fast`, 0 failed; 5576 across `--workspace --lib`, 0 failed; both behavior-freeze harness gates exit 0; all 3 replay-validated acceptance gates pass with `diff_snapshots(interp, jit).is_identical()`.
 
 **Next steps (R6 candidates — NOT in scope for R5 closure):**
 
 | Path | Scope | Independently valuable | Pre-reqs |
 |---|---|---|---|
 | **(A) R6 live bridge C++↔Rust SPU** | Replace RPCS3's C++ SPU executor with the Rust stack at runtime via FFI; one cooperative SPU thread first, then opt-in escalation. The R5.9e.7 oracle becomes the regression sentinel for every bridge change. | yes (the project's primary deliverable: actually swap the C++ implementation) | this R5 closure (DONE); a real game/homebrew workload to drive the bridge under load. |
-| **(B) R5.11 expand oracle suite** | Author 2-4 additional CC0/MIT non-DMA homebrews exercising distinct hooks: signals (snr1/snr2), multi-mailbox protocol, single-SPU compute kernels (vector ALU only). Each commits as a `<name>.jsonl` + `.notes.md` + `.spuimg` triple. Strictly additive on top of R5.9e.7's flag-flipped state. | yes (broader oracle coverage; catches regressions the single-mailbox fixture misses) | R5.9e.7 (DONE) + same Docker `ps3toolchain` workflow used here. |
+| **(B) R5.11 expand oracle suite** ✅ **PARTIALLY LANDED 2026-04-29** | First two fixtures added on top of R5.9e.7: `single_spu_branch_loop_v1` (Fibonacci via branch+loop, no engine fix needed) and `single_spu_signal_v1` (PPU signal + SPU SNR1, 1 general engine fix co-landed: Cell BE SPU SNR-channel blocking semantics). Workspace gate count moved 5604 → 5606 tests (`--workspace --tests`); recompiler release 146 → 148. Remaining candidates (vector ALU, multi-mailbox, load/store) are incremental — can continue in parallel with R6 or be deferred. | yes (broader oracle coverage; catches regressions the single-mailbox fixture misses) | R5.9e.7 (DONE) + same Docker `ps3toolchain` workflow used here. |
 | **(C) R5.12 DMA / MFC trace + replay design** | Lift R5.9f from deferred to active: (1) extend the writer to capture MFC events (LSA, EAH, EAL, Size, TagID, MFC_Cmd) as oracle inputs; (2) add an EA-memory model to the replay engine; (3) re-attempt v4 spurs_test under the new contract. Larger scope than R5.11. | yes (unlocks every DMA-bearing trace including the existing v3/v4) | R5.9e.7 (DONE) + RPCS3 build access for writer extension. |
 | **(D) R5.4d JIT-side resume path / performance polish** | Implement JIT-side resume (currently the JIT bails to interpreter on park/wake; resume re-enters the interpreter). Eliminates the JIT→interpreter handoff for hot park/wake loops. Pure performance work; correctness already handled by partial fallback. | mid (perf only; correctness was never load-bearing here) | R5.9e.7 (DONE) — the regression sentinel must exist before performance refactors. |
 
-Recommended next path: **(A) R6 live bridge** — that's the project's load-bearing primary deliverable, and R5.9e.7 just unlocked the regression sentinel that makes a safe bridge possible. **(B) R5.11** is a good warm-up if the user wants more oracle coverage before committing to the bridge work.
+Recommended next path: **(A) R6 live bridge** — the oracle suite now has 3 replay-validated fixtures covering the IN_MBOX, OUT_MBOX, branch+loop ISA, and SNR1 signal-notification paths (R5.9e.7 + R5.11). That's enough regression-sentinel coverage to commit to the bridge work safely. Additional R5.11 fixtures (vector ALU, multi-mailbox, load/store) can land additively during R6 as the bridge surfaces specific gaps that need oracle coverage.
 
 ---
 

@@ -14,10 +14,10 @@ index f863a2b91..129199900 100644
      Cell/lv2/sys_btsetting.cpp
 diff --git a/rpcs3/Emu/Cell/SPUTraceJsonl.cpp b/rpcs3/Emu/Cell/SPUTraceJsonl.cpp
 new file mode 100644
-index 000000000..21027ec65
+index 000000000..8bbd9d78f
 --- /dev/null
 +++ b/rpcs3/Emu/Cell/SPUTraceJsonl.cpp
-@@ -0,0 +1,553 @@
+@@ -0,0 +1,758 @@
 +#include "stdafx.h"
 +
 +// R5.8 A.3 — SPU PPU↔SPU trace JSONL writer (impl).
@@ -570,13 +570,218 @@ index 000000000..21027ec65
 +	emit_line(os.str());
 +}
 +
++// =====================================================================
++// R6.7 A.1 — MFC DMA recorders
++// =====================================================================
++//
++// `record_spu_mfc_cmd` and `record_mfc_dma_complete` extend the writer
++// to capture the minimal MFC GET subset described in
++// `docs/SPU_DMA_MFC_R6_7_DESIGN.md` § 4. They are SPU-side recorders
++// (target_spu mandatory) and follow the same lock/seq/lock_guard
++// contract as every other `record_*` method.
++//
++// Side-file model mirrors `record_spu_image`: the EA bytes are written
++// to `<trace_path>.dma/<sha>.dmachunk`, content-addressed by SHA-256.
++// The JSONL `spu_mfc_cmd` line carries only the SHA pointer; bytes are
++// NEVER inlined. The replay engine resolves the SHA at parse time by
++// looking up `<trace>.dma/<sha>.dmachunk` (per-trace) or
++// `behavior-freeze/fixtures/spu/dma/<sha>.dmachunk` (canonical CC0
++// shared store) — same dual-path convention as `.spuimg`.
++
++void TraceWriter::record_spu_mfc_cmd(std::uint32_t target_spu, std::uint32_t pc,
++	std::uint32_t cmd, std::uint32_t tag, std::uint32_t size,
++	std::uint32_t lsa, std::uint32_t eah, std::uint32_t eal,
++	const std::uint8_t* ea_bytes, std::uint32_t ea_bytes_size)
++{
++	if (!enabled()) return;
++	if (!ea_bytes || ea_bytes_size == 0 || ea_bytes_size != size)
++	{
++		// Defensive — caller error. Drop the emit rather than write
++		// a `.dmachunk` whose size disagrees with the cmd's `size`
++		// field (the parser rejects with `DmaChunkSizeMismatch`).
++		std::fprintf(stderr,
++			"[spu_trace] record_spu_mfc_cmd dropped: ea_bytes=%p, ea_bytes_size=%u, size=%u\n",
++			static_cast<const void*>(ea_bytes), ea_bytes_size, size);
++		return;
++	}
++
++	// Snapshot bytes BEFORE taking the lock or hashing. Caller MUST
++	// have already captured these from EA via vm::_ptr (RPCS3 vm::
++	// is not callable from inside the writer). We copy defensively
++	// to keep this function self-contained — the caller is free to
++	// release its snapshot vector after the call returns.
++	std::vector<std::uint8_t> snapshot(ea_bytes, ea_bytes + ea_bytes_size);
++
++	unsigned char hash[32];
++	if (mbedtls_sha256_ret(snapshot.data(), snapshot.size(), hash, /*is224=*/0) != 0)
++	{
++		std::fprintf(stderr,
++			"[spu_trace] record_spu_mfc_cmd dropped: mbedtls_sha256_ret failed for target_spu=%u tag=%u size=%u\n",
++			target_spu, tag, size);
++		return;
++	}
++
++	static constexpr char hex_chars[] = "0123456789abcdef";
++	char hex[65];
++	for (std::size_t i = 0; i < 32; ++i)
++	{
++		hex[i * 2]     = hex_chars[(hash[i] >> 4) & 0xF];
++		hex[i * 2 + 1] = hex_chars[hash[i] & 0xF];
++	}
++	hex[64] = '\0';
++	std::string sha256_hex(hex, 64);
++
++	std::lock_guard<std::mutex> lk(m_write_mutex);
++
++	// Side-file MUST land before the JSONL emit (same contract as
++	// record_spu_image — refuse to emit a JSONL line that would
++	// reference a missing or short side-file).
++	if (!write_dma_chunk_side_file(sha256_hex, snapshot.data(), ea_bytes_size))
++	{
++		std::fprintf(stderr,
++			"[spu_trace] record_spu_mfc_cmd dropped for target_spu=%u tag=%u: "
++			"side-file write failed; JSONL spu_mfc_cmd NOT emitted\n",
++			target_spu, tag);
++		return;
++	}
++
++	const auto seq = next_seq();
++	std::ostringstream os;
++	start_event(os, seq, true, "spu_mfc_cmd");
++	os << ",\"target_spu\":"; append_u32(os, target_spu);
++	os << ",\"pc\":";         append_u32(os, pc);
++	os << ",\"cmd\":";        append_u32(os, cmd);
++	os << ",\"tag\":";        append_u32(os, tag);
++	os << ",\"size\":";       append_u32(os, size);
++	os << ",\"lsa\":";        append_u32(os, lsa);
++	os << ",\"eah\":";        append_u32(os, eah);
++	os << ",\"eal\":";        append_u32(os, eal);
++	os << ",\"ea_chunk_sha256\":\"" << sha256_hex << '"';
++	os << "}";
++	emit_line(os.str());
++}
++
++void TraceWriter::record_mfc_dma_complete(std::uint32_t target_spu, std::uint32_t tag,
++	std::uint32_t transferred_bytes)
++{
++	if (!enabled()) return;
++	std::lock_guard<std::mutex> lk(m_write_mutex);
++	const auto seq = next_seq();
++	std::ostringstream os;
++	start_event(os, seq, true, "mfc_dma_complete");
++	os << ",\"target_spu\":";        append_u32(os, target_spu);
++	os << ",\"tag\":";               append_u32(os, tag);
++	os << ",\"transferred_bytes\":"; append_u32(os, transferred_bytes);
++	os << "}";
++	emit_line(os.str());
++}
++
++// R6.7 A.1 — write the captured EA bytes to
++// `<m_trace_path>.dma/<sha>.dmachunk`. Mirrors `write_image_side_file`
++// for `.spuimg` — same dedup-on-existing-SHA logic, same post-write
++// size verification, same caller-holds-mutex contract. Returns true
++// iff the side-file is on disk with exactly `size` bytes after the
++// call.
++bool TraceWriter::write_dma_chunk_side_file(const std::string& sha256_hex,
++	const std::uint8_t* bytes, std::uint32_t size)
++{
++	if (m_trace_path.empty())
++	{
++		std::fprintf(stderr,
++			"[spu_trace] write_dma_chunk_side_file: m_trace_path is empty (writer state inconsistent)\n");
++		return false;
++	}
++
++	namespace fs = std::filesystem;
++	std::error_code ec;
++
++	// Per-trace `.dma/` directory. Created on demand. The canonical
++	// CC0 location (`behavior-freeze/fixtures/spu/dma/`) is populated
++	// by a separate post-capture workflow step that copies/dedups
++	// `.dmachunk` files from the per-trace directory; this writer
++	// only emits to the per-trace path to keep capture self-contained.
++	const fs::path dma_dir = fs::path(m_trace_path).concat(".dma");
++	fs::create_directories(dma_dir, ec);
++	if (ec)
++	{
++		std::fprintf(stderr,
++			"[spu_trace] write_dma_chunk_side_file: create_directories('%s') failed: %s\n",
++			dma_dir.string().c_str(), ec.message().c_str());
++		return false;
++	}
++	if (!fs::is_directory(dma_dir, ec))
++	{
++		std::fprintf(stderr,
++			"[spu_trace] write_dma_chunk_side_file: '%s' is not a directory after create_directories (ec=%s)\n",
++			dma_dir.string().c_str(), ec.message().c_str());
++		return false;
++	}
++
++	const fs::path file_path = dma_dir / (sha256_hex + ".dmachunk");
++
++	if (fs::exists(file_path, ec))
++	{
++		ec.clear();
++		const auto existing_size = fs::file_size(file_path, ec);
++		if (!ec && existing_size == size)
++		{
++			return true; // content-addressed dedup — same SHA + same size = same bytes.
++		}
++		std::fprintf(stderr,
++			"[spu_trace] write_dma_chunk_side_file: '%s' exists with size %llu, expected %u — overwriting\n",
++			file_path.string().c_str(),
++			static_cast<unsigned long long>(existing_size), size);
++	}
++
++	{
++		std::ofstream of(file_path, std::ios::binary | std::ios::trunc);
++		if (!of.is_open())
++		{
++			std::fprintf(stderr,
++				"[spu_trace] write_dma_chunk_side_file: ofstream open('%s', binary|trunc) failed\n",
++				file_path.string().c_str());
++			return false;
++		}
++		of.write(reinterpret_cast<const char*>(bytes), static_cast<std::streamsize>(size));
++		if (!of.good())
++		{
++			const auto wrote = static_cast<long long>(of.tellp());
++			std::fprintf(stderr,
++				"[spu_trace] write_dma_chunk_side_file: short/failed write to '%s' (wrote ~%lld of %u)\n",
++				file_path.string().c_str(), wrote, size);
++			return false;
++		}
++		of.flush();
++	}
++
++	ec.clear();
++	const auto final_size = fs::file_size(file_path, ec);
++	if (ec)
++	{
++		std::fprintf(stderr,
++			"[spu_trace] write_dma_chunk_side_file: post-write file_size('%s') failed: %s\n",
++			file_path.string().c_str(), ec.message().c_str());
++		return false;
++	}
++	if (final_size != size)
++	{
++		std::fprintf(stderr,
++			"[spu_trace] write_dma_chunk_side_file: post-write size mismatch for '%s': on disk %llu, expected %u\n",
++			file_path.string().c_str(),
++			static_cast<unsigned long long>(final_size), size);
++		return false;
++	}
++
++	return true;
++}
++
 +} // namespace rpcs3::spu_trace
 diff --git a/rpcs3/Emu/Cell/SPUTraceJsonl.h b/rpcs3/Emu/Cell/SPUTraceJsonl.h
 new file mode 100644
-index 000000000..15c45fb93
+index 000000000..f062be67f
 --- /dev/null
 +++ b/rpcs3/Emu/Cell/SPUTraceJsonl.h
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,274 @@
 +// R5.8 A.3 — SPU PPU↔SPU trace JSONL writer.
 +//
 +// Self-contained, gated, disabled-by-default trace emitter that produces
@@ -633,6 +838,8 @@ index 000000000..15c45fb93
 +	SpuStop,
 +	FinalState,
 +	SpuImage, // R5.9e.1 — SPU local store image metadata (bytes in side-file)
++	SpuMfcCmd,        // R6.7 A.1 — MFC cmd packet at wrch ch21 dispatch (with EA-chunk reference)
++	MfcDmaComplete,   // R6.7 A.1 — MFC tag completion observed after C++ do_mfc()/do_dma_transfer
 +	PpuPushInmbox,
 +	PpuPopOutmbox,
 +	PpuSignal,
@@ -748,6 +955,40 @@ index 000000000..15c45fb93
 +	void record_spu_image(std::uint32_t target_spu, const std::uint8_t* ls_bytes,
 +		std::uint32_t size, std::uint32_t load_addr, std::uint32_t entry_pc);
 +
++	// R6.7 A.1 — `spu_mfc_cmd`: emitted IMMEDIATELY AFTER the matching
++	// `spu_wrch ch21 (MFC_Cmd)` event, BEFORE the C++ `process_mfc_cmd()`
++	// dispatches the transfer. Caller (the runtime hook) is responsible
++	// for snapshotting `ea_bytes`/`ea_bytes_size` from EA via vm::_ptr
++	// BEFORE invoking this — the writer does not touch RPCS3 vm:: or LS.
++	// The recorder SHA-256-hashes the bytes, writes a content-addressed
++	// `<trace_path>.dma/<sha>.dmachunk` side-file (skipping if a file
++	// with the same SHA already exists with matching size), and emits
++	// the JSONL line referencing the SHA.
++	//
++	// Scope (R6.7 A.1): GET only (cmd code 0x40). The runtime hook is
++	// responsible for filtering: it MUST NOT call this for non-GET
++	// codes (PUT/list/atomic) — those surface as bare `spu_wrch ch21`
++	// and the parser rejects them with `UnsupportedMfcCmd`.
++	//
++	// Side-file write contract: same as `record_spu_image` — the JSONL
++	// line is emitted ONLY if the side-file landed on disk with the
++	// expected size. On any failure the call is dropped and the caller
++	// MUST NOT proceed with `record_mfc_dma_complete` for the same tag
++	// (the trace would reference a missing chunk).
++	void record_spu_mfc_cmd(std::uint32_t target_spu, std::uint32_t pc,
++		std::uint32_t cmd, std::uint32_t tag, std::uint32_t size,
++		std::uint32_t lsa, std::uint32_t eah, std::uint32_t eal,
++		const std::uint8_t* ea_bytes, std::uint32_t ea_bytes_size);
++
++	// R6.7 A.1 — `mfc_dma_complete`: emitted after the C++
++	// `process_mfc_cmd()` returns. Per R6.7 design § 4.1 it MUST
++	// appear strictly after the matching `spu_mfc_cmd` and strictly
++	// before any `spu_rdch ch24 (RdTagStat)` that observes the tag
++	// completed. The replay parser uses the per-trace ordering to
++	// advance its tag-stat oracle.
++	void record_mfc_dma_complete(std::uint32_t target_spu, std::uint32_t tag,
++		std::uint32_t transferred_bytes);
++
 +	// === PPU-side recorders ====================================
 +
 +	void record_ppu_push_inmbox(std::uint32_t target_spu, std::uint32_t value);
@@ -786,6 +1027,16 @@ index 000000000..15c45fb93
 +	// returns false — the v4-bug fix that surfaced when the JSONL
 +	// referenced a `.spuimg` that never made it to disk.
 +	bool write_image_side_file(const std::string& sha256_hex,
++		const std::uint8_t* bytes, std::uint32_t size);
++
++	// R6.7 A.1 — write the captured EA bytes to
++	// `<m_trace_path>.dma/<sha256>.dmachunk` if a file with the same
++	// SHA-named name does NOT already exist with matching size.
++	// Caller MUST hold `m_write_mutex`. Same return-and-failure
++	// semantics as `write_image_side_file`. The caller (`record_spu_mfc_cmd`)
++	// refuses to emit the JSONL `spu_mfc_cmd` event when this returns
++	// false so the trace never references a missing/short `.dmachunk`.
++	bool write_dma_chunk_side_file(const std::string& sha256_hex,
 +		const std::uint8_t* bytes, std::uint32_t size);
 +
 +	std::atomic<bool> m_enabled{false};

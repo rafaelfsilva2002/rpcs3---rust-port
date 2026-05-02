@@ -1,0 +1,5 @@
+{"seq":0,"side":"ppu","kind":"ppu_push_inmbox","target_spu":256,"value":10}
+{"seq":1,"side":"spu","kind":"spu_image","target_spu":256,"image_sha256":"f0531bb93c432d93149f8648e7812cd02a3d54717df3733dbb82e55ed9846fb1","load_addr":0,"size":262144,"entry_pc":0}
+{"seq":2,"side":"spu","kind":"spu_wrch","target_spu":256,"pc":52,"channel":28,"value":89,"would_stall":false}
+{"seq":3,"side":"spu","kind":"spu_stop","target_spu":256,"pc":60,"stop_code":257}
+{"seq":4,"side":"spu","kind":"final_state","target_spu":256,"gpr_lane_zero":[{"reg":1,"value":262128},{"reg":2,"value":89},{"reg":3,"value":10},{"reg":4,"value":89},{"reg":5,"value":55},{"reg":6,"value":4294967295},{"reg":7,"value":10}],"channels":{"in_mbox":null,"out_mbox":null,"out_intr_mbox":null,"snr1":0,"snr2":0}}

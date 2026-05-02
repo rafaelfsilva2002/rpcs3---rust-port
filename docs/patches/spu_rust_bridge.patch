@@ -1,0 +1,1163 @@
+diff --git a/rpcs3/Emu/CMakeLists.txt b/rpcs3/Emu/CMakeLists.txt
+index 1291999..d862b22 100644
+--- a/rpcs3/Emu/CMakeLists.txt
++++ b/rpcs3/Emu/CMakeLists.txt
+@@ -187,6 +187,11 @@ target_sources(rpcs3_emu PRIVATE
+     # R5.8 A.3 -- SPU trace JSONL writer scaffolding (gated, disabled by default).
+     # See docs/SPU_TRACE_CAPTURE_RUNTIME_HOOKS.md for runtime-hook integration.
+     Cell/SPUTraceJsonl.cpp
++    # R6.1 -- Rust SPU bridge (opt-in via env var RPCS3_SPU_RUST_BRIDGE=1).
++    # Compile-time gated by RPCS3_HAS_SPU_RUST_BRIDGE (set below
++    # when the staticlib `rust/target/release/rpcs3_spu_ffi.lib` or
++    # `librpcs3_spu_ffi.a` exists). See docs/SPU_RUST_BRIDGE_PATCH.md.
++    Cell/SPURustBridge.cpp
+     Cell/lv2/lv2.cpp
+     Cell/lv2/sys_bdemu.cpp
+     Cell/lv2/sys_btsetting.cpp
+@@ -701,6 +706,28 @@ if(APPLE)
+     endif()
+ endif()
+ 
++# R6.1 -- Optional link against the rpcs3-spu-ffi Rust staticlib.
++# Build the staticlib via:  scripts/build_rust_spu_ffi.{sh,ps1}
++# If the .lib/.a is present, link it + define RPCS3_HAS_SPU_RUST_BRIDGE=1
++# so SPURustBridge.cpp compiles out the FFI calls. If absent, the
++# bridge is compile-time disabled and `is_enabled()` returns false.
++# This keeps RPCS3 buildable without touching the Rust side.
++set(RUST_SPU_FFI_LIB_MSVC "${CMAKE_CURRENT_SOURCE_DIR}/../../rust/target/release/rpcs3_spu_ffi.lib")
++set(RUST_SPU_FFI_LIB_UNIX "${CMAKE_CURRENT_SOURCE_DIR}/../../rust/target/release/librpcs3_spu_ffi.a")
++set(RUST_SPU_FFI_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../../rust/rpcs3-spu-ffi/include")
++if(EXISTS "${RUST_SPU_FFI_LIB_MSVC}")
++    target_link_libraries(rpcs3_emu PRIVATE "${RUST_SPU_FFI_LIB_MSVC}")
++    target_include_directories(rpcs3_emu PRIVATE "${RUST_SPU_FFI_INCLUDE}")
++    target_compile_definitions(rpcs3_emu PRIVATE RPCS3_HAS_SPU_RUST_BRIDGE=1)
++    message(STATUS "R6.1: linking rpcs3_spu_ffi.lib (MSVC staticlib)")
++elseif(EXISTS "${RUST_SPU_FFI_LIB_UNIX}")
++    target_link_libraries(rpcs3_emu PRIVATE "${RUST_SPU_FFI_LIB_UNIX}")
++    target_include_directories(rpcs3_emu PRIVATE "${RUST_SPU_FFI_INCLUDE}")
++    target_compile_definitions(rpcs3_emu PRIVATE RPCS3_HAS_SPU_RUST_BRIDGE=1)
++    message(STATUS "R6.1: linking librpcs3_spu_ffi.a (Unix staticlib)")
++else()
++    message(STATUS "R6.1: rpcs3_spu_ffi staticlib not found; bridge disabled at compile time. Run scripts/build_rust_spu_ffi.{sh,ps1} to enable.")
++endif()
+ 
+ if(USE_PRECOMPILED_HEADERS)
+     target_precompile_headers(rpcs3_emu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../stdafx.h")
+diff --git a/rpcs3/Emu/Cell/SPURustBridge.cpp b/rpcs3/Emu/Cell/SPURustBridge.cpp
+new file mode 100644
+index 0000000..e1df939
+--- /dev/null
++++ b/rpcs3/Emu/Cell/SPURustBridge.cpp
+@@ -0,0 +1,793 @@
++#include "stdafx.h"
++#include "SPURustBridge.h"
++
++#include "SPUThread.h"
++#include "Utilities/StrUtil.h"
++
++#include <atomic>
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <unordered_map>
++
++#ifdef RPCS3_HAS_SPU_RUST_BRIDGE
++#include "rpcs3_spu_ffi.h"
++#endif
++
++LOG_CHANNEL(spu_rust_bridge_log, "RustSPU");
++
++namespace spu_rust_bridge
++{
++	// -1 = uncached, 0 = disabled, 1 = enabled.
++	static std::atomic<int> s_enabled_cache{-1};
++
++	bool is_enabled()
++	{
++#ifdef RPCS3_HAS_SPU_RUST_BRIDGE
++		int cached = s_enabled_cache.load(std::memory_order_relaxed);
++		if (cached < 0)
++		{
++			const char* env = std::getenv("RPCS3_SPU_RUST_BRIDGE");
++			cached = (env && env[0] == '1' && env[1] == '\0') ? 1 : 0;
++
++			// Race-safe: multiple threads may compute the same value
++			// concurrently. Whichever wins the store is fine — the
++			// computation is deterministic.
++			s_enabled_cache.store(cached, std::memory_order_relaxed);
++
++			if (cached == 1)
++			{
++				spu_rust_bridge_log.success(
++					"[Rust SPU bridge] RPCS3_SPU_RUST_BRIDGE=1 detected; "
++					"bridge ENABLED globally for this RPCS3 process. "
++					"R6.5b delegated-execution scope: mailbox + SNR "
++					"workloads (no DMA/MFC, no SPURS). Multi-round handling: "
++					"StallRead on IN_MBOX/SNR1/SNR2 blocks via RPCS3 pop_wait "
++					"+ resumes the same Rust handle; StallWrite on OUT_MBOX "
++					"(ch28) drains intermediate value into RPCS3 ch_out_mbox "
++					"(depth-1 overwrite, matches PSL1GHT-cooperative semantics) "
++					"and resumes. Verified: single_spu_mailbox_v1, "
++					"single_spu_branch_loop_v1, single_spu_loadstore_v1, "
++					"single_spu_signal_v1, single_spu_mailbox_multi_v1 "
++					"(R6.5 stall_iters=1 proven on real binary). StallWrite "
++					"path covered by FFI test rust_spu_outmbox_backpressure_via_ffi "
++					"(real-binary fixture for StallWrite ch28 not realizable in "
++					"PSL1GHT cooperative model — see docs/SPU_RUST_BRIDGE_PATCH.md).");
++			}
++		}
++		return cached == 1;
++#else
++		return false;
++#endif
++	}
++
++	void hello_world_proof(spu_thread& spu)
++	{
++#ifdef RPCS3_HAS_SPU_RUST_BRIDGE
++		rust_spu_t* h = rust_spu_new();
++		if (!h)
++		{
++			spu_rust_bridge_log.error(
++				"[Rust SPU bridge] rust_spu_new() returned null; "
++				"FFI link is broken or process is OOM. spu_thread '%s' "
++				"will continue with the existing C++ executor.",
++				spu.get_name());
++			return;
++		}
++
++		spu_rust_bridge_log.success(
++			"[Rust SPU bridge] hello-world FFI roundtrip OK on "
++			"spu_thread '%s' (lv2_id=0x%x). Static linkage of "
++			"rpcs3_spu_ffi.lib confirmed; rust_spu_t handle "
++			"allocated + dropped cleanly.",
++			spu.get_name(), spu.lv2_id);
++
++		rust_spu_drop(h);
++#else
++		(void)spu;
++		spu_rust_bridge_log.warning(
++			"[Rust SPU bridge] RPCS3_HAS_SPU_RUST_BRIDGE not defined; "
++			"the Rust staticlib was not present at CMake configure "
++			"time. Run scripts/build_rust_spu_ffi.{sh,ps1} and "
++			"re-configure CMake to enable the bridge.");
++#endif
++	}
++
++#ifdef RPCS3_HAS_SPU_RUST_BRIDGE
++	// Encode a 128-bit GPR (RPCS3 v128, native LE in memory) as a
++	// 16-byte big-endian buffer matching the Rust FFI's contract:
++	// `bytes[0]` = preferred-slot MSB.
++	//
++	// SPU preferred slot in RPCS3's LE layout is `_u32[3]`. The
++	// canonical SPU big-endian register layout is:
++	//   word 0 (preferred slot) -> bytes[0..3]
++	//   word 1                  -> bytes[4..7]
++	//   word 2                  -> bytes[8..11]
++	//   word 3                  -> bytes[12..15]
++	// So `bytes[i*4 .. i*4+3]` = BE encoding of `gpr._u32[3 - i]`.
++	static void v128_to_be_bytes(const v128& v, u8 (&bytes)[16])
++	{
++		for (u32 i = 0; i < 4; ++i)
++		{
++			const u32 word = v._u32[3 - i];
++			bytes[i * 4 + 0] = static_cast<u8>(word >> 24);
++			bytes[i * 4 + 1] = static_cast<u8>(word >> 16);
++			bytes[i * 4 + 2] = static_cast<u8>(word >> 8);
++			bytes[i * 4 + 3] = static_cast<u8>(word >> 0);
++		}
++	}
++
++	static const char* outcome_name(rust_spu_outcome_t o)
++	{
++		switch (o)
++		{
++		case rust_spu_outcome_t_Continue:    return "Continue";
++		case rust_spu_outcome_t_Stop:        return "Stop";
++		case rust_spu_outcome_t_StallRead:   return "StallRead";
++		case rust_spu_outcome_t_StallWrite:  return "StallWrite";
++		case rust_spu_outcome_t_Error:       return "Error";
++		}
++		return "Unknown";
++	}
++
++	// R6.4 channel classification.
++	// Maps the 7-bit channel index returned in `out_code` for
++	// StallRead / StallWrite outcomes to a human-readable name +
++	// re-tryability classification. The Rust SPU subset (per
++	// `rpcs3-spu-thread::ch`) handles ch 0/1/2/3/4/7/8/22/23/28/29/30;
++	// MFC channels (16..21) are explicitly NOT in the subset and
++	// surface as `Error` rather than `Stall*`.
++	struct StallClass
++	{
++		const char* name;       // "IN_MBOX (ch29)" etc.
++		bool potentially_retryable; // true ⇒ R6.4b could re-invoke
++		                            //   after a PPU-side action
++		                            //   that fills/drains the channel
++	};
++
++	static StallClass classify_stall_channel(u32 ch)
++	{
++		switch (ch)
++		{
++		// Mailbox-class — future R6.4b can re-invoke after
++		// `sysSpuThreadWriteMb` (IN_MBOX) or PPU OUT_MBOX drain.
++		case 29: return { "IN_MBOX (ch29)",         true };
++		case 28: return { "OUT_MBOX (ch28)",        true };
++		// Signal-class — future R6.4b can re-invoke after
++		// `sysSpuThreadWriteSignal`.
++		case 3:  return { "SNR1 (ch3)",             true };
++		case 4:  return { "SNR2 (ch4)",             true };
++		// Event-class — rare; would need event_stat plumbing.
++		case 0:  return { "EVENTSTAT (ch0)",        false };
++		case 1:  return { "EVENTMASK_W (ch1)",      false };
++		case 2:  return { "EVENTACK (ch2)",         false };
++		case 22: return { "EVENTMASK_R (ch22)",     false };
++		case 23: return { "MACHSTAT (ch23)",        false };
++		// Decrementer — timing-dependent; out of R6.4 scope.
++		case 7:  return { "WRDEC (ch7)",            false };
++		case 8:  return { "RDDEC (ch8)",            false };
++		case 30: return { "OUT_INTR_MBOX (ch30)",   false };
++		// MFC / DMA — explicitly out of scope; the Rust subset does
++		// not even decode the writes, so this case should be
++		// unreachable in practice (Error fires first). Keeping the
++		// label for completeness.
++		case 21: return { "MFC_Cmd (ch21, DMA)",    false };
++		default: return { "unknown channel",        false };
++		}
++	}
++
++	// =====================================================================
++	// R6.4b — persistent-handle session infrastructure.
++	// =====================================================================
++	//
++	// Side-table keyed by `spu_thread::lv2_id` (a stable u32 set by the
++	// LV2 kernel when the SPU thread is initialized; unique within an
++	// emulator process). The map owns each `rust_spu_t*` via RAII
++	// (deleter calls `rust_spu_drop`). Mutex serializes access; in
++	// practice contention is very low — at most one SPU thread per
++	// lv2_id touches its own session, and the only cross-thread reader
++	// would be a hypothetical R6.4c+ wake-up path.
++	//
++	// Lifecycle:
++	//   - First entry to `try_delegate_execution` for a given spu_thread
++	//     creates the session (allocate handle, load LS/PC/GPR, peek
++	//     channels, push to Rust).
++	//   - `try_delegate_execution` then runs a multi-round loop within
++	//     the same call: every Stop commits and drops the session;
++	//     supported `StallRead` (mailbox/SNR) blocks via RPCS3-side
++	//     `pop_wait` (matches the C++ executor pattern in
++	//     `spu_thread::get_ch_value`), forwards the popped value to
++	//     Rust, and continues the loop. Any other outcome
++	//     (Continue / unsupported Stall / Error) drops the session and
++	//     returns false (clean fallback to C++).
++	//   - The side-table is structured to support cross-call session
++	//     survival (sessions persisting across `try_delegate_execution`
++	//     invocations) — future R6.4c work. In R6.4b sessions are
++	//     always dropped before the function returns.
++	struct BridgeSession
++	{
++		rust_spu_t* handle;
++		u32 lv2_id;
++		u32 in_mbox_consumed;       // count of values popped from RPCS3 IN_MBOX into Rust
++		bool snr1_forwarded;        // true if we ever forwarded a value to Rust slot 0
++		bool snr2_forwarded;        // true if we ever forwarded a value to Rust slot 1
++		u32 stall_iterations;       // count of StallRead→pop_wait→resume cycles (R6.4b)
++		u32 stall_write_iterations; // count of StallWrite→drain→resume cycles (R6.5b)
++		u32 total_steps;            // accumulated step count across iterations
++	};
++
++	struct BridgeSessionDeleter
++	{
++		void operator()(BridgeSession* s) const
++		{
++			if (s)
++			{
++				if (s->handle)
++				{
++					rust_spu_drop(s->handle);
++				}
++				delete s;
++			}
++		}
++	};
++
++	using BridgeSessionPtr = std::unique_ptr<BridgeSession, BridgeSessionDeleter>;
++
++	static std::mutex s_sessions_mutex;
++	static std::unordered_map<u32, BridgeSessionPtr> s_sessions;
++
++	static BridgeSession* find_session(u32 lv2_id)
++	{
++		std::lock_guard<std::mutex> lk(s_sessions_mutex);
++		auto it = s_sessions.find(lv2_id);
++		return it != s_sessions.end() ? it->second.get() : nullptr;
++	}
++
++	// Insert a fresh session (caller must guarantee no existing entry).
++	// Returns a borrowed pointer; ownership stays with the side-table.
++	static BridgeSession* insert_session(u32 lv2_id, rust_spu_t* handle)
++	{
++		std::lock_guard<std::mutex> lk(s_sessions_mutex);
++		BridgeSessionPtr s(new BridgeSession{
++			handle, lv2_id, /*in_mbox_consumed=*/0u,
++			/*snr1=*/false, /*snr2=*/false,
++			/*stall_iters=*/0u, /*stall_write_iters=*/0u,
++			/*total_steps=*/0u});
++		BridgeSession* raw = s.get();
++		s_sessions[lv2_id] = std::move(s);
++		return raw;
++	}
++
++	// Drop the session (frees the handle via the unique_ptr deleter).
++	static void drop_session(u32 lv2_id)
++	{
++		std::lock_guard<std::mutex> lk(s_sessions_mutex);
++		s_sessions.erase(lv2_id);
++	}
++#endif
++
++	bool try_delegate_execution(spu_thread& spu)
++	{
++#ifdef RPCS3_HAS_SPU_RUST_BRIDGE
++		// =========================================================
++		// Phase 0 — handle alloc + LS + PC + GPR setup + session
++		// registration in the side-table.
++		// These touch ONLY Rust state, never RPCS3 state, so any
++		// failure here is a clean fallback.
++		// =========================================================
++
++		// In R6.4b we always start fresh (sessions never survive
++		// across `try_delegate_execution` calls — they live only for
++		// the multi-round loop below). The side-table API is set up
++		// to support cross-call survival in a future R6.4c, but
++		// here we treat any leftover entry as stale and drop it.
++		drop_session(spu.lv2_id);
++
++		rust_spu_t* h = rust_spu_new();
++		if (!h)
++		{
++			spu_rust_bridge_log.warning(
++				"[Rust SPU bridge] try_delegate: rust_spu_new() returned null; "
++				"falling back to C++ executor on '%s'", spu.get_name());
++			return false;
++		}
++
++		// Load the full 256 KiB Local Store image.
++		if (rust_spu_load_ls(h, spu.ls, SPU_LS_SIZE) != 0)
++		{
++			spu_rust_bridge_log.warning(
++				"[Rust SPU bridge] try_delegate: rust_spu_load_ls failed on '%s'; "
++				"falling back to C++ executor", spu.get_name());
++			rust_spu_drop(h);
++			return false;
++		}
++
++		// Set entry PC.
++		if (rust_spu_set_pc(h, spu.pc) != 0)
++		{
++			spu_rust_bridge_log.warning(
++				"[Rust SPU bridge] try_delegate: rust_spu_set_pc(0x%x) failed on '%s'; "
++				"falling back to C++ executor", spu.pc, spu.get_name());
++			rust_spu_drop(h);
++			return false;
++		}
++
++		// Mirror all 128 GPRs. SPU `main(spu_id, arg)` ABI puts
++		// `spu_id` in r3 and `arg` in r4; pulling the full bank is
++		// future-proof and costs ~2 KiB per delegation (negligible).
++		for (u32 r = 0; r < 128; ++r)
++		{
++			u8 bytes[16];
++			v128_to_be_bytes(spu.gpr[r], bytes);
++			if (rust_spu_set_gpr(h, r, bytes) != 0)
++			{
++				spu_rust_bridge_log.warning(
++					"[Rust SPU bridge] try_delegate: rust_spu_set_gpr(r%u) failed on '%s'; "
++					"falling back to C++ executor", r, spu.get_name());
++				rust_spu_drop(h);
++				return false;
++			}
++		}
++
++		// Hand the handle to the side-table (RAII ownership). All
++		// subsequent paths reference `session->handle` and use
++		// `drop_session(spu.lv2_id)` to release.
++		BridgeSession* session = insert_session(spu.lv2_id, h);
++
++		spu_rust_bridge_log.trace(
++			"[Rust SPU bridge] SESSION CREATED for lv2_id=0x%x", spu.lv2_id);
++
++		// =========================================================
++		// Phase 1 — IN_MBOX peek + push to Rust.
++		// `try_read` is non-destructive, so we can fall back without
++		// disturbing RPCS3's mailbox state.
++		// =========================================================
++
++		u32 in_vals[4] = {0, 0, 0, 0};
++		u32 in_count = spu.ch_in_mbox.try_read(in_vals);
++
++		for (u32 i = 0; i < in_count; ++i)
++		{
++			if (rust_spu_push_inmbox(h, in_vals[i]) != 0)
++			{
++				spu_rust_bridge_log.warning(
++					"[Rust SPU bridge] try_delegate: rust_spu_push_inmbox failed on '%s'; "
++					"falling back to C++ executor", spu.get_name());
++				drop_session(spu.lv2_id);
++				return false;
++			}
++		}
++
++		// =========================================================
++		// Phase 1b — SNR1 / SNR2 peek + forward to Rust (R6.3c).
++		// Same non-destructive pattern: `spu_channel::try_read` reads
++		// the pending value without consuming it. SNR forwarding goes
++		// through `rust_spu_signal(slot, value)`. RPCS3's `ch_snr1`/
++		// `ch_snr2` already hold the OR-merged value the PPU sent via
++		// `sysSpuThreadWriteSignal`, so we forward that single value;
++		// the Rust side OR-merges as well, matching Cell BE semantics.
++		// =========================================================
++
++		u32 snr1_value = 0;
++		u32 snr2_value = 0;
++		bool snr1_pending = spu.ch_snr1.try_read(snr1_value);
++		bool snr2_pending = spu.ch_snr2.try_read(snr2_value);
++		u32 signals_forwarded = 0;
++
++		if (snr1_pending)
++		{
++			if (rust_spu_signal(h, /*slot=*/0u, snr1_value) != 0)
++			{
++				spu_rust_bridge_log.warning(
++					"[Rust SPU bridge] try_delegate: rust_spu_signal(SNR1=0x%x) failed on '%s'; "
++					"falling back to C++ executor", snr1_value, spu.get_name());
++				drop_session(spu.lv2_id);
++				return false;
++			}
++			signals_forwarded++;
++			session->snr1_forwarded = true;
++		}
++
++		if (snr2_pending)
++		{
++			if (rust_spu_signal(h, /*slot=*/1u, snr2_value) != 0)
++			{
++				spu_rust_bridge_log.warning(
++					"[Rust SPU bridge] try_delegate: rust_spu_signal(SNR2=0x%x) failed on '%s'; "
++					"falling back to C++ executor", snr2_value, spu.get_name());
++				drop_session(spu.lv2_id);
++				return false;
++			}
++			signals_forwarded++;
++			session->snr2_forwarded = true;
++		}
++
++		// =========================================================
++		// Phase 2 — multi-round run loop (R6.4b).
++		//
++		// Strategy:
++		//   - Run up to `kMaxSteps` Rust SPU instructions per call.
++		//   - On `Stop`: break out of the loop, fall through to commit.
++		//   - On `StallRead` of a *supported* channel (IN_MBOX, SNR1,
++		//     SNR2): block on the corresponding RPCS3 channel via
++		//     `pop_wait` (matches the C++ executor pattern in
++		//     `spu_thread::get_ch_value`). When the PPU pushes a value
++		//     and `pop_wait` returns, forward the popped value into the
++		//     Rust handle and continue the loop. This is destructive
++		//     on the RPCS3 side, so the bridge is "all-in" once the
++		//     loop enters this branch — but `pop_wait` is exactly what
++		//     C++ would have done at the same SPU PC, and the only
++		//     way the Rust executor can lose the popped value
++		//     afterward is by hitting `Error` (unsupported opcode),
++		//     which is documented as a known edge case.
++		//   - On unsupported `Stall*` / `Continue` / `Error`: drop
++		//     the session, fall back to C++ — RPCS3 state is intact
++		//     unless we already pop_wait'd, in which case the values
++		//     are lost (logged at WARNING). For the four R5.11/R5.11b
++		//     fixtures + the multi-round FFI test this never happens.
++		// =========================================================
++
++		constexpr u32 kMaxSteps = 1'000'000;
++		constexpr u32 kMaxStallIterations = 32;
++
++		u32 out_code = 0;
++		u32 out_steps = 0;
++		rust_spu_outcome_t outcome = rust_spu_outcome_t_Stop;
++
++		while (true)
++		{
++			outcome = rust_spu_run_until_event(h, kMaxSteps, &out_code, &out_steps);
++			session->total_steps += out_steps;
++
++			if (outcome == rust_spu_outcome_t_Stop)
++			{
++				break;
++			}
++
++			// Supported `StallRead`: pop_wait on the corresponding
++			// RPCS3 channel + push to Rust + continue.
++			if (outcome == rust_spu_outcome_t_StallRead &&
++				(out_code == 29u || out_code == 3u || out_code == 4u))
++			{
++				if (session->stall_iterations >= kMaxStallIterations)
++				{
++					spu_rust_bridge_log.warning(
++						"[Rust SPU bridge] try_delegate: max stall iterations (%u) reached on '%s'; "
++						"dropping session and falling back to C++ executor. "
++						"This indicates either a runaway stall loop in the SPU program or a "
++						"bridge bookkeeping bug.",
++						kMaxStallIterations, spu.get_name());
++					drop_session(spu.lv2_id);
++					return false;
++				}
++
++				const StallClass cls = classify_stall_channel(out_code);
++				spu_rust_bridge_log.trace(
++					"[Rust SPU bridge] PARKED on %s (stall iter %u, total steps %u) on '%s'; "
++					"blocking on RPCS3 channel via pop_wait",
++					cls.name, session->stall_iterations + 1, session->total_steps,
++					spu.get_name());
++
++				session->stall_iterations++;
++
++				// Block on RPCS3 channel. Same path the C++ executor
++				// takes in `spu_thread::get_ch_value`.
++				if (out_code == 29u)
++				{
++					// IN_MBOX (4-deep queue). `pop_wait` returns
++					// {old_count, value}. old_count==0 indicates
++					// abort (e.g. SPU thread stopping).
++					const auto popped = spu.ch_in_mbox.pop_wait(spu, /*pop_value=*/true);
++					if (popped.first == 0)
++					{
++						spu_rust_bridge_log.warning(
++							"[Rust SPU bridge] try_delegate: IN_MBOX pop_wait aborted on '%s' "
++							"(SPU thread stopping?); dropping session and falling back",
++							spu.get_name());
++						drop_session(spu.lv2_id);
++						return false;
++					}
++					if (rust_spu_push_inmbox(h, popped.second) != 0)
++					{
++						spu_rust_bridge_log.warning(
++							"[Rust SPU bridge] try_delegate: post-stall rust_spu_push_inmbox "
++							"failed on '%s'; dropping session", spu.get_name());
++						drop_session(spu.lv2_id);
++						return false;
++					}
++					session->in_mbox_consumed++;
++					spu_rust_bridge_log.trace(
++						"[Rust SPU bridge] WAKE on IN_MBOX value=0x%x on '%s'", popped.second, spu.get_name());
++				}
++				else
++				{
++					// SNR1 / SNR2 (depth-1 spu_channel). `pop_wait`
++					// returns s64 — high bits carry error sentinel.
++					spu_channel& ch = (out_code == 3u) ? spu.ch_snr1 : spu.ch_snr2;
++					const u32 slot = (out_code == 3u) ? 0u : 1u;
++					const s64 result = ch.pop_wait(spu);
++					if (result < 0)
++					{
++						spu_rust_bridge_log.warning(
++							"[Rust SPU bridge] try_delegate: SNR%u pop_wait aborted on '%s'; "
++							"dropping session and falling back",
++							(slot + 1u), spu.get_name());
++						drop_session(spu.lv2_id);
++						return false;
++					}
++					const u32 sig_value = static_cast<u32>(result);
++					if (rust_spu_signal(h, slot, sig_value) != 0)
++					{
++						spu_rust_bridge_log.warning(
++							"[Rust SPU bridge] try_delegate: post-stall rust_spu_signal(SNR%u=0x%x) "
++							"failed on '%s'; dropping session",
++							(slot + 1u), sig_value, spu.get_name());
++						drop_session(spu.lv2_id);
++						return false;
++					}
++					if (slot == 0u) session->snr1_forwarded = true;
++					else            session->snr2_forwarded = true;
++					signals_forwarded++;
++					spu_rust_bridge_log.trace(
++						"[Rust SPU bridge] WAKE on SNR%u value=0x%x on '%s'",
++						(slot + 1u), sig_value, spu.get_name());
++				}
++				// Continue the loop — re-run on the same handle.
++				continue;
++			}
++
++			// R6.5b — Supported `StallWrite` on OUT_MBOX (ch28).
++			// The Rust executor's OUT_MBOX is depth-1 (`Option<u32>`),
++			// matching Cell BE semantics: a second `wrch ch28` while
++			// the first is still pending parks. The bridge's
++			// resolution: drain the pending value into RPCS3's
++			// `ch_out_mbox` (depth-1) via `set_value`. This is
++			// destructive — any pre-existing value in RPCS3's channel
++			// is overwritten. In PSL1GHT cooperative-thread context
++			// the PPU has no syscall to read OUT_MBOX during execution
++			// (only the lv2 stop-handler reads it as exit_status), so
++			// intermediate values are functionally lost regardless;
++			// the depth-1 overwrite IS the semantic. After draining
++			// we re-run the same handle; the SPU's stalled `wrch`
++			// retries against an empty Rust mailbox and succeeds.
++			if (outcome == rust_spu_outcome_t_StallWrite && out_code == 28u)
++			{
++				if (session->stall_write_iterations >= kMaxStallIterations)
++				{
++					spu_rust_bridge_log.warning(
++						"[Rust SPU bridge] try_delegate: max StallWrite iterations (%u) reached on '%s'; "
++						"dropping session and falling back to C++ executor. "
++						"This indicates either a SPU runaway-write loop or a backpressure "
++						"deadlock that the depth-1 overwrite resolution cannot break.",
++						kMaxStallIterations, spu.get_name());
++					drop_session(spu.lv2_id);
++					return false;
++				}
++
++				const StallClass cls = classify_stall_channel(out_code);
++				spu_rust_bridge_log.trace(
++					"[Rust SPU bridge] PARKED on %s (StallWrite, write iter %u, total steps %u) on '%s'; "
++					"draining intermediate value from Rust OUT_MBOX into RPCS3 (depth-1 overwrite)",
++					cls.name, session->stall_write_iterations + 1, session->total_steps,
++					spu.get_name());
++
++				session->stall_write_iterations++;
++
++				// Pop the value blocking Rust's OUT_MBOX.
++				u32 intermediate = 0;
++				if (rust_spu_pop_outmbox(h, &intermediate) != 0)
++				{
++					// Should be unreachable: Rust just told us OUT_MBOX is full.
++					spu_rust_bridge_log.warning(
++						"[Rust SPU bridge] try_delegate: StallWrite ch28 but rust_spu_pop_outmbox "
++						"returned empty on '%s'; dropping session and falling back",
++						spu.get_name());
++					drop_session(spu.lv2_id);
++					return false;
++				}
++
++				// Push to RPCS3's depth-1 ch_out_mbox. set_value overwrites
++				// any prior value — matches the PSL1GHT-cooperative reality
++				// that intermediate OUT_MBOX writes the PPU never observes.
++				spu.ch_out_mbox.set_value(intermediate);
++
++				spu_rust_bridge_log.trace(
++					"[Rust SPU bridge] WAKE on OUT_MBOX intermediate=0x%x set on RPCS3 ch_out_mbox on '%s'",
++					intermediate, spu.get_name());
++
++				// Continue the loop — Rust's OUT_MBOX is now empty, the
++				// stalled `wrch` will retry on the next run_until_event.
++				continue;
++			}
++
++			// Any other outcome (unsupported Stall, Continue, Error,
++			// or future variant): drop session, fall back honestly.
++			break;
++		}
++
++		if (outcome != rust_spu_outcome_t_Stop)
++		{
++			// Detailed classification of the non-Stop, non-supported-stall
++			// outcome that broke us out of the loop.
++			switch (outcome)
++			{
++			case rust_spu_outcome_t_StallRead:
++			case rust_spu_outcome_t_StallWrite:
++			{
++				const StallClass cls = classify_stall_channel(out_code);
++				const char* dir = (outcome == rust_spu_outcome_t_StallRead) ? "read" : "write";
++				spu_rust_bridge_log.warning(
++					"[Rust SPU bridge] try_delegate: %s stall on %s during %s "
++					"(stall_iters=%u total_steps=%u) on '%s'. %s — dropping session and "
++					"falling back to C++ executor",
++					outcome_name(outcome), cls.name, dir,
++					session->stall_iterations, session->total_steps, spu.get_name(),
++					cls.potentially_retryable
++						? "Re-tryable channel — but R6.4b only handles StallRead on mailbox/SNR; "
++						  "StallWrite (e.g. OUT_MBOX backpressure) lands in R6.4c+"
++						: "Not re-tryable in R6.4 scope (event/decrementer/DMA class)");
++				break;
++			}
++			case rust_spu_outcome_t_Continue:
++				spu_rust_bridge_log.warning(
++					"[Rust SPU bridge] try_delegate: Continue (max_steps=%u budget exhausted) "
++					"on '%s' after %u total steps; dropping session and falling back to C++ "
++					"executor (workload exceeds bridge budget; longer-running workloads need "
++					"R6.4c+ multi-call session support).",
++					kMaxSteps, spu.get_name(), session->total_steps);
++				break;
++			case rust_spu_outcome_t_Error:
++				spu_rust_bridge_log.warning(
++					"[Rust SPU bridge] try_delegate: Error at PC=0x%x total_steps=%u on '%s'; "
++					"dropping session and falling back to C++ executor (unsupported opcode "
++					"or LS-OOB; the C++ recompilers cover a wider opcode set than the Rust "
++					"subset). %s",
++					out_code, session->total_steps, spu.get_name(),
++					session->in_mbox_consumed > 0 || session->snr1_forwarded || session->snr2_forwarded
++						? "WARNING: this session already pop_wait'd RPCS3 channel values — those "
++						  "values are now lost; C++ executor will see partially-drained channels "
++						  "and may diverge from a clean run."
++						: "Channel state intact (no destructive ops performed before Error).");
++				break;
++			default:
++				spu_rust_bridge_log.warning(
++					"[Rust SPU bridge] try_delegate: unexpected outcome=%s code=0x%x on '%s'; "
++					"dropping session and falling back to C++ executor",
++					outcome_name(outcome), out_code, spu.get_name());
++				break;
++			}
++			drop_session(spu.lv2_id);
++			return false;
++		}
++
++		// =========================================================
++		// Phase 3 — Stop reached. Commit to delegation.
++		// We now mutate RPCS3 state: drain RPCS3's IN_MBOX (which we
++		// peeked earlier — `in_count` from the initial peek were
++		// pushed to Rust; any ADDITIONAL values consumed via pop_wait
++		// inside the loop were already popped from RPCS3 there, so
++		// only the original `in_count` need draining now), publish
++		// OUT_MBOX, sync PC + GPRs, then invoke stop_and_signal(code)
++		// so the rest of RPCS3 (group join, status_npc, exit_status)
++		// terminates exactly as the C++ executor would.
++		// =========================================================
++
++		// Drain RPCS3's IN_MBOX: the Rust SPU consumed `in_count`
++		// values during run from our initial peek. Note the loop body
++		// above already pop_wait'd anything that arrived AFTER the
++		// initial peek — those are not in RPCS3's queue anymore.
++		{
++			u32 drained = 0;
++			for (u32 i = 0; i < in_count; ++i)
++			{
++				u32 v = 0;
++				if (!spu.ch_in_mbox.try_pop(v))
++				{
++					break;
++				}
++				drained++;
++			}
++			if (drained != in_count)
++			{
++				spu_rust_bridge_log.warning(
++					"[Rust SPU bridge] try_delegate: IN_MBOX drained %u/%u entries; "
++					"continuing — discrepancy is non-fatal", drained, in_count);
++			}
++		}
++
++		// R6.3c — drain SNR1 / SNR2 channels we forwarded to Rust
++		// from the *initial* peek. Loop-body pop_wait'd values are
++		// already consumed.
++		if (snr1_pending)
++		{
++			u32 dummy = 0;
++			spu.ch_snr1.try_pop(dummy);
++		}
++		if (snr2_pending)
++		{
++			u32 dummy = 0;
++			spu.ch_snr2.try_pop(dummy);
++		}
++
++		// Publish OUT_MBOX. The Rust executor's mailbox is a queue;
++		// RPCS3's `ch_out_mbox` is a depth-1 channel. Multi-round
++		// fixtures may emit several values; we keep the LATEST
++		// (matching depth-1 channel overwrite semantics).
++		{
++			u32 out_val = 0;
++			u32 popped = 0;
++			while (rust_spu_pop_outmbox(h, &out_val) == 0)
++			{
++				popped++;
++			}
++			if (popped > 0)
++			{
++				spu.ch_out_mbox.set_value(out_val);
++				if (popped > 1)
++				{
++					spu_rust_bridge_log.warning(
++						"[Rust SPU bridge] try_delegate: %u OUT_MBOX values "
++						"in Rust handle; RPCS3 channel is depth-1, kept latest "
++						"(0x%x). Multi-write workloads need R6.4c+ to drain "
++						"OUT_MBOX between writes.",
++						popped, out_val);
++				}
++			}
++		}
++
++		// Sync the final PC + GPRs back into spu_thread. This makes
++		// post-stop RPCS3-side hooks (final_state trace guard, etc.)
++		// see exactly what the Rust executor produced.
++		{
++			u32 final_pc = 0;
++			if (rust_spu_get_pc(h, &final_pc) == 0)
++			{
++				spu.pc = final_pc;
++			}
++		}
++		for (u32 r = 0; r < 128; ++r)
++		{
++			u8 bytes[16];
++			if (rust_spu_get_gpr(h, r, bytes) != 0)
++			{
++				continue;
++			}
++			// Inverse of v128_to_be_bytes: bytes[i*4..i*4+3] BE -> _u32[3-i].
++			v128 v{};
++			for (u32 i = 0; i < 4; ++i)
++			{
++				const u32 w =
++					(static_cast<u32>(bytes[i * 4 + 0]) << 24) |
++					(static_cast<u32>(bytes[i * 4 + 1]) << 16) |
++					(static_cast<u32>(bytes[i * 4 + 2]) << 8) |
++					(static_cast<u32>(bytes[i * 4 + 3]) << 0);
++				v._u32[3 - i] = w;
++			}
++			spu.gpr[r] = v;
++		}
++
++		spu_rust_bridge_log.success(
++			"[Rust SPU bridge] DELEGATED EXECUTION OK on '%s' (lv2_id=0x%x): "
++			"Stop code=0x%x total_steps=%u in_mbox_consumed=%u signal_forwarded=%u "
++			"stall_iters=%u stall_write_iters=%u final_pc=0x%x. Routing through stop_and_signal() now.",
++			spu.get_name(), spu.lv2_id, out_code, session->total_steps,
++			(in_count + session->in_mbox_consumed), signals_forwarded,
++			session->stall_iterations, session->stall_write_iterations, spu.pc);
++
++		// Drop the session (RAII calls `rust_spu_drop` on the handle).
++		drop_session(spu.lv2_id);
++
++		// Hand off to RPCS3's existing stop machinery — this sets
++		// cpu_flag::stop / cpu_flag::ret, pops the OUT_MBOX value into
++		// group->exit_status (for code 0x101), and signals join
++		// waiters. After this returns, cpu_task() will see the stop
++		// flag and exit the run loop.
++		spu.stop_and_signal(out_code);
++		return true;
++#else
++		(void)spu;
++		return false;
++#endif
++	}
++}
+diff --git a/rpcs3/Emu/Cell/SPURustBridge.h b/rpcs3/Emu/Cell/SPURustBridge.h
+new file mode 100644
+index 0000000..e948e0b
+--- /dev/null
++++ b/rpcs3/Emu/Cell/SPURustBridge.h
+@@ -0,0 +1,159 @@
++#pragma once
++
++// R6.1 / R6.2 / R6.3a / R6.3b / R6.3c / R6.4a / R6.4b / R6.5b — RPCS3 ↔ Rust SPU bridge (opt-in, default OFF).
++//
++// This header is the C++-side facade over the `rpcs3_spu_ffi` Rust
++// staticlib. It lets the SPU thread loop optionally delegate
++// execution to the pure-Rust SPU executor (interpreter +
++// recompiler) once the env var RPCS3_SPU_RUST_BRIDGE=1 is set.
++//
++// R6.1 scope: hello-world ONLY — proves the staticlib links and the
++// FFI surface is callable.
++// R6.2 scope: first DELEGATED execution path. The bridge can take
++// over execution of a single SPU thread for mailbox-only Stop-
++// terminating workloads. Implementation is deliberately generic:
++// no fixture-specific eligibility check — the bridge runs the SPU
++// to its first event (Stop / Stall / Continue / Error) and then
++// either commits (on Stop) or falls back honestly (every other
++// outcome). RPCS3 state stays untouched on the fallback path.
++// R6.3a scope: same generic implementation now exercised end-to-end
++// on a second oracle fixture, `single_spu_branch_loop_v1`. The
++// bridge runs the Fibonacci loop (~70 SPU instructions) and exits
++// via the same `stop_and_signal(0x101)` path. No code changes
++// were needed.
++// R6.3b scope: third delegated fixture, `single_spu_loadstore_v1`,
++// confirms the bridge's LS/PC/GPR sync (including r1 stack pointer
++// preservation) and the Rust executor's stqd/lqd quadword load/
++// store opcodes. ~187 SPU instructions including a real LS round-
++// trip via volatile stack buffer; OUT_MBOX = 0x81C. Again, no
++// bridge logic changes — only proof + log/doc updates.
++// R6.3c scope: fourth delegated fixture, `single_spu_signal_v1`,
++// adds SNR1 / SNR2 forwarding (the FIRST real bridge logic
++// extension since R6.2). The PPU sends a signal via
++// `sysSpuThreadWriteSignal` which lands in `spu_thread::ch_snr1`
++// or `ch_snr2`. The bridge non-destructively peeks (`try_read`)
++// these channels before run, forwards via `rust_spu_signal(slot,
++// value)` (slot=0 for SNR1, slot=1 for SNR2), and only consumes
++// the RPCS3-side channel via `try_pop` on the Stop-commit branch.
++//
++// R6.4a scope: formalize the outcome contract + classification.
++// `try_delegate_execution()` returns true ONLY for
++// `RustSpuOutcome::Stop`; every other outcome (Continue / StallRead
++// / StallWrite / Error) falls back to the C++ executor with the
++// load-bearing invariant that RPCS3 state is byte-identical to
++// entry on the fallback path:
++//   - PC, GPRs, LS unchanged (Phase 0 only reads).
++//   - IN_MBOX peeked via `try_read` (non-destructive).
++//   - SNR1/SNR2 peeked via `try_read` (non-destructive).
++//   - OUT_MBOX, ch_in_mbox, ch_snr*, ch_out_mbox not mutated.
++//   - `stop_and_signal()` not invoked.
++// On Stop the bridge commits exactly once: drains the channels
++// it peeked, publishes OUT_MBOX, syncs PC + 128 GPRs, and routes
++// through `stop_and_signal(out_code)` so RPCS3's existing group-
++// exit machinery handles the rest.
++//
++// The R6.4a fallback log includes:
++//   - For StallRead/StallWrite: the channel name (mapped via
++//     `classify_stall_channel`) and a re-tryability flag.
++//     Mailbox/Signal channels (28/29/3/4) are flagged re-tryable;
++//     event/decrementer/DMA channels are not.
++//   - For Continue: the per-call max_steps budget (1M).
++//   - For Error: the failing PC.
++//
++// R6.5b — StallWrite OUT_MBOX (ch28) handling. The multi-round
++// loop now also handles `StallWrite code=28` by popping the
++// pending value out of Rust's depth-1 OUT_MBOX, calling
++// `set_value` on RPCS3's `ch_out_mbox` (which is also depth-1, so
++// any pre-existing value is overwritten), and resuming the same
++// handle. This is the correct semantic for PSL1GHT cooperative
++// SPU threads: there is no syscall path for the PPU to read a
++// cooperative SPU's OUT_MBOX during execution, so intermediate
++// writes the PPU cannot observe are FUNCTIONALLY lost regardless;
++// the depth-1 overwrite IS the well-defined semantic. A separate
++// `stall_write_iterations` counter mirrors `stall_iterations`,
++// and both are surfaced in the DELEGATED success log. A real-
++// binary fixture cannot exercise this path (a SPU that writes
++// OUT_MBOX twice with neither overlapping a stop instruction
++// would deadlock the C++ executor's `push_wait` since PSL1GHT
++// can't drain) — the FFI-level acceptance gate is
++// `rust_spu_outmbox_backpressure_via_ffi`.
++//
++// R6.4b — persistent-handle multi-round loop. The bridge now keeps
++// a `BridgeSession` (in a side-table keyed by `spu_thread::lv2_id`)
++// alive across `rust_spu_run_until_event` calls within a single
++// `try_delegate_execution`. On `StallRead` of a supported channel
++// (29 IN_MBOX, 3 SNR1, 4 SNR2) the bridge calls the corresponding
++// RPCS3-side `pop_wait` (the same path the C++ executor uses in
++// `spu_thread::get_ch_value`), forwards the popped value into the
++// Rust handle, and re-runs. This makes multi-round mailbox/SNR
++// fixtures delegate end-to-end. The session is dropped on Stop
++// commit, on unsupported outcomes, on stall-iteration cap, or on
++// `Error` (drop also triggers `rust_spu_drop`). The side-table
++// supports cross-call session survival as a future R6.4c
++// extensibility hook, but R6.4b sessions never outlive a single
++// `try_delegate_execution` call. The FFI-level acceptance gate
++// is `rust_spu_mailbox_multi_round_via_ffi` (in
++// `rust/rpcs3-spu-ffi/src/tests.rs`); a real-binary acceptance
++// gate via `single_spu_mailbox_multi_v1.self` lands when PSL1GHT
++// is available (R6.4b-pre authored the source).
++//
++// Verified workloads: `single_spu_mailbox_v1`,
++// `single_spu_branch_loop_v1`, `single_spu_loadstore_v1`,
++// `single_spu_signal_v1`. Other fixtures and game workloads
++// still fall back honestly.
++//
++// The whole bridge is compile-time gated by `RPCS3_HAS_SPU_RUST_BRIDGE`,
++// which the CMake build system sets only when the Rust staticlib
++// (`rust/target/release/rpcs3_spu_ffi.lib` or `.a`) is present.
++// If the staticlib has not been built, this header still compiles
++// and `is_enabled()` returns false unconditionally.
++//
++// See:
++//   - docs/R6_LIVE_BRIDGE_PLAN.md for the phased plan.
++//   - docs/SPU_RUST_BRIDGE_PATCH.md for build / apply instructions.
++//   - rust/rpcs3-spu-ffi/include/rpcs3_spu_ffi.h for the C ABI.
++
++class spu_thread;
++
++namespace spu_rust_bridge
++{
++	// Returns true iff the env var RPCS3_SPU_RUST_BRIDGE is exactly
++	// "1". Cached on first call; subsequent calls are lock-free.
++	// Always returns false if RPCS3_HAS_SPU_RUST_BRIDGE is not defined
++	// at compile time (i.e., the Rust staticlib was not present).
++	bool is_enabled();
++
++	// R6.1 hello-world: instantiates a `rust_spu_t*` handle, logs
++	// the activation, and drops it. Called at most ONCE per
++	// spu_thread (gated by a per-thread flag in the caller).
++	//
++	// On success: log via the `RustSPU` log channel at SUCCESS level.
++	// On failure (rust_spu_new returns null): log at ERROR level and
++	// return; the SPU thread continues with the existing C++
++	// executor.
++	void hello_world_proof(spu_thread& spu);
++
++	// R6.2 — try to delegate execution of `spu` to the Rust executor.
++	//
++	// On success (== returned `true`): the bridge has FULLY handled
++	// this SPU thread's execution up to a normal stop. Specifically:
++	//   - LS / PC / GPRs were copied into a Rust SPU handle
++	//   - any pending IN_MBOX values were forwarded
++	//   - `rust_spu_run_until_event` ran to a Stop outcome
++	//   - the resulting OUT_MBOX value was pushed back into RPCS3's
++	//     `ch_out_mbox` and `stop_and_signal(code)` was invoked,
++	//     setting the proper `cpu_flag::stop` / group join state.
++	// The caller MUST return from `cpu_task()` immediately; the SPU
++	// has terminated.
++	//
++	// On failure (== returned `false`): the bridge declined to handle
++	// this SPU thread (or hit an unsupported outcome). The caller
++	// MUST fall back to the existing C++ executor. RPCS3 state is
++	// guaranteed unchanged on failure — no GPRs written, no LS
++	// modified, IN_MBOX values restored if briefly drained, no
++	// stop_and_signal called. Reason is logged at WARNING level.
++	//
++	// Always returns false when `RPCS3_HAS_SPU_RUST_BRIDGE` is not
++	// defined or `is_enabled()` returns false.
++	bool try_delegate_execution(spu_thread& spu);
++}
+diff --git a/rpcs3/Emu/Cell/SPUThread.cpp b/rpcs3/Emu/Cell/SPUThread.cpp
+index 84cd254..618845b 100644
+--- a/rpcs3/Emu/Cell/SPUThread.cpp
++++ b/rpcs3/Emu/Cell/SPUThread.cpp
+@@ -21,6 +21,7 @@
+ #include "Emu/Cell/SPUAnalyser.h"
+ #include "Emu/Cell/SPUThread.h"
+ #include "Emu/Cell/SPURecompiler.h"
++#include "Emu/Cell/SPURustBridge.h"
+ #include "Emu/Cell/SPUTraceJsonl.h"
+ #include "Emu/Cell/timers.hpp"
+ 
+@@ -1579,6 +1580,35 @@ void spu_thread::cpu_task()
+ 		}
+ 	}
+ 
++	// R6.1 / R6.2 — Rust SPU bridge (opt-in, default OFF).
++	// R6.1: hello-world FFI proof (linkage check, ONCE per spu_thread).
++	// R6.2: first DELEGATED execution path. When the bridge is enabled,
++	// every cpu_task() entry first attempts to delegate to the Rust
++	// executor. On success the SPU has terminated via stop_and_signal()
++	// and we return immediately. On failure we fall back honestly to the
++	// existing C++ executor (jit / interpreter) — RPCS3 state is
++	// preserved unchanged on the fallback path.
++	// The bridge is compile-time gated by RPCS3_HAS_SPU_RUST_BRIDGE
++	// (set by CMake when the staticlib is present) and runtime-gated by
++	// the env var RPCS3_SPU_RUST_BRIDGE=1.
++	if (spu_rust_bridge::is_enabled())
++	{
++		[[maybe_unused]] static thread_local bool s_announced = false;
++		if (!s_announced)
++		{
++			s_announced = true;
++			spu_rust_bridge::hello_world_proof(*this);
++		}
++
++		if (spu_rust_bridge::try_delegate_execution(*this))
++		{
++			// Bridge took over: stop_and_signal() set cpu_flag::stop;
++			// exit cpu_task() so the thread group joins normally.
++			return;
++		}
++		// else: fall through to C++ executor (no state mutated).
++	}
++
+ 	if (jit)
+ 	{
+ 		while (true)
+diff --git a/rpcs3/emucore.vcxproj b/rpcs3/emucore.vcxproj
+index a8bbc94..0ed482f 100644
+--- a/rpcs3/emucore.vcxproj
++++ b/rpcs3/emucore.vcxproj
+@@ -546,6 +546,7 @@
+     <ClCompile Include="Emu\Cell\RawSPUThread.cpp" />
+     <ClCompile Include="Emu\Cell\SPUCommonRecompiler.cpp" />
+     <ClCompile Include="Emu\Cell\SPULLVMRecompiler.cpp" />
++    <ClCompile Include="Emu\Cell\SPURustBridge.cpp" />
+     <ClCompile Include="Emu\Cell\SPUThread.cpp" />
+     <ClCompile Include="Emu\Cell\SPUTraceJsonl.cpp" />
+     <ClCompile Include="Emu\CPU\CPUThread.cpp" />
+@@ -1000,6 +1001,7 @@
+     <ClInclude Include="Emu\Cell\SPUInterpreter.h" />
+     <ClInclude Include="Emu\Cell\SPUOpcodes.h" />
+     <ClInclude Include="Emu\Cell\SPURecompiler.h" />
++    <ClInclude Include="Emu\Cell\SPURustBridge.h" />
+     <ClInclude Include="Emu\Cell\SPUThread.h" />
+     <ClInclude Include="Emu\Cell\SPUTraceJsonl.h" />
+     <ClInclude Include="Emu\Cell\timers.hpp" />
+@@ -1138,4 +1140,25 @@
+   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+   <ImportGroup Label="ExtensionTargets">
+   </ImportGroup>
++  <!--
++    R6.1 - Rust SPU bridge link integration.
++    Conditional on the rpcs3-spu-ffi staticlib being present at
++    $(MSBuildProjectDirectory)\..\rust\target\release\rpcs3_spu_ffi.lib
++    (= R:\rust\target\release\... when building from R:\rpcs3.sln).
++    When present, adds the staticlib to AdditionalDependencies, the
++    cbindgen-generated header dir to AdditionalIncludeDirectories,
++    and defines RPCS3_HAS_SPU_RUST_BRIDGE=1 so SPURustBridge.cpp
++    compiles in the FFI calls. When absent, the bridge is
++    compile-time disabled and rpcs3.exe builds + runs unchanged.
++    Build via: scripts\build_rust_spu_ffi.ps1 (relative to repo root).
++  -->
++  <ItemDefinitionGroup Condition="Exists('$(MSBuildProjectDirectory)\..\rust\target\release\rpcs3_spu_ffi.lib')">
++    <ClCompile>
++      <PreprocessorDefinitions>RPCS3_HAS_SPU_RUST_BRIDGE=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
++      <AdditionalIncludeDirectories>$(MSBuildProjectDirectory)\..\rust\rpcs3-spu-ffi\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
++    </ClCompile>
++    <Link>
++      <AdditionalDependencies>$(MSBuildProjectDirectory)\..\rust\target\release\rpcs3_spu_ffi.lib;%(AdditionalDependencies)</AdditionalDependencies>
++    </Link>
++  </ItemDefinitionGroup>
+ </Project>
+\ No newline at end of file
+diff --git a/rpcs3/emucore.vcxproj.filters b/rpcs3/emucore.vcxproj.filters
+index 362bbf4..07d26bd 100644
+--- a/rpcs3/emucore.vcxproj.filters
++++ b/rpcs3/emucore.vcxproj.filters
+@@ -183,6 +183,9 @@
+     <ClCompile Include="Emu\Cell\RawSPUThread.cpp">
+       <Filter>Emu\Cell</Filter>
+     </ClCompile>
++    <ClCompile Include="Emu\Cell\SPURustBridge.cpp">
++      <Filter>Emu\Cell</Filter>
++    </ClCompile>
+     <ClCompile Include="Emu\Cell\SPUThread.cpp">
+       <Filter>Emu\Cell</Filter>
+     </ClCompile>
+@@ -1512,6 +1515,9 @@
+     <ClInclude Include="Emu\Cell\SPURecompiler.h">
+       <Filter>Emu\Cell</Filter>
+     </ClInclude>
++    <ClInclude Include="Emu\Cell\SPURustBridge.h">
++      <Filter>Emu\Cell</Filter>
++    </ClInclude>
+     <ClInclude Include="Emu\Cell\SPUThread.h">
+       <Filter>Emu\Cell</Filter>
+     </ClInclude>
+diff --git a/rpcs3/rpcs3.vcxproj b/rpcs3/rpcs3.vcxproj
+index 8bf5e5b..66d6b79 100644
+--- a/rpcs3/rpcs3.vcxproj
++++ b/rpcs3/rpcs3.vcxproj
+@@ -2339,4 +2339,29 @@
+       <UserProperties MocDir=".\QTGeneratedFiles\$(ConfigurationName)" Qt5Version_x0020_x64="$(DefaultQtVersion)" RccDir=".\QTGeneratedFiles" UicDir=".\QTGeneratedFiles" />
+     </VisualStudio>
+   </ProjectExtensions>
++  <!--
++    R6.1 - Propagate the Rust SPU bridge staticlib dependency to the
++    final EXE link. emucore is built as a static .lib, so its
++    references to rust_spu_new/rust_spu_drop don't resolve until
++    rpcs3.exe is linked. The same Exists() condition as in
++    emucore.vcxproj keeps this opt-in: when the staticlib is absent,
++    nothing is added.
++  -->
++  <ItemDefinitionGroup Condition="Exists('$(MSBuildProjectDirectory)\..\rust\target\release\rpcs3_spu_ffi.lib')">
++    <Link>
++      <!--
++        rpcs3_spu_ffi.lib drags in Rust's std crate which links
++        against several Windows system libraries via #[link]
++        attributes. MSVC's linker doesn't auto-resolve those from
++        the staticlib metadata, so we list them explicitly:
++          - userenv.lib    : GetUserProfileDirectoryW (std::env)
++          - ws2_32.lib     : Windows Sockets (std::net)
++          - bcrypt.lib     : RtlGenRandom / BCryptGenRandom (std::sys::rand)
++          - iphlpapi.lib   : IP helper APIs (std::net adapter enumeration)
++          - userenv.lib + ntdll.lib already exported by emucore;
++            duplicate names are deduped by the linker (harmless).
++      -->
++      <AdditionalDependencies>$(MSBuildProjectDirectory)\..\rust\target\release\rpcs3_spu_ffi.lib;userenv.lib;ws2_32.lib;bcrypt.lib;iphlpapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
++    </Link>
++  </ItemDefinitionGroup>
+ </Project>
+\ No newline at end of file

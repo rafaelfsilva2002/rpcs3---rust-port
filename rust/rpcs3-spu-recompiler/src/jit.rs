@@ -31,16 +31,156 @@ use std::collections::BTreeMap;
 
 use cranelift::codegen::ir::condcodes::IntCC;
 use cranelift::codegen::ir::types::{I32, I64};
-use cranelift::codegen::ir::{AbiParam, Block, InstBuilder, MemFlags, Signature, Value};
+use cranelift::codegen::ir::{AbiParam, Block, FuncRef, InstBuilder, MemFlags, Signature, Value};
 use cranelift::frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift::prelude::settings::{self, Configurable};
 use cranelift::prelude::EntityRef;
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{Linkage, Module};
+use cranelift_module::{FuncId, Linkage, Module};
 
 use rpcs3_spu_decoder::{
     decode_function, BlockTerminator, DecodeError, SpuFunction, SpuInstKind,
 };
+
+// =====================================================================
+// R5.2 — channel-op runtime helpers
+// =====================================================================
+//
+// Channel ops (`rdch`, `wrch`) need access to the live `SpuChannels`
+// state held outside the JIT. We can't codegen the entire channel
+// dispatch table inline (the semantics are stateful and small enough
+// that an extern "C" Rust call is the right cost/complexity tradeoff).
+//
+// Each helper:
+//   - Operates on the **real** SpuChannels passed via JitState.channels_ptr.
+//   - Returns a `ChannelHelperOutcome`-coded u32 the JIT translates
+//     into either "advance PC" or "exit JIT for R5 partial fallback".
+//   - Never returns a fake/synthesized value to dodge a stall.
+
+/// Outcome of a channel-op runtime helper. Wire format is u32 so the
+/// JIT can branch on it directly without struct-shape concerns.
+#[repr(u32)]
+pub enum ChannelHelperOutcome {
+    /// Helper executed the op against real `SpuChannels` state with a
+    /// well-defined result. JIT advances PC and continues.
+    OkContinue = 0,
+    /// Channel is empty (rdch) / full (wrch) — the SPU would block
+    /// here. JIT must NOT make progress; exits to R5 partial fallback
+    /// with `state.pc` left at the channel op's pc.
+    Stall = 1,
+    /// Channel id is one the helper does not recognise. Treated as a
+    /// fallback-worthy unsupported case — the interpreter has the
+    /// authoritative behaviour (returns `Error::Unimplemented`).
+    BadChannel = 2,
+}
+
+/// R5.2 helper for `rdch rt, ch`. Reads the channel via the real
+/// SpuChannels state. On Ok, writes `gpr_lanes[rt] = [value, 0, 0, 0]`
+/// (mirroring the interpreter's `join_lanes([value, 0, 0, 0])`). On
+/// Stall / BadChannel, leaves `gpr_lanes[rt]` untouched so the
+/// interpreter resume sees identical state to the moment the helper
+/// was called.
+///
+/// # Safety
+///
+/// Both pointers must be non-null and point at valid live objects
+/// owned by the dispatcher for the duration of this call. The
+/// dispatcher in `try_jit_run` allocates both alongside the JitState
+/// and keeps them alive across the entire run.
+pub extern "C" fn spu_helper_rdch(
+    state_ptr: *mut JitState,
+    rt: u32,
+    channel: u32,
+) -> u32 {
+    let st = unsafe { &mut *state_ptr };
+    if st.channels_ptr.is_null() {
+        return ChannelHelperOutcome::BadChannel as u32;
+    }
+    let chans = unsafe { &mut *st.channels_ptr };
+    use rpcs3_spu_thread::ChannelStatus;
+    match chans.read(channel) {
+        Ok(value) => {
+            // Mirror interpreter exactly: lane 0 = value, lanes 1..3 = 0.
+            let lanes = &mut st.gpr_lanes[rt as usize & 0x7F];
+            lanes[0] = value;
+            lanes[1] = 0;
+            lanes[2] = 0;
+            lanes[3] = 0;
+            ChannelHelperOutcome::OkContinue as u32
+        }
+        Err(ChannelStatus::WouldStall) => ChannelHelperOutcome::Stall as u32,
+        Err(_) => ChannelHelperOutcome::BadChannel as u32,
+    }
+}
+
+/// R5.2 helper for `wrch ch, rt`. Reads the channel value from
+/// `gpr_lanes[rt][0]` (preferred slot, lane 0) and writes it to the
+/// live SpuChannels via `SpuChannels::write`. On Stall / BadChannel,
+/// the channel state is unchanged (the interpreter's `write`
+/// implementation checks for capacity *before* mutating, so error
+/// paths are no-op).
+///
+/// # Safety
+///
+/// Same contract as `spu_helper_rdch`.
+pub extern "C" fn spu_helper_wrch(
+    state_ptr: *mut JitState,
+    rt: u32,
+    channel: u32,
+) -> u32 {
+    let st = unsafe { &mut *state_ptr };
+    if st.channels_ptr.is_null() {
+        return ChannelHelperOutcome::BadChannel as u32;
+    }
+    let chans = unsafe { &mut *st.channels_ptr };
+    use rpcs3_spu_thread::ChannelStatus;
+    let value = st.gpr_lanes[rt as usize & 0x7F][0];
+    match chans.write(channel, value) {
+        Ok(()) => ChannelHelperOutcome::OkContinue as u32,
+        Err(ChannelStatus::WouldStall) => ChannelHelperOutcome::Stall as u32,
+        Err(_) => ChannelHelperOutcome::BadChannel as u32,
+    }
+}
+
+/// R5.3 helper for `rchcnt rt, ch` against a *variable-count* channel.
+/// Reads the channel's count via `SpuChannels::count` and writes the
+/// interpreter's exact lane layout (`join_lanes([count, 0, 0, 0])`)
+/// into `gpr_lanes[rt]`.
+///
+/// `rchcnt` never stalls — it queries a count, doesn't acquire a
+/// resource — so the only non-Ok outcome is `BadChannel`. The const-1
+/// channels are NOT routed here; they go through R5.1's direct
+/// codegen (`emit_rchcnt_const_one`) so this helper is reserved for
+/// channels with state-dependent counts: mailbox depth, signal
+/// pending bits, etc.
+///
+/// # Safety
+///
+/// Same contract as `spu_helper_rdch`. `count(&self)` is non-mutating
+/// but we hold `&mut *st.channels_ptr` for ABI consistency with the
+/// rdch/wrch helpers (the auto-deref handles the mutability mismatch).
+pub extern "C" fn spu_helper_rchcnt(
+    state_ptr: *mut JitState,
+    rt: u32,
+    channel: u32,
+) -> u32 {
+    let st = unsafe { &mut *state_ptr };
+    if st.channels_ptr.is_null() {
+        return ChannelHelperOutcome::BadChannel as u32;
+    }
+    let chans = unsafe { &*st.channels_ptr };
+    match chans.count(channel) {
+        Ok(count) => {
+            let lanes = &mut st.gpr_lanes[rt as usize & 0x7F];
+            lanes[0] = count;
+            lanes[1] = 0;
+            lanes[2] = 0;
+            lanes[3] = 0;
+            ChannelHelperOutcome::OkContinue as u32
+        }
+        Err(_) => ChannelHelperOutcome::BadChannel as u32,
+    }
+}
 
 /// JIT outcome: clean stop. `state.stop_code` carries the 14-bit code,
 /// `state.pc` is the address of the stop instruction itself.
@@ -79,11 +219,26 @@ pub struct JitState {
     /// leave this as a null pointer; the JIT only dereferences it
     /// when one of the load/store opcodes is actually compiled.
     pub ls_ptr: *mut u8,
+    /// R5.2: pointer to the per-execute SpuChannels owned by the
+    /// dispatcher. Used by the rdch / wrch runtime helpers
+    /// (`spu_helper_rdch`, `spu_helper_wrch`). May be null when the
+    /// caller doesn't intend to support channel ops at runtime — the
+    /// JIT only dereferences this pointer through the helpers, which
+    /// are only emitted for `Channel { Read, .. }` / `Channel { Write, .. }`
+    /// instructions. Existing rchcnt const-1 codegen does NOT touch
+    /// this pointer.
+    pub channels_ptr: *mut rpcs3_spu_thread::SpuChannels,
 }
 
 impl JitState {
     pub fn new() -> Self {
-        Self { gpr_lanes: [[0; 4]; 128], pc: 0, stop_code: 0, ls_ptr: std::ptr::null_mut() }
+        Self {
+            gpr_lanes: [[0; 4]; 128],
+            pc: 0,
+            stop_code: 0,
+            ls_ptr: std::ptr::null_mut(),
+            channels_ptr: std::ptr::null_mut(),
+        }
     }
 
     pub fn store_gpr(&mut self, idx: usize, value: u128) {
@@ -153,6 +308,26 @@ impl CompiledFunction {
 pub struct JitBackend {
     module: JITModule,
     counter: u64,
+    /// R5.2 + R5.3: pre-declared FuncIds for the channel-op runtime
+    /// helpers. Each compile pulls a `FuncRef` into its function via
+    /// `declare_func_in_func` so codegen can `call` the helpers.
+    helper_rdch_id: FuncId,
+    helper_wrch_id: FuncId,
+    /// R5.3: helper for `rchcnt` against variable-count channels.
+    /// Constant-count channels still bypass this via R5.1's
+    /// `emit_rchcnt_const_one`.
+    helper_rchcnt_id: FuncId,
+}
+
+/// R5.2 + R5.3: per-compile FuncRefs for the channel runtime helpers,
+/// derived from `JitBackend::helper_*_id` via `declare_func_in_func`.
+/// Threaded through `emit_block` and `emit_inst` so any `Channel`
+/// instruction can emit a call without re-declaring the imports.
+#[derive(Clone, Copy)]
+struct HelperRefs {
+    rdch: FuncRef,
+    wrch: FuncRef,
+    rchcnt: FuncRef,
 }
 
 impl JitBackend {
@@ -164,9 +339,47 @@ impl JitBackend {
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
             .expect("Cranelift ISA finalisation");
-        let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-        let module = JITModule::new(builder);
-        Self { module, counter: 0 }
+        let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        // R5.2: register the channel-op runtime helpers so codegen for
+        // `rdch`/`wrch` can call them by name. The function pointers
+        // are stable for the process lifetime, so we register once at
+        // backend construction.
+        builder.symbol("spu_helper_rdch", spu_helper_rdch as *const u8);
+        builder.symbol("spu_helper_wrch", spu_helper_wrch as *const u8);
+        // R5.3: register the rchcnt helper for variable-count channels.
+        builder.symbol("spu_helper_rchcnt", spu_helper_rchcnt as *const u8);
+        let mut module = JITModule::new(builder);
+
+        // R5.2 + R5.3: pre-declare the helpers' signatures and import
+        // names. `declare_function(..., Linkage::Import, ...)` tells
+        // Cranelift these symbols are resolved at link time — the
+        // symbol() calls above point them at our Rust functions. All
+        // three helpers share the same signature.
+        let helper_sig = {
+            let mut s = Signature::new(module.target_config().default_call_conv);
+            s.params.push(AbiParam::new(I64));   // state_ptr
+            s.params.push(AbiParam::new(I32));   // rt
+            s.params.push(AbiParam::new(I32));   // channel
+            s.returns.push(AbiParam::new(I32));  // ChannelHelperOutcome (u32)
+            s
+        };
+        let helper_rdch_id = module
+            .declare_function("spu_helper_rdch", Linkage::Import, &helper_sig)
+            .expect("Cranelift declare spu_helper_rdch");
+        let helper_wrch_id = module
+            .declare_function("spu_helper_wrch", Linkage::Import, &helper_sig)
+            .expect("Cranelift declare spu_helper_wrch");
+        let helper_rchcnt_id = module
+            .declare_function("spu_helper_rchcnt", Linkage::Import, &helper_sig)
+            .expect("Cranelift declare spu_helper_rchcnt");
+
+        Self {
+            module,
+            counter: 0,
+            helper_rdch_id,
+            helper_wrch_id,
+            helper_rchcnt_id,
+        }
     }
 
     pub fn compile_at(&mut self, ls: &[u8], entry_pc: u32) -> Result<CompiledFunction, JitError> {
@@ -232,6 +445,15 @@ impl JitBackend {
         let state_param = builder.block_params(entry_block)[0];
         builder.def_var(state_var, state_param);
 
+        // R5.2 + R5.3: pull the channel-op helper FuncRefs into this
+        // function exactly once, so emit_inst can call them without
+        // re-doing the declaration per instruction.
+        let helper_refs = HelperRefs {
+            rdch: self.module.declare_func_in_func(self.helper_rdch_id, builder.func),
+            wrch: self.module.declare_func_in_func(self.helper_wrch_id, builder.func),
+            rchcnt: self.module.declare_func_in_func(self.helper_rchcnt_id, builder.func),
+        };
+
         // Now emit each block.
         for (pc, spu_block) in &function.blocks {
             let cl_block = block_map[pc];
@@ -239,7 +461,7 @@ impl JitBackend {
                 builder.switch_to_block(cl_block);
             }
             let state = builder.use_var(state_var);
-            emit_block(&mut builder, state, state_var, spu_block, &block_map)?;
+            emit_block(&mut builder, state, state_var, spu_block, &block_map, &helper_refs)?;
         }
 
         builder.seal_all_blocks();
@@ -274,6 +496,7 @@ fn emit_block(
     state_var: Variable,
     block: &rpcs3_spu_decoder::SpuBasicBlock,
     block_map: &BTreeMap<u32, Block>,
+    helper_refs: &HelperRefs,
 ) -> Result<(), JitError> {
     // Emit every instruction except possibly the last (if the last is
     // a branch / stop, it's handled by the terminator emitter below).
@@ -282,7 +505,7 @@ fn emit_block(
     let inst_emit_count = if last_is_terminator { last_idx.saturating_sub(1) } else { last_idx };
 
     for inst in &block.instructions[..inst_emit_count] {
-        emit_inst(builder, state, inst.kind, inst.pc, inst.raw)?;
+        emit_inst(builder, state, state_var, inst.kind, inst.pc, inst.raw, helper_refs)?;
     }
 
     let last = block.instructions.last();
@@ -608,6 +831,21 @@ fn supported_check(kind: SpuInstKind, pc: u32, raw: u32) -> Result<(), JitError>
         SpuInstKind::BranchIndirect { .. }
         | SpuInstKind::BranchIndirectLink { .. }
         | SpuInstKind::BranchIndirectCond { .. } => Ok(()),
+        // R5.1 + R5.2 + R5.3 — Channel ops:
+        //   - `rchcnt` (ReadCount) against a *constant-count* channel
+        //     (R5.1): JIT emits `rt = [1, 0, 0, 0]` directly, no
+        //     runtime call. Channels: 0, 1, 2, 7, 8, 22, 23.
+        //   - `rchcnt` against a *variable-count* channel (R5.3):
+        //     JIT emits a call to `spu_helper_rchcnt` which queries
+        //     `SpuChannels::count` for the live count.
+        //   - `rdch` / `wrch` (Read / Write) against ANY channel
+        //     (R5.2): JIT emits a call to `spu_helper_rdch` /
+        //     `spu_helper_wrch`.
+        //   - All helpers translate `Stall` / `BadChannel` into
+        //     `JIT_OUTCOME_STALL` so the dispatcher's R5 partial
+        //     fallback hands control to the interpreter at the
+        //     channel op's pc. No fake values are ever returned.
+        SpuInstKind::Channel { .. } => Ok(()),
         _ => Err(JitError::Unsupported {
             pc, raw,
             reason: format!("kind {kind:?} not yet codegen'd"),
@@ -618,9 +856,11 @@ fn supported_check(kind: SpuInstKind, pc: u32, raw: u32) -> Result<(), JitError>
 fn emit_inst(
     builder: &mut FunctionBuilder,
     state: Value,
+    state_var: Variable,
     kind: SpuInstKind,
     pc: u32,
     raw: u32,
+    helper_refs: &HelperRefs,
 ) -> Result<(), JitError> {
     match kind {
         SpuInstKind::Nop => Ok(()),
@@ -903,10 +1143,115 @@ fn emit_inst(
             emit_word_imm(builder, state, rt, ra, imm32, op);
             Ok(())
         }
+        // R5.1 + R5.2 + R5.3 — Channel ops:
+        //   - `rchcnt` (ReadCount) const-1 channel — direct codegen.
+        //   - `rchcnt` variable channel — `spu_helper_rchcnt`.
+        //   - `rdch` (Read) — `spu_helper_rdch`.
+        //   - `wrch` (Write) — `spu_helper_wrch`.
+        SpuInstKind::Channel { rt, channel, kind } => {
+            use rpcs3_spu_decoder::ChannelOp;
+            match kind {
+                ChannelOp::ReadCount => {
+                    let is_const_one_channel = matches!(channel, 0 | 1 | 2 | 7 | 8 | 22 | 23);
+                    if is_const_one_channel {
+                        // R5.1 fast-path: rt = [1, 0, 0, 0], no helper.
+                        emit_rchcnt_const_one(builder, state, rt as usize);
+                    } else {
+                        // R5.3: variable-count channel via helper.
+                        emit_channel_helper_call(
+                            builder, state, state_var,
+                            helper_refs.rchcnt, rt, channel, pc,
+                        );
+                    }
+                }
+                ChannelOp::Read => {
+                    emit_channel_helper_call(
+                        builder, state, state_var,
+                        helper_refs.rdch, rt, channel, pc,
+                    );
+                }
+                ChannelOp::Write => {
+                    emit_channel_helper_call(
+                        builder, state, state_var,
+                        helper_refs.wrch, rt, channel, pc,
+                    );
+                }
+            }
+            Ok(())
+        }
         _ => Err(JitError::Unsupported {
             pc, raw,
             reason: "emit_inst hit kind not classified by supported_check".into(),
         }),
+    }
+}
+
+/// R5.2: emit a call to a channel runtime helper (`spu_helper_rdch` or
+/// `spu_helper_wrch`). The helper receives `(state_ptr, rt, channel)`
+/// and returns a `ChannelHelperOutcome` u32:
+///   - 0 (`OkContinue`) — fall through; helper already mutated state.
+///   - non-zero (Stall / BadChannel) — exit the JIT with `state.pc =
+///     pc-of-this-instruction` and `JIT_OUTCOME_STALL`. The dispatcher
+///     then routes to `partial_fallback_to_interpreter` which lets the
+///     interpreter retry the same op against the now-shared SpuChannels
+///     (preserving its authoritative behaviour for stalls / bad ids).
+///
+/// Subsequent instructions in the same SPU block keep emitting into
+/// the post-call continue block — Cranelift sees the call's only
+/// non-error path is the continue block, so codegen stays correct.
+fn emit_channel_helper_call(
+    builder: &mut FunctionBuilder,
+    state: Value,
+    state_var: Variable,
+    helper: FuncRef,
+    rt: u8,
+    channel: u32,
+    pc: u32,
+) {
+    let rt_v = builder.ins().iconst(I32, rt as i64);
+    let ch_v = builder.ins().iconst(I32, channel as i64);
+    let call = builder.ins().call(helper, &[state, rt_v, ch_v]);
+    let outcome = builder.inst_results(call)[0];
+
+    let zero = builder.ins().iconst(I32, 0);
+    let is_ok = builder.ins().icmp(IntCC::Equal, outcome, zero);
+
+    let continue_block = builder.create_block();
+    let stall_block = builder.create_block();
+
+    builder.ins().brif(is_ok, continue_block, &[], stall_block, &[]);
+
+    // Stall path: write current pc, return JIT_OUTCOME_STALL.
+    builder.switch_to_block(stall_block);
+    let stall_state = builder.use_var(state_var);
+    let v_pc = builder.ins().iconst(I32, pc as i64);
+    let pc_off = std::mem::offset_of!(JitState, pc) as i32;
+    builder.ins().store(MemFlags::trusted(), v_pc, stall_state, pc_off);
+    let v_stall = builder.ins().iconst(I32, JIT_OUTCOME_STALL as i64);
+    builder.ins().return_(&[v_stall]);
+
+    // Continue path: subsequent instructions in this SPU block emit
+    // into continue_block. The state pointer flowed through state_var
+    // so we don't need to re-thread it here.
+    builder.switch_to_block(continue_block);
+}
+
+/// R5.1: emit codegen for `rchcnt rt, ch` against a constant-count
+/// channel. Output layout matches the interpreter's
+/// `join_lanes([1, 0, 0, 0])` — lane 0 (preferred slot, high u32) is
+/// 1, the other three lanes are 0.
+fn emit_rchcnt_const_one(builder: &mut FunctionBuilder, state: Value, rt: usize) {
+    let one = builder.ins().iconst(I32, 1);
+    let zero = builder.ins().iconst(I32, 0);
+    builder.ins().store(
+        MemFlags::trusted(), one, state,
+        gpr_lane_offset(rt, 0) as i32,
+    );
+    for lane in 1..4 {
+        builder.ins().store(
+            MemFlags::trusted(), zero, state,
+            gpr_lane_offset(rt, lane) as i32,
+        );
     }
 }
 
@@ -2959,8 +3304,12 @@ mod tests {
     fn jit_compiles_andbi_byte_immediate_and() {
         // andbi rt, ra, imm8: rt = ra & broadcast(imm8) per byte.
         // ra = 0xFFFFFFFF × 4, imm8 = 0x55 → rt = 0x55555555 × 4.
+        // R5.10i: imm8 occupies LSB-0 bits 14..21 per RPCS3
+        // `bf_t<u32, 14, 8> i8`. The pre-R5.10i version of this helper
+        // used `<< 16`, which silently aligned with a buggy decoder
+        // shift of `(raw >> 16)`; both have been corrected to `<< 14`.
         let andbi = |rt: u32, ra: u32, imm8: u32|
-            (0x16u32 << 24) | ((imm8 & 0xFF) << 16) | ((ra & 0x7F) << 7) | (rt & 0x7F);
+            (0x16u32 << 24) | ((imm8 & 0xFF) << 14) | ((ra & 0x7F) << 7) | (rt & 0x7F);
         let ls = make_ls(0x100, &[andbi(5, 3, 0x55), stop_op(0)]);
         let mut backend = JitBackend::new();
         let func = backend.compile_at(&ls, 0x100).expect("compile");
@@ -2975,8 +3324,10 @@ mod tests {
     #[test]
     fn jit_compiles_ceqbi_per_byte_compare_with_imm() {
         // ceqbi rt, ra, imm8: 0xFF where byte == imm8, 0 else.
+        // R5.10i: imm8 occupies LSB-0 bits 14..21 (was buggy `<< 16`
+        // pre-R5.10i; aligned with the corrected decoder).
         let ceqbi = |rt: u32, ra: u32, imm8: u32|
-            (0x7Eu32 << 24) | ((imm8 & 0xFF) << 16) | ((ra & 0x7F) << 7) | (rt & 0x7F);
+            (0x7Eu32 << 24) | ((imm8 & 0xFF) << 14) | ((ra & 0x7F) << 7) | (rt & 0x7F);
         let ls = make_ls(0x100, &[ceqbi(5, 3, 0xAB), stop_op(0)]);
         let mut backend = JitBackend::new();
         let func = backend.compile_at(&ls, 0x100).expect("compile");

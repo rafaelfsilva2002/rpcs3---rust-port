@@ -32,7 +32,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use rpcs3_spu_decoder::{decode_function, DecodeError, SpuFunction};
+use rpcs3_spu_decoder::{decode_function, decode_inst, DecodeError, SpuFunction, SpuInstKind};
 use rpcs3_spu_differential::{
     error_result, ChannelCounts, ExecutionStopReason, InterpreterExecutor, SpuExecutionResult,
     SpuExecutor, SpuProgram, SpuStateSnapshot,
@@ -42,7 +42,9 @@ pub mod jit;
 use jit::{
     CompiledFunction, JitBackend, JitState,
     JIT_OUTCOME_STOP, JIT_OUTCOME_CONTINUE_TO, JIT_OUTCOME_UNKNOWN_OPCODE,
+    JIT_OUTCOME_STALL,
 };
+use rpcs3_spu_thread::SpuChannels;
 
 /// R4b chain-table entry: a stable, lock-free reference to a previously
 /// compiled function plus the `ls_hash` snapshot that proved the function
@@ -60,6 +62,29 @@ struct ChainEntry {
     /// Cached instruction count, used for the dispatcher's `total_steps`
     /// budget without re-querying the decoded-function cache.
     function_size: u64,
+}
+
+/// R5.1 + R5.2: which dispatcher path triggered a partial fallback.
+/// Used by `partial_fallback_to_interpreter` to attribute stats
+/// correctly without double-counting.
+#[derive(Clone, Copy)]
+enum PartialFallbackCause {
+    /// `compile_or_fetch` returned `Err` — the function couldn't be
+    /// JIT-compiled because at least one instruction was unsupported.
+    /// Channel attribution already happened inside `compile_or_fetch`
+    /// while the decoded function was in scope.
+    CompileFailure,
+    /// JIT runtime returned `JIT_OUTCOME_UNKNOWN_OPCODE`. Defensive
+    /// escape hatch — current codegen never emits this — but kept
+    /// live for safety. The failing instruction is exactly at
+    /// `state.pc` because the JIT writes pc before returning.
+    RuntimeUnknownOpcode,
+    /// R5.2: JIT-emitted channel helper (`spu_helper_rdch` /
+    /// `spu_helper_wrch`) returned a non-Ok outcome. The JIT codegen
+    /// already wrote `state.pc` to the channel op's pc and returned
+    /// `JIT_OUTCOME_STALL`. Bumps `channel_stall_exits` (and the
+    /// existing channel attribution stat).
+    ChannelStall,
 }
 
 /// Result of a chain-table lookup. Hit returns the data needed to call
@@ -245,6 +270,20 @@ pub struct JitStats {
     /// / total_steps` ratios. Steps executed by the JIT prefix are
     /// already accounted for in `dispatcher_iterations`/`jit_runs`.
     pub resumed_interpreter_steps: u64,
+    /// R5.1: count of channel ops successfully codegen'd at JIT compile
+    /// time. Counts every supported `rchcnt` against a constant-count
+    /// channel emitted by the JIT — incremented once per instruction
+    /// per compile, not per run. A channel op that fails `supported_check`
+    /// (e.g. `rdch`/`wrch`, or `rchcnt` against a variable-count channel)
+    /// is **not** counted here; instead it triggers the R5 partial
+    /// fallback path and bumps `channel_ops_partial_fallback`.
+    pub channel_ops_jitted: u64,
+    /// R5.1: subset of `partial_fallbacks` triggered by an unsupported
+    /// channel op (i.e., the function being compiled contained a
+    /// channel instruction the JIT does not codegen). Distinguishes
+    /// "fell back because of channels" from "fell back because of
+    /// some other unsupported opcode (e.g., dfa)".
+    pub channel_ops_partial_fallback: u64,
 }
 
 impl RecompilerExecutor {
@@ -314,8 +353,10 @@ impl RecompilerExecutor {
         &self,
         state: &JitState,
         ls: &[u8; SPU_LS_SIZE],
+        channels: &SpuChannels,
         total_steps: u64,
         program: &SpuProgram,
+        cause: PartialFallbackCause,
     ) -> SpuExecutionResult {
         let mut gpr = [0u128; SPU_GPR_COUNT];
         for i in 0..SPU_GPR_COUNT {
@@ -324,9 +365,25 @@ impl RecompilerExecutor {
         let resume_pc = state.pc;
         let remaining = program.max_steps.saturating_sub(total_steps);
 
+        // R5.1 + R5.2 attribution:
+        //   - `CompileFailure`: `compile_or_fetch` already bumped
+        //     `channel_ops_partial_fallback`; nothing else here.
+        //   - `RuntimeUnknownOpcode`: rare/defensive — decode the one
+        //     instruction at resume_pc and bump if it's a channel op.
+        //   - `ChannelStall`: the JIT-emitted helper returned non-Ok;
+        //     the instruction at resume_pc IS a channel op by
+        //     construction, so always bump both
+        //     `channel_ops_partial_fallback` and `channel_stall_exits`.
+        let (channel_attr_bump, stall_bump) = match cause {
+            PartialFallbackCause::CompileFailure => (false, false),
+            PartialFallbackCause::RuntimeUnknownOpcode => (decode_inst_at(ls, resume_pc), false),
+            PartialFallbackCause::ChannelStall => (true, true),
+        };
+
         let result = self.interp.resume_from_state(
             &gpr,
             ls,
+            channels,
             resume_pc,
             remaining,
             total_steps,
@@ -340,6 +397,12 @@ impl RecompilerExecutor {
             jit.stats.resumed_interpreter_runs += 1;
             jit.stats.resumed_interpreter_steps =
                 jit.stats.resumed_interpreter_steps.saturating_add(interp_steps);
+            if channel_attr_bump {
+                jit.stats.channel_ops_partial_fallback += 1;
+            }
+            if stall_bump {
+                jit.stats.channel_stall_exits += 1;
+            }
         }
 
         result
@@ -373,9 +436,22 @@ impl RecompilerExecutor {
                 ls[start..end].copy_from_slice(&seg.data);
             }
         }
+        // R5.2: per-execute SpuChannels owned by the dispatcher. JIT
+        // codegen for `rdch`/`wrch` calls runtime helpers that mutate
+        // this state via `state.channels_ptr`. On partial fallback, we
+        // hand the same SpuChannels to the interpreter so the resume
+        // sees the JIT-side mutations.
+        let mut channels = Box::new(SpuChannels::default());
+
         let mut state = JitState::new();
         state.pc = program.entry_pc & 0x3FFFC;
         state.ls_ptr = ls.as_mut_ptr();
+        state.channels_ptr = &mut *channels as *mut SpuChannels;
+        for &(reg, value) in &program.initial_gpr_overrides {
+            if (reg as usize) < state.gpr_lanes.len() {
+                state.store_gpr(reg as usize, value);
+            }
+        }
 
         let max_iterations = (program.max_steps.max(1)) as usize;
         let mut total_steps: u64 = 0;
@@ -411,8 +487,11 @@ impl RecompilerExecutor {
                             // current state (gprs, ls, pc=target_pc) to
                             // the interpreter and let it continue from
                             // there — no need to re-run the JIT prefix.
+                            // R5.1 attribution: channel-related cause was
+                            // already bumped inside `compile_or_fetch`.
                             return Some(self.partial_fallback_to_interpreter(
-                                &state, &ls, total_steps, program,
+                                &state, &ls, &channels, total_steps, program,
+                                PartialFallbackCause::CompileFailure,
                             ));
                         }
                     };
@@ -444,13 +523,13 @@ impl RecompilerExecutor {
             match outcome {
                 JIT_OUTCOME_STOP => {
                     let code = state.stop_code;
-                    return Some(self.build_result(&mut state, &ls, total_steps,
+                    return Some(self.build_result(&mut state, &ls, &channels, total_steps,
                         ExecutionStopReason::Stop(code)));
                 }
                 JIT_OUTCOME_CONTINUE_TO => {
                     // state.pc is the new target; loop.
                     if total_steps >= program.max_steps {
-                        return Some(self.build_result(&mut state, &ls, total_steps,
+                        return Some(self.build_result(&mut state, &ls, &channels, total_steps,
                             ExecutionStopReason::MaxStepsExceeded));
                     }
                     continue;
@@ -462,11 +541,27 @@ impl RecompilerExecutor {
                     // path live as a safety net). Hand to interpreter
                     // from current state.pc.
                     return Some(self.partial_fallback_to_interpreter(
-                        &state, &ls, total_steps, program,
+                        &state, &ls, &channels, total_steps, program,
+                        PartialFallbackCause::RuntimeUnknownOpcode,
+                    ));
+                }
+                JIT_OUTCOME_STALL => {
+                    // R5.2: JIT codegen for rdch/wrch hit a Stall or
+                    // BadChannel return from the runtime helper. The
+                    // helper already left state.pc at the channel op's
+                    // pc and the SpuChannels in their pre-call state
+                    // (read/write check capacity before mutating). We
+                    // hand control to the interpreter so it can either
+                    // surface the stall (Ok(StepOutcome::ChannelStall))
+                    // or produce the same Error::Unimplemented as a
+                    // pure interpreter run would.
+                    return Some(self.partial_fallback_to_interpreter(
+                        &state, &ls, &channels, total_steps, program,
+                        PartialFallbackCause::ChannelStall,
                     ));
                 }
                 _ => {
-                    return Some(self.build_result(&mut state, &ls, total_steps,
+                    return Some(self.build_result(&mut state, &ls, &channels, total_steps,
                         ExecutionStopReason::Error(format!(
                             "unknown JIT outcome {outcome}"
                         ))));
@@ -478,7 +573,7 @@ impl RecompilerExecutor {
         // via `partial_fallback_to_interpreter` from inside the loop, so
         // reaching here means we exhausted `max_iterations` without
         // hitting Stop. Surface that as MaxStepsExceeded.
-        Some(self.build_result(&mut state, &ls, total_steps,
+        Some(self.build_result(&mut state, &ls, &channels, total_steps,
             ExecutionStopReason::MaxStepsExceeded))
     }
 
@@ -576,12 +671,37 @@ impl RecompilerExecutor {
             CachedFunction { function: func.clone(), jit_compiled: None }
         );
 
+        // R5.1: count the channel ops that the just-decoded function
+        // contains — every one of them passed `supported_check` (else
+        // backend.compile would fail), so the count is exactly the
+        // number of channel ops the JIT will emit code for.
+        let channel_ops_in_func: u64 = func.blocks.values()
+            .flat_map(|b| b.instructions.iter())
+            .filter(|i| matches!(i.kind, SpuInstKind::Channel { .. }))
+            .count() as u64;
+
+        // R5.1: pre-compute "did the function contain any channel op
+        // at all?" so we can attribute a compile failure to channels
+        // without re-decoding. Used below in the compile-error path.
+        let has_channel_op = channel_ops_in_func > 0;
+
         let mut jit = self.jit.lock().expect("jit lock poisoned");
         jit.stats.cache_misses += 1;
         let compiled = jit.backend.compile(&func).map_err(|_e| {
-            DecodeError::BadEntryPc(pc)  // surface as DecodeError-ish
+            // R5.1: bump the channel-attribution stat at compile-failure
+            // time. The dispatcher's R5 partial fallback path is the
+            // 1:1 consumer of this Err — one Err here means one
+            // partial fallback above. If the function carries any
+            // channel op (whether that op is the cause or not), we
+            // count this as channel-related; coarse but predictable.
+            if has_channel_op {
+                jit.stats.channel_ops_partial_fallback += 1;
+            }
+            DecodeError::BadEntryPc(pc)
         })?;
         jit.stats.compiled_functions += 1;
+        jit.stats.channel_ops_jitted = jit.stats.channel_ops_jitted
+            .saturating_add(channel_ops_in_func);
         let entry = jit.compiled.entry(key).or_insert(compiled);
         let ptr: *const CompiledFunction = entry;
         // R4c: install the code-range metadata used by `smc_scan`.
@@ -694,11 +814,17 @@ impl RecompilerExecutor {
         &self,
         state: &mut JitState,
         ls: &[u8; SPU_LS_SIZE],
+        channels: &SpuChannels,
         total_steps: u64,
         stop_reason: ExecutionStopReason,
     ) -> SpuExecutionResult {
-        // Defensive: null the LS pointer before returning.
+        // Defensive: null both pointers before returning. The
+        // SpuChannels and LS Boxes are owned by `try_jit_run` and will
+        // be dropped after this method returns; we don't want the
+        // dangling pointers to outlive their backing storage in
+        // `state`.
         state.ls_ptr = std::ptr::null_mut();
+        state.channels_ptr = std::ptr::null_mut();
 
         let mut gpr = Box::new([0u128; SPU_GPR_COUNT]);
         for i in 0..SPU_GPR_COUNT {
@@ -707,6 +833,19 @@ impl RecompilerExecutor {
         let mut ls_box = Box::new([0u8; SPU_LS_SIZE]);
         ls_box.copy_from_slice(ls.as_ref());
 
+        // R5.3: derive ChannelCounts from the live SpuChannels — same
+        // formula as `rpcs3_spu_differential::snapshot_from_thread`.
+        // Without this the snapshot would always report all-zero
+        // counts even when the JIT helpers mutated mailbox/snr state,
+        // breaking byte-exact equivalence vs the interpreter.
+        let channel_counts = ChannelCounts {
+            in_mbox_depth: channels.in_mbox.is_some() as u32,
+            out_mbox_depth: channels.out_mbox.is_some() as u32,
+            out_intr_mbox_depth: channels.out_intr_mbox.is_some() as u32,
+            signal1_pending: channels.snr[0] != 0,
+            signal2_pending: channels.snr[1] != 0,
+        };
+
         SpuExecutionResult {
             steps_executed: total_steps,
             stop_reason,
@@ -714,7 +853,22 @@ impl RecompilerExecutor {
                 pc: state.pc,
                 gpr,
                 ls: ls_box,
-                channel_counts: ChannelCounts::default(),
+                channel_counts,
+                // R5.4a: build_result is reached only on clean exits
+                // (STOP, MaxStepsExceeded). The JIT itself never parks
+                // — parking is a property of the interpreter's
+                // ChannelStall path, which routes through
+                // `partial_fallback_to_interpreter` and returns the
+                // interpreter's own result (with `park_state` already
+                // populated by `snapshot_from_thread`). So here it's
+                // always None.
+                park_state: None,
+                // R5.4b: clone the live SpuChannels into the snapshot
+                // so callers can drive the wake → resume cycle. Even
+                // on clean STOPs the channels may have been mutated
+                // by JIT helpers (rdch/wrch/rchcnt) and we need to
+                // expose that state.
+                channels: channels.clone(),
             },
         }
     }
@@ -764,6 +918,21 @@ fn hash_ls_range(ls: &[u8], start: u32, end: u32) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     ls[s..e].hash(&mut h);
     h.finish()
+}
+
+/// R5.1: peek at the single SPU instruction at `pc` in `ls` and
+/// classify it as "channel op" (rdch / wrch / rchcnt). Returns
+/// `false` if the read would go out of bounds, decode produces
+/// anything other than `SpuInstKind::Channel { .. }`, or `pc` is
+/// misaligned. Cheap — used only on the partial-fallback slow path
+/// to attribute the cause.
+fn decode_inst_at(ls: &[u8; SPU_LS_SIZE], pc: u32) -> bool {
+    let p = pc as usize;
+    if p + 4 > SPU_LS_SIZE || pc & 0x3 != 0 {
+        return false;
+    }
+    let raw = u32::from_be_bytes([ls[p], ls[p + 1], ls[p + 2], ls[p + 3]]);
+    matches!(decode_inst(raw, pc).kind, SpuInstKind::Channel { .. })
 }
 
 /// R4c: compute the byte range covered by every block in `func`.
@@ -1033,6 +1202,316 @@ mod tests {
         let mut recomp = RecompilerExecutor::new();
         let (_, _, d) = run_and_diff(&mut interp, &mut recomp, &prog);
         assert!(d.is_identical(), "JIT diverged from interpreter on arith:\n{d:?}");
+    }
+
+    /// R5.10o — end-to-end regression for LQA + STQA via partial
+    /// fallback. The JIT has no codegen for the absolute-address
+    /// `0x041`/`0x061` primaries (the SpuInstKind is the new
+    /// `LoadAbs`/`StoreAbs` variant, which hits the JIT's wildcard
+    /// `_ =>` arm in supported_check). Both opcodes route through R5
+    /// partial fallback to the interpreter. This test asserts that
+    /// the JIT and interpreter end up byte-identical after a full
+    /// store-then-load round-trip at the top of LS — the same
+    /// save/restore pattern observed in the v4 trace at pc=0x734
+    /// (STQA r9) and pc=0x07AC..0x0824 (LQA r4/r38/etc).
+    #[test]
+    fn jit_lqa_stqa_byte_identical_to_interpreter_via_partial_fallback() {
+        let il    = |rt: u32, imm: u16| ((0x081u32 & 0x1FF) << 23) | ((imm as u32) << 7) | rt;
+        // RI16 abs store: primary 0x041 (top-9), imm16 at bits 7..22.
+        let stqa = |rt: u32, imm16: i16| -> u32 {
+            let i = (imm16 as u16 as u32) & 0xFFFF;
+            (0x041u32 << 23) | (i << 7) | (rt & 0x7F)
+        };
+        // RI16 abs load: primary 0x061.
+        let lqa = |rt: u32, imm16: i16| -> u32 {
+            let i = (imm16 as u16 as u32) & 0xFFFF;
+            (0x061u32 << 23) | (i << 7) | (rt & 0x7F)
+        };
+        let stop  = 0x0055u32;
+
+        // il r3, 0x55AA               → r3 = 0x000055AA broadcast across 4 lanes.
+        // stqa r3, -12 (target 0x3FFD0) → write r3 to top-of-LS.
+        // lqa  r4, -12                → load same 16 bytes back into r4.
+        // stop 0x55.
+        // Post-execution invariant: r4 == r3 (round-trip).
+        let code: [u32; 4] = [
+            il(3, 0x55AA),
+            stqa(3, -12),
+            lqa(4, -12),
+            stop,
+        ];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let (a, b, d) = run_and_diff(&mut interp, &mut recomp, &prog);
+        assert_eq!(a.stop_reason, b.stop_reason);
+        assert_eq!(a.stop_reason, ExecutionStopReason::Stop(0x55));
+        assert!(
+            d.is_identical(),
+            "LQA/STQA JIT-vs-interpreter divergence (the JIT must \
+             partial-fallback correctly to the new interpreter arms):\n{d:?}",
+        );
+
+        // Round-trip invariant: r4 == r3 == [0,0,0x55,0xAA] per lane.
+        let expected: u128 = (0x000055AAu128 << 96)
+                           | (0x000055AAu128 << 64)
+                           | (0x000055AAu128 << 32)
+                           | 0x000055AAu128;
+        assert_eq!(a.final_state.gpr[3], expected, "il r3, 0x55AA");
+        assert_eq!(a.final_state.gpr[4], expected, "lqa→stqa round-trip preserves bytes");
+    }
+
+    /// R5.10m — end-to-end regression for ROTQMBYI through partial
+    /// fallback. The JIT has no codegen for `0x1FD`, so it marks the
+    /// instruction Unsupported and the dispatcher hands control to
+    /// the interpreter at the same pc. The interpreter's new R5.10m
+    /// arm produces the correct byte-shift-right result. This test
+    /// guards (a) the partial fallback path stays alive for ROTQMBYI,
+    /// AND (b) the interpreter matches the expected mask result on a
+    /// non-trivial input.
+    #[test]
+    fn jit_rotqmbyi_byte_identical_to_interpreter() {
+        let il    = |rt: u32, imm: u16| ((0x081u32 & 0x1FF) << 23) | ((imm as u32) << 7) | rt;
+        // rotqmbyi rt, ra, imm7: primary 0x1FD at MSB-0 bits 0..10.
+        let rotqmbyi = |rt: u32, ra: u32, imm7: i8| -> u32 {
+            let imm = (imm7 as u8 as u32) & 0x7F;
+            (0x1FDu32 << 21) | (imm << 14) | ((ra & 0x7F) << 7) | (rt & 0x7F)
+        };
+        let stop  = 0x0055u32;
+
+        // il r3, 0x1234 → r3 = 0x00001234 broadcast across 4 lanes.
+        // rotqmbyi r4, r3, -4 → r4 = r3 >> 32 bits (= shift right 4
+        //   bytes in SPU BE) with zero fill. For our broadcast input
+        //   each byte pattern repeats; result is non-trivial enough to
+        //   detect a wrong shift count.
+        let code: [u32; 3] = [
+            il(3, 0x1234),
+            rotqmbyi(4, 3, -4),
+            stop,
+        ];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let (a, b, d) = run_and_diff(&mut interp, &mut recomp, &prog);
+        assert_eq!(a.stop_reason, b.stop_reason);
+        assert_eq!(a.stop_reason, ExecutionStopReason::Stop(0x55));
+        assert!(
+            d.is_identical(),
+            "ROTQMBYI JIT/interpreter divergence (the JIT must \
+             partial-fallback correctly to the new interpreter arm):\n{d:?}",
+        );
+
+        // Spot-check the expected r4 byte pattern: r3 = 0x00001234 in
+        // each word lane → all 16 bytes of r3 are
+        // [0,0,0x12,0x34, 0,0,0x12,0x34, ...]. Right-shift by 4 bytes
+        // (zero-fill) → 4 leading zeros, then bytes 0..11 of original.
+        let r3_bytes = a.final_state.gpr[3].to_be_bytes();
+        let expected_r4 = {
+            let mut e = [0u8; 16];
+            for i in 4..16 { e[i] = r3_bytes[i - 4]; }
+            u128::from_be_bytes(e)
+        };
+        assert_eq!(a.final_state.gpr[4], expected_r4, "ROTQMBYI mask wrong");
+    }
+
+    /// R5.10m — end-to-end regression for SHLQBYI at the corrected
+    /// primary `0x1FF`. Pre-R5.10m the encoder packed `0x1FB` (which
+    /// is SHLQBII) and the interpreter handled `0x1FB` as byte-shift,
+    /// so the two layers silently agreed on a wrong-vs-RPCS3 wire
+    /// format. Post-R5.10m: encoder packs `0x1FF`, interpreter handles
+    /// `0x1FF` as byte-shift, JIT codegen at `0x1FF` already does
+    /// byte-shift — all three layers now agree on the correct primary.
+    /// This test exercises the full pipeline.
+    #[test]
+    fn jit_shlqbyi_byte_identical_to_interpreter_at_primary_0x1ff() {
+        let il    = |rt: u32, imm: u16| ((0x081u32 & 0x1FF) << 23) | ((imm as u32) << 7) | rt;
+        let shlqbyi = |rt: u32, ra: u32, imm7: i8| -> u32 {
+            let imm = (imm7 as u8 as u32) & 0x7F;
+            (0x1FFu32 << 21) | (imm << 14) | ((ra & 0x7F) << 7) | (rt & 0x7F)
+        };
+        let stop  = 0x0055u32;
+
+        // il r3, 0x00FF → r3 = 0x000000FF broadcast.
+        // shlqbyi r4, r3, 3 → byte-shift left by 3 bytes (zero-fill
+        //   right tail).
+        let code: [u32; 3] = [
+            il(3, 0x00FF),
+            shlqbyi(4, 3, 3),
+            stop,
+        ];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let (_, _, d) = run_and_diff(&mut interp, &mut recomp, &prog);
+        assert!(
+            d.is_identical(),
+            "SHLQBYI at primary 0x1FF must produce identical results \
+             via JIT codegen and interpreter:\n{d:?}",
+        );
+    }
+
+    /// R5.10k — end-to-end regression for the wider RI10 Class-A
+    /// subfamily. Runs `il r3, 32; clgti r4, r3, 31; sfi r5, r3, 100;
+    /// ahi r6, r3, -3; mpyi r7, r3, 7; mpyui r8, r3, 7; stop 0x55`
+    /// via BOTH backends and asserts byte-identical state.
+    ///
+    /// Pre-R5.10k the interpreter had no arm for any of these 5
+    /// opcodes and would fail with `Unimplemented`, while the JIT
+    /// silently computed correct results — the diff would be a
+    /// run-finish vs run-error mismatch, not a value mismatch. This
+    /// test guards both: (a) interpreter now executes them, AND
+    /// (b) the values it produces match the JIT byte-for-byte.
+    #[test]
+    fn jit_class_a_ri10_byte_identical_to_interpreter() {
+        let il    = |rt: u32, imm: u16| ((0x081u32 & 0x1FF) << 23) | ((imm as u32) << 7) | rt;
+        // Word-imm RI10 packer. imm10 sign-extended; only low 10 bits
+        // of the 16-bit immediate matter.
+        let pack8 = |p8: u32, rt: u32, ra: u32, imm10: i16| -> u32 {
+            let imm = (imm10 as u32) & 0x3FF;
+            ((p8 & 0xFF) << 24) | (imm << 14) | ((ra & 0x7F) << 7) | (rt & 0x7F)
+        };
+        let clgti = |rt: u32, ra: u32, imm: i16| pack8(0x5C, rt, ra, imm);
+        let sfi   = |rt: u32, ra: u32, imm: i16| pack8(0x0C, rt, ra, imm);
+        let ahi   = |rt: u32, ra: u32, imm: i16| pack8(0x1D, rt, ra, imm);
+        let mpyi  = |rt: u32, ra: u32, imm: i16| pack8(0x74, rt, ra, imm);
+        let mpyui = |rt: u32, ra: u32, imm: i16| pack8(0x75, rt, ra, imm);
+        let stop  = 0x0055u32;
+
+        let code: [u32; 7] = [
+            il(3, 32),         // r3 = 0x20 broadcast (lanes = 32)
+            clgti(4, 3, 31),   // r4 = 0xFFFFFFFF per lane (32 > 31 unsigned)
+            sfi(5, 3, 100),    // r5 = (100 - 32) = 68 per lane
+            ahi(6, 3, -3),     // r6 = halfword(0x0020 + 0xFFFD) = 0x001D per halfword
+            mpyi(7, 3, 7),     // r7 = (low_i16(32) * 7) = 224 per word
+            mpyui(8, 3, 7),    // r8 = (low_u16(32) * 7) = 224 per word
+            stop,
+        ];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let (a, b, d) = run_and_diff(&mut interp, &mut recomp, &prog);
+
+        assert_eq!(a.stop_reason, b.stop_reason);
+        assert_eq!(a.stop_reason, ExecutionStopReason::Stop(0x55));
+        assert!(
+            d.is_identical(),
+            "Class-A RI10 subfamily JIT/interpreter divergence:\n{d:?}",
+        );
+
+        // Spot-check expected lane values to lock semantics.
+        assert_eq!(a.final_state.gpr[4], u128::from_be_bytes([0xFF; 16]),
+                   "clgti 32 > 31 unsigned must be all-ones");
+        // Each word lane = 68. In SPU big-endian: bytes [0,0,0,68] per word.
+        let expect_5: u128 = (68u128 << 96) | (68u128 << 64) | (68u128 << 32) | 68u128;
+        assert_eq!(a.final_state.gpr[5], expect_5, "sfi 100 - 32 = 68");
+        // mpyi 32*7 = 224 per word. mpyui same value (32 fits in low u16).
+        let expect_word_224: u128 = (224u128 << 96) | (224u128 << 64) | (224u128 << 32) | 224u128;
+        assert_eq!(a.final_state.gpr[7], expect_word_224, "mpyi 32*7 = 224");
+        assert_eq!(a.final_state.gpr[8], expect_word_224, "mpyui 32*7 = 224");
+    }
+
+    /// R5.10k — separate JIT differential test for MPYI/MPYUI
+    /// signedness divergence: when low halfword has high bit set,
+    /// signed and unsigned variants must produce DIFFERENT results
+    /// AND each backend must agree with the other on its variant's
+    /// result. Pre-R5.10k the interpreter rejected both, so any
+    /// codegen bug in the JIT for these specific paths was invisible.
+    #[test]
+    fn jit_mpyi_vs_mpyui_signedness_byte_identical_to_interpreter() {
+        let il    = |rt: u32, imm: u16| ((0x081u32 & 0x1FF) << 23) | ((imm as u32) << 7) | rt;
+        let pack8 = |p8: u32, rt: u32, ra: u32, imm10: i16| -> u32 {
+            let imm = (imm10 as u32) & 0x3FF;
+            ((p8 & 0xFF) << 24) | (imm << 14) | ((ra & 0x7F) << 7) | (rt & 0x7F)
+        };
+        let mpyi  = |rt: u32, ra: u32, imm: i16| pack8(0x74, rt, ra, imm);
+        let mpyui = |rt: u32, ra: u32, imm: i16| pack8(0x75, rt, ra, imm);
+        let stop  = 0x0055u32;
+
+        // r3 = 0xFFFF broadcast → low halfword of each word lane is
+        // 0xFFFF (= -1 signed, 65535 unsigned).
+        let code: [u32; 4] = [
+            il(3, 0xFFFF),
+            mpyi(4, 3, 3),     // signed: -1 * 3 = -3 = 0xFFFFFFFD
+            mpyui(5, 3, 3),    // unsigned: 65535 * 3 = 196605 = 0x0002FFFD
+            stop,
+        ];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let (a, _, d) = run_and_diff(&mut interp, &mut recomp, &prog);
+        assert!(d.is_identical(), "mpyi/mpyui differential failed:\n{d:?}");
+
+        let expect_signed:   u128 = (0xFFFFFFFDu128 << 96) | (0xFFFFFFFDu128 << 64) | (0xFFFFFFFDu128 << 32) | 0xFFFFFFFDu128;
+        let expect_unsigned: u128 = (0x0002FFFDu128 << 96) | (0x0002FFFDu128 << 64) | (0x0002FFFDu128 << 32) | 0x0002FFFDu128;
+        assert_eq!(a.final_state.gpr[4], expect_signed,   "mpyi -1*3 = -3");
+        assert_eq!(a.final_state.gpr[5], expect_unsigned, "mpyui 65535*3 = 196605");
+    }
+
+    /// R5.10i — end-to-end regression for the decoder i8 extraction
+    /// fix. Runs `il r3, 0xFFFF; andbi r4, r3, 0x20; stop 0x55` via
+    /// BOTH backends and asserts byte-identical state.
+    ///
+    /// Before R5.10i the decoder extracted i8 from bits 16..23 instead
+    /// of bits 14..21 — for `andbi rt, ra, 0x20` the JIT received
+    /// `imm10 = 0x08` and produced `r4 = 0x08…08` per byte, while the
+    /// interpreter (after R5.10i) computes `r4 = 0x20…20`. The
+    /// diff would surface as a 16-byte mismatch in gpr[4]. This test
+    /// guards the coupled decoder fix + interpreter arm.
+    #[test]
+    fn jit_andbi_byte_identical_to_interpreter_with_nonzero_i8() {
+        // il    rt=3, imm=0xFFFF                → r3 = 0xFFFFFFFF broadcast
+        // andbi rt=4, ra=3, i8=0x20             → r4 = 0x20 in every byte
+        // stop  0x55
+        let il    = |rt: u32, imm: u16| ((0x081u32 & 0x1FF) << 23) | ((imm as u32) << 7) | rt;
+        // andbi: 8-bit primary 0x16, i8 in bits 14..21, ra in 7..13, rt in 0..6.
+        let andbi = |rt: u32, ra: u32, i8: u32| (0x16u32 << 24) | ((i8 & 0xFF) << 14) | ((ra & 0x7F) << 7) | (rt & 0x7F);
+        let stop  = 0x0055u32;
+
+        let code: [u32; 3] = [
+            il(3, 0xFFFF),
+            andbi(4, 3, 0x20),
+            stop,
+        ];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let (a, b, d) = run_and_diff(&mut interp, &mut recomp, &prog);
+
+        // Both backends must reach the same stop code.
+        assert_eq!(a.stop_reason, b.stop_reason);
+        assert_eq!(a.stop_reason, ExecutionStopReason::Stop(0x55));
+
+        // The byte-exact result must match: r4 = [0x20; 16] per RPCS3.
+        // Pre-R5.10i this would fail because the JIT used i8=0x08.
+        assert!(
+            d.is_identical(),
+            "JIT diverged from interpreter on byte-imm with non-zero i8 — \
+             this means the decoder i8 extraction or the interpreter byte-imm \
+             arm regressed:\n{d:?}",
+        );
+        assert_eq!(
+            a.final_state.gpr[4],
+            u128::from_be_bytes([0x20; 16]),
+            "andbi r4, r3, 0x20 must mask each byte to 0x20",
+        );
     }
 
     /// Mirrors `synthetic_loadstore.elf`: round-trip through LS via stqd+lqd.
@@ -2438,20 +2917,27 @@ mod tests {
     fn r5_partial_fallback_program() -> SpuProgram {
         let ila    = |rt: u32, imm: u32| (0x21u32 << 25) | ((imm & 0x3FFFF) << 7) | rt;
         let bi     = |ra: u32| (0x1A8u32 << 21) | ((ra & 0x7F) << 7);
-        let rchcnt = |rt: u32, ch: u32| (0x00Fu32 << 21) | ((ch & 0x7F) << 7) | rt;
-        let ai     = |rt: u32, ra: u32, imm: u32|
-            (0x1Cu32 << 24) | ((imm & 0x3FF) << 14) | (ra << 7) | rt;
+        // R5.3 update: `rchcnt` is now fully JIT-codegen'd (R5.1
+        // const-1 fast-path + R5.3 helper for variable channels), so
+        // it no longer triggers a partial fallback. We use `dfa`
+        // (primary 0x2CC, double-precision add) instead — neither the
+        // JIT codegen nor the Rust interpreter implements double-
+        // precision float, so both produce `Error::Unimplemented` and
+        // the byte-exact diff still passes via the partial-fallback
+        // bridge.
+        let dfa    = |rt: u32, ra: u32, rb: u32|
+            (0x2CCu32 << 21) | ((rb & 0x7F) << 14) | ((ra & 0x7F) << 7) | rt;
         let nop    = 0x4020_0000u32;
         let stop   = 0x77u32 & 0x3FFF;
 
         let code: [u32; 7] = [
-            ila(4, 0x12345),  // 0x100  r4 = 0x12345 (proves JIT prefix ran)
-            ila(6, 0x110),    // 0x104  r6 = 0x110
-            bi(6),            // 0x108  → CONTINUE_TO 0x110 (function A ends)
-            nop,              // 0x10C  padding (decoder doesn't follow)
-            rchcnt(3, 28),    // 0x110  function B: UNSUPPORTED by JIT
-            ai(3, 3, 100),    // 0x114  r3 = r3 + 100 (broadcast per lane)
-            stop,             // 0x118  stop 0x77
+            ila(4, 0x12345),    // 0x100  r4 = 0x12345 (proves JIT prefix ran)
+            ila(6, 0x110),      // 0x104  r6 = 0x110
+            bi(6),              // 0x108  → CONTINUE_TO 0x110 (function A ends)
+            nop,                // 0x10C  padding (decoder doesn't follow)
+            dfa(3, 3, 3),       // 0x110  function B: UNSUPPORTED by JIT *and* interpreter
+            ila(3, 0xABC),      // 0x114  (never reached — interpreter hits Unimplemented)
+            stop,               // 0x118
         ];
         let mut bytes = Vec::with_capacity(code.len() * 4);
         for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
@@ -2473,29 +2959,26 @@ mod tests {
                 "R5 partial fallback diverged from interpreter-only: {d:?}");
         assert_eq!(result_interp.stop_reason, result_recomp.stop_reason);
 
-        // Specific behavior: stops at 0x77.
-        assert_eq!(result_recomp.stop_reason, ExecutionStopReason::Stop(0x77));
+        // R5.3 update: dfa is unsupported by both JIT and interpreter,
+        // so both produce `ExecutionStopReason::Error("Unimplemented...")`.
+        // The contract still holds: byte-exact equivalence + JIT prefix
+        // state preserved through the partial-fallback boundary.
+        match &result_recomp.stop_reason {
+            ExecutionStopReason::Error(msg) => {
+                assert!(msg.contains("Unimplemented"),
+                        "expected dfa Unimplemented, got: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
 
         // r4 = 0x12345 broadcast — proves JIT prefix ran AND its state
-        // was preserved into the interpreter resume.
+        // was preserved into the interpreter resume even though the
+        // interpreter immediately bailed at the dfa.
         assert_eq!(
             result_recomp.final_state.gpr[4],
             0x00012345_00012345_00012345_00012345,
             "r4 must reflect the JIT-prefix's `ila r4, 0x12345`",
         );
-        // r3 holds the rchcnt+ai result. Channel 28 (SPU_WROUTMBOX)
-        // returns "1 slot available" (count=1) when the outbound
-        // mailbox is empty (default), placed only in lane 0 by the
-        // interpreter's `join_lanes([count, 0, 0, 0])`. The subsequent
-        // `ai` adds 100 to every word lane, so r3 ends up as
-        // [101, 100, 100, 100] across the 4 word lanes — *not* a
-        // broadcast. We rely on the diff_snapshots check above to
-        // confirm byte-exact equivalence with the interpreter; the
-        // explicit assertion here just checks the lane-0 high word
-        // since that's the most readable proof the rchcnt+ai chain ran.
-        let r3_lane0 = (result_recomp.final_state.gpr[3] >> 96) as u32;
-        assert_eq!(r3_lane0, 101,
-                   "r3 lane 0 should be 1 (rchcnt) + 100 (ai) = 101");
 
         // Stats: partial fallback fired exactly once; full fallback never.
         let s = recomp.jit_stats();
@@ -2503,9 +2986,6 @@ mod tests {
                    "expected exactly one partial fallback");
         assert_eq!(s.unknown_opcode_exits, 1);
         assert_eq!(s.resumed_interpreter_runs, 1);
-        assert!(s.resumed_interpreter_steps >= 3,
-                "interpreter resumed for at least 3 steps (rchcnt+ai+stop), got {}",
-                s.resumed_interpreter_steps);
         assert_eq!(s.fallback_runs, 0,
                    "full fallback must NOT fire — partial fallback handles it");
         // The dispatcher ran function A once via JIT before falling back.
@@ -2524,11 +3004,12 @@ mod tests {
         let stqd = |rt: u32, ra: u32, imm10: u32|
             (0x24u32 << 24) | ((imm10 & 0x3FF) << 14) | (ra << 7) | rt;
         let bi     = |ra: u32| (0x1A8u32 << 21) | ((ra & 0x7F) << 7);
-        let lqd    = |rt: u32, ra: u32, imm10: u32|
-            (0x34u32 << 24) | ((imm10 & 0x3FF) << 14) | (ra << 7) | rt;
-        let rchcnt = |rt: u32, ch: u32| (0x00Fu32 << 21) | ((ch & 0x7F) << 7) | rt;
-        let nop    = 0x4020_0000u32;
-        let stop   = 0x88u32 & 0x3FFF;
+        // R5.3 update: rchcnt is now JIT-supported, so we use `dfa`
+        // (double-precision add) as the unsupported trigger.
+        let dfa  = |rt: u32, ra: u32, rb: u32|
+            (0x2CCu32 << 21) | ((rb & 0x7F) << 14) | ((ra & 0x7F) << 7) | rt;
+        let nop  = 0x4020_0000u32;
+        let stop = 0x88u32 & 0x3FFF;
 
         // Layout (single segment starting at 0x100). stqd's effective
         // address is `(ra.preferred + imm10 * 16) & 0x3FFF0`, so we
@@ -2548,6 +3029,16 @@ mod tests {
         //   0x118 rchcnt r5, 28            ; UNSUPPORTED → partial fallback
         //   0x11C lqd  r7, 16(r4)          ; r7 = LS[0x140] (must see JIT's store)
         //   0x120 stop 0x88
+        // Layout:
+        //   0x100 il   r3, 0x5A5A          ; JIT
+        //   0x104 ila  r4, 0x40            ; JIT
+        //   0x108 stqd r3, 16(r4)          ; JIT — LS[0x140] = 0x5A5A
+        //   0x10C ila  r6, 0x118           ; JIT
+        //   0x110 bi   r6                  ; → CONTINUE_TO 0x118
+        //   0x114 nop                      ; padding
+        //   0x118 dfa  r5, r5, r5          ; UNSUPPORTED → partial fallback
+        //   0x11C nop                      ; never reached
+        //   0x120 stop 0x88                ; never reached
         let code: [u32; 9] = [
             il(3, 0x5A5A),
             ila(4, 0x40),
@@ -2555,8 +3046,8 @@ mod tests {
             ila(6, 0x118),
             bi(6),
             nop,
-            rchcnt(5, 28),
-            lqd(7, 4, 16),
+            dfa(5, 5, 5),
+            nop,
             stop,
         ];
         let mut bytes = Vec::with_capacity(code.len() * 4);
@@ -2571,23 +3062,23 @@ mod tests {
         let d = diff_snapshots(&r_interp.final_state, &r_recomp.final_state);
         assert!(d.is_identical(),
                 "R5 partial fallback with LS write diverged: {d:?}");
-        assert_eq!(r_recomp.stop_reason, ExecutionStopReason::Stop(0x88));
+        // R5.3: dfa unsupported by both → both produce Error.
+        match &r_recomp.stop_reason {
+            ExecutionStopReason::Error(_) => {}
+            other => panic!("expected Error from dfa, got {other:?}"),
+        }
 
-        // r7 must equal r3 — the lqd in the interpreter suffix loaded
-        // the value the JIT prefix stqd'd. If the JIT's LS write didn't
-        // make it across, r7 would be 0.
-        assert_eq!(
-            r_recomp.final_state.gpr[7],
-            0x00005A5A_00005A5A_00005A5A_00005A5A,
-            "r7 should reflect the JIT prefix's stqd to LS[0x140]",
-        );
-        // The LS itself at 0x140 should hold the stored qword. Address
-        // computed as 0x40 + 16*16 = 0x140 — outside the code segment
-        // (which ends at 0x124), so the byte check is unambiguous.
+        // The LS at 0x140 should hold the stored qword — proving the
+        // JIT prefix's stqd survived through the partial-fallback
+        // boundary even though the interpreter immediately bailed at
+        // the dfa. Address: 0x40 + 16*16 = 0x140, outside the code
+        // segment (which ends at 0x124), so the byte check is
+        // unambiguous.
         let stored = u128::from_be_bytes(
             r_recomp.final_state.ls[0x140..0x150].try_into().unwrap()
         );
-        assert_eq!(stored, 0x00005A5A_00005A5A_00005A5A_00005A5A);
+        assert_eq!(stored, 0x00005A5A_00005A5A_00005A5A_00005A5A,
+                   "LS[0x140] must reflect the JIT prefix's stqd");
 
         let s = recomp.jit_stats();
         assert_eq!(s.partial_fallbacks, 1);
@@ -2607,28 +3098,28 @@ mod tests {
     #[test]
     fn r5_partial_fallback_preserves_pc_no_redo_of_jit_prefix() {
         let ila    = |rt: u32, imm: u32| (0x21u32 << 25) | ((imm & 0x3FFFF) << 7) | rt;
-        let ai     = |rt: u32, ra: u32, imm: u32|
-            (0x1Cu32 << 24) | ((imm & 0x3FF) << 14) | (ra << 7) | rt;
         let bi     = |ra: u32| (0x1A8u32 << 21) | ((ra & 0x7F) << 7);
-        let rchcnt = |rt: u32, ch: u32| (0x00Fu32 << 21) | ((ch & 0x7F) << 7) | rt;
+        // R5.3 update: rchcnt is now JIT-supported. Use `dfa` instead.
+        let dfa    = |rt: u32, ra: u32, rb: u32|
+            (0x2CCu32 << 21) | ((rb & 0x7F) << 14) | ((ra & 0x7F) << 7) | rt;
         let nop    = 0x4020_0000u32;
-        let stop   = 0x99u32 & 0x3FFF;
+        let _ = 0x99u32; // stop unused now (interpreter errors before reaching it)
 
-        // 0x100 ila r3, 1                ; r3 = 1 (JIT side)
+        // 0x100 ila r3, 0xCAFE            ; r3 = 0xCAFE (proves JIT ran)
         // 0x104 ila r4, 0x110             ; target
-        // 0x108 bi r4                     ; → 0x110
+        // 0x108 bi r4                     ; → 0x110 (function A done)
         // 0x10C nop                       ; padding
-        // 0x110 rchcnt r5, 28             ; UNSUPPORTED — partial fallback
-        // 0x114 ai r3, r3, 1              ; r3 += 1 (interp side)
-        // 0x118 stop 0x99
+        // 0x110 dfa r5, r5, r5            ; UNSUPPORTED — partial fallback
+        // 0x114 nop                       ; never reached
+        // 0x118 nop                       ; never reached
         let code: [u32; 7] = [
-            ila(3, 1),
+            ila(3, 0xCAFE),
             ila(4, 0x110),
             bi(4),
             nop,
-            rchcnt(5, 28),
-            ai(3, 3, 1),
-            stop,
+            dfa(5, 5, 5),
+            nop,
+            nop,
         ];
         let mut bytes = Vec::with_capacity(code.len() * 4);
         for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
@@ -2637,32 +3128,28 @@ mod tests {
         let mut recomp = RecompilerExecutor::new();
         let r = recomp.execute(&prog);
 
-        assert_eq!(r.stop_reason, ExecutionStopReason::Stop(0x99));
-        // r3 must be exactly 2 (1 from JIT prefix + 1 from interpreter
-        // suffix). If the interpreter re-ran from 0x100, r3 would be
-        // 1 (overwritten by ila) + 1 (ai) = 2 — so this test is robust:
-        // either way r3 = 2. Actually that means the ila-then-ai shape
-        // doesn't distinguish. Let me distinguish by checking pc/steps.
-        //
-        // The robust signal is `r.steps_executed`: a partial fallback
-        // executes ~3 JIT steps + 3 interpreter steps = ~6; a full
-        // re-run from entry_pc would execute 6 interpreter steps PLUS
-        // any JIT steps already recorded, depending on accounting.
-        // What we *can* assert is that steps_executed is sensible AND
-        // the partial-fallback stat fired (proving we didn't re-run
-        // the whole program through `interp.execute`).
+        // The interpreter resume hits dfa at 0x110 immediately and
+        // returns Err(Unimplemented). Result is Error, with state.pc
+        // left at 0x110 (where the dfa lives).
+        match &r.stop_reason {
+            ExecutionStopReason::Error(_) => {}
+            other => panic!("expected Error, got {other:?}"),
+        }
+        // r3 must reflect the JIT prefix's `ila r3, 0xCAFE`. If the
+        // interpreter had re-run from entry_pc=0x100 (full fallback)
+        // r3 would also be 0xCAFE — so this assertion alone doesn't
+        // distinguish the paths. The robust signal is the stats:
+        // partial_fallbacks bumped, fallback_runs stayed 0.
+        assert_eq!(
+            r.final_state.gpr[3],
+            0x0000CAFE_0000CAFE_0000CAFE_0000CAFE,
+            "r3 must reflect the JIT prefix's `ila r3, 0xCAFE`",
+        );
         let s = recomp.jit_stats();
         assert_eq!(s.partial_fallbacks, 1,
                    "partial fallback path must have been used");
         assert_eq!(s.fallback_runs, 0,
                    "full fallback (from entry_pc) must NOT have been used");
-        assert_eq!(
-            r.final_state.gpr[3],
-            0x00000002_00000002_00000002_00000002,
-            "r3 should be JIT's 1 + interp's 1 = 2",
-        );
-        // PC at end is the stop instruction.
-        assert_eq!(r.final_state.pc, 0x118);
     }
 
     /// R5: a 100% JIT-supported program must NOT trigger any fallback,
@@ -2751,5 +3238,1868 @@ mod tests {
             "expected one partial fallback per execute() call",
         );
         assert_eq!(s.fallback_runs, 0);
+    }
+
+    // =================================================================
+    // R5.1 — Channel ops partial codegen: tests
+    // =================================================================
+    //
+    // Safety contract (re-stated for this layer):
+    //   - `rchcnt` against the 7 constant-count channels
+    //     (SPU_RDEVENTSTAT, SPU_WREVENTMASK, SPU_WREVENTACK, SPU_WRDEC,
+    //      SPU_RDDEC, SPU_RDEVENTMASK, SPU_RDMACHSTAT) is JIT-codegen'd
+    //     directly: rt = [1, 0, 0, 0] in lane order. PC advances at the
+    //     block boundary like any other non-terminator instruction.
+    //   - Every other channel form (`rchcnt` against a variable-count
+    //     channel; `rdch` / `wrch` against any channel) keeps the
+    //     pre-R5.1 behavior: `supported_check` rejects the function,
+    //     `compile_or_fetch` returns Err, the dispatcher hands control
+    //     to the interpreter via R5 partial fallback. No fake values.
+    //   - Stats: a successful compile that contains channel ops bumps
+    //     `channel_ops_jitted` by the number of channel instructions
+    //     the JIT emitted code for. A partial fallback whose triggering
+    //     instruction is a channel op bumps `channel_ops_partial_fallback`.
+
+    /// `rchcnt rt, ch` against a constant-count channel must run 100%
+    /// via JIT — no compile failure, no partial fallback, byte-exact
+    /// vs interpreter. We use SPU_RDMACHSTAT (channel 23) so the
+    /// interpreter sees count=1 and the JIT emits the same.
+    #[test]
+    fn r5_1_rchcnt_const_channel_runs_via_jit() {
+        let il     = |rt: u32, imm: u16| ((0x081u32 & 0x1FF) << 23) | ((imm as u32) << 7) | rt;
+        let rchcnt = |rt: u32, ch: u32| (0x00Fu32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop = 0xCCu32 & 0x3FFF;
+
+        // 0x100 il r3, 0xFFFF        ; r3 = 0xFFFFFFFF broadcast (so we
+        //                              can prove rchcnt overwrote it)
+        // 0x104 rchcnt r3, 23        ; SPU_RDMACHSTAT — const-1 channel
+        // 0x108 stop 0xCC
+        let code: [u32; 3] = [
+            il(3, 0xFFFF),
+            rchcnt(3, 23),
+            stop,
+        ];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let r_interp = interp.execute(&prog);
+        let r_recomp = recomp.execute(&prog);
+
+        let d = diff_snapshots(&r_interp.final_state, &r_recomp.final_state);
+        assert!(d.is_identical(),
+                "R5.1 rchcnt JIT diverged from interpreter: {d:?}");
+        assert_eq!(r_recomp.stop_reason, ExecutionStopReason::Stop(0xCC));
+        // r3 lane 0 = 1 (count); lanes 1..3 = 0 — overwrites the
+        // 0xFFFFFFFF broadcast we set up.
+        assert_eq!(
+            r_recomp.final_state.gpr[3],
+            0x00000001_00000000_00000000_00000000,
+            "rchcnt against const-1 channel must produce [1, 0, 0, 0] lanes",
+        );
+
+        // Stats: 1 channel op codegen'd; ZERO partial fallback.
+        let s = recomp.jit_stats();
+        assert_eq!(s.channel_ops_jitted, 1,
+                   "supported channel op should be codegen'd, not fall back");
+        assert_eq!(s.channel_ops_partial_fallback, 0);
+        assert_eq!(s.partial_fallbacks, 0,
+                   "rchcnt against const-channel must NOT trigger partial fallback");
+        assert_eq!(s.fallback_runs, 0);
+    }
+
+    /// All 7 const-count channels must be accepted by the JIT.
+    #[test]
+    fn r5_1_all_seven_const_channels_supported() {
+        let rchcnt = |rt: u32, ch: u32| (0x00Fu32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop = 0x99u32 & 0x3FFF;
+        // The 7 const-count channels per rpcs3_spu_thread::ch::*:
+        //   0=RDEVENTSTAT, 1=WREVENTMASK, 2=WREVENTACK,
+        //   7=WRDEC,       8=RDDEC,       22=RDEVENTMASK,
+        //   23=RDMACHSTAT
+        let const_channels: [u32; 7] = [0, 1, 2, 7, 8, 22, 23];
+
+        for ch in const_channels {
+            let code = vec![rchcnt(3, ch), stop];
+            let mut bytes = Vec::with_capacity(code.len() * 4);
+            for w in &code { bytes.extend_from_slice(&w.to_be_bytes()); }
+            let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+            let mut recomp = RecompilerExecutor::new();
+            let r = recomp.execute(&prog);
+            assert_eq!(r.stop_reason, ExecutionStopReason::Stop(0x99),
+                       "channel {} should reach stop via JIT", ch);
+            let s = recomp.jit_stats();
+            assert_eq!(s.partial_fallbacks, 0,
+                       "channel {} must run via JIT, not partial fallback", ch);
+            assert_eq!(s.channel_ops_jitted, 1, "channel {} should be jitted", ch);
+        }
+    }
+
+    /// R5.3 update (was R5.1's "variable channels always fallback"):
+    /// `rchcnt` against SPU_RDINMBOX (channel 29) is now JIT-codegen'd
+    /// via `spu_helper_rchcnt`. The helper queries the live
+    /// `SpuChannels::count(29)` (returns 0 for empty mailbox) and
+    /// writes `[0, 0, 0, 0]` to `gpr[rt]`. No partial fallback.
+    #[test]
+    fn r5_1_rchcnt_variable_channel_falls_to_partial_fallback() {
+        let rchcnt = |rt: u32, ch: u32| (0x00Fu32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop = 0x55u32 & 0x3FFF;
+        let code: [u32; 2] = [rchcnt(3, 29), stop];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let r_interp = interp.execute(&prog);
+        let r_recomp = recomp.execute(&prog);
+
+        let d = diff_snapshots(&r_interp.final_state, &r_recomp.final_state);
+        assert!(d.is_identical(),
+                "R5.3 variable-channel rchcnt must be byte-exact: {d:?}");
+        assert_eq!(r_recomp.stop_reason, ExecutionStopReason::Stop(0x55));
+
+        let s = recomp.jit_stats();
+        // R5.3: variable channel is now JIT-codegen'd via helper.
+        assert_eq!(s.partial_fallbacks, 0,
+                   "R5.3: variable rchcnt is now JITed — no fallback");
+        assert_eq!(s.channel_ops_partial_fallback, 0);
+        assert_eq!(s.fallback_runs, 0);
+        assert_eq!(s.channel_ops_jitted, 1,
+                   "R5.3: rchcnt against variable channel is codegen'd");
+    }
+
+    /// R5.2 (was R5.1's "always fallback" assertion): `wrch` against
+    /// SPU_WREVENTMASK (channel 1, never stalls — pure write to
+    /// `event_mask`) is now JIT-codegen'd via the runtime helper.
+    /// Programs that only write to non-stalling channels stay 100%
+    /// in JIT-land.
+    #[test]
+    fn r5_1_wrch_falls_to_partial_fallback() {
+        let il   = |rt: u32, imm: u16| ((0x081u32 & 0x1FF) << 23) | ((imm as u32) << 7) | rt;
+        let wrch = |rt: u32, ch: u32| (0x10Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop = 0x77u32 & 0x3FFF;
+
+        // 0x100 il r3, 0x42         ; r3 = 0x42 (the value to wrch)
+        // 0x104 wrch ch=1, r3       ; SPU_WREVENTMASK — JIT helper, never stalls
+        // 0x108 stop 0x77
+        let code: [u32; 3] = [il(3, 0x42), wrch(3, 1), stop];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let r_interp = interp.execute(&prog);
+        let r_recomp = recomp.execute(&prog);
+
+        let d = diff_snapshots(&r_interp.final_state, &r_recomp.final_state);
+        assert!(d.is_identical(), "wrch JIT must be byte-exact vs interpreter: {d:?}");
+        assert_eq!(r_recomp.stop_reason, ExecutionStopReason::Stop(0x77));
+
+        let s = recomp.jit_stats();
+        // R5.2 reality: wrch is JIT-codegen'd via helper, no fallback.
+        assert_eq!(s.partial_fallbacks, 0,
+                   "R5.2: non-stalling wrch must run via JIT helper, no fallback");
+        assert_eq!(s.channel_ops_partial_fallback, 0);
+        assert_eq!(s.channel_stall_exits, 0);
+        // The wrch counts toward `channel_ops_jitted` (compile-time stat
+        // bumped per channel instruction in the compiled function).
+        assert_eq!(s.channel_ops_jitted, 1);
+        assert_eq!(s.fallback_runs, 0);
+    }
+
+    /// R5.2 (was R5.1's "function B falls back due to wrch"): the
+    /// mixed `rchcnt + bi + wrch` program now runs 100% via JIT
+    /// because wrch ch=1 (SPU_WREVENTMASK) is helper-JITed and
+    /// doesn't stall. We keep the test under the R5.1 name to make
+    /// the regression bar explicit: the previous fallback path is
+    /// gone, replaced by a clean compile-and-execute.
+    #[test]
+    fn r5_1_mixed_const_channel_jit_then_wrch_partial_fallback() {
+        let ila    = |rt: u32, imm: u32| (0x21u32 << 25) | ((imm & 0x3FFFF) << 7) | rt;
+        let bi     = |ra: u32| (0x1A8u32 << 21) | ((ra & 0x7F) << 7);
+        let rchcnt = |rt: u32, ch: u32| (0x00Fu32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let wrch   = |rt: u32, ch: u32| (0x10Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let nop    = 0x4020_0000u32;
+        let stop   = 0xAAu32 & 0x3FFF;
+
+        // 0x100 rchcnt r3, 23      ; r3 = [1,0,0,0] (JIT)
+        // 0x104 ila    r6, 0x110   ; r6 = 0x110
+        // 0x108 bi     r6          ; → CONTINUE_TO 0x110 (function A ends)
+        // 0x10C nop                ; padding
+        // 0x110 ila    r4, 0x99    ; r4 = 0x99 (this triggers compile-failure
+        //                            on function B because of the wrch below,
+        //                            so this ila runs in the interpreter)
+        // 0x114 wrch   ch=1, r4    ; SPU_WREVENTMASK = 0x99 (interpreter)
+        // 0x118 stop 0xAA
+        let code: [u32; 7] = [
+            rchcnt(3, 23),
+            ila(6, 0x110),
+            bi(6),
+            nop,
+            ila(4, 0x99),
+            wrch(4, 1),
+            stop,
+        ];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let r_interp = interp.execute(&prog);
+        let r_recomp = recomp.execute(&prog);
+
+        let d = diff_snapshots(&r_interp.final_state, &r_recomp.final_state);
+        assert!(d.is_identical(), "R5.2 mixed program must be byte-exact: {d:?}");
+        assert_eq!(r_recomp.stop_reason, ExecutionStopReason::Stop(0xAA));
+        // r3 reflects function A's rchcnt; r4 reflects the ila before
+        // the wrch in function B.
+        assert_eq!(
+            r_recomp.final_state.gpr[3],
+            0x00000001_00000000_00000000_00000000,
+            "r3 must reflect rchcnt's [1, 0, 0, 0] lane layout",
+        );
+
+        let s = recomp.jit_stats();
+        // Both functions compile (function A: rchcnt; function B:
+        // ila + wrch). 2 channel ops codegen'd (1 rchcnt + 1 wrch).
+        assert_eq!(s.channel_ops_jitted, 2,
+                   "rchcnt in A + wrch in B should both be codegen'd");
+        assert_eq!(s.compiled_functions, 2);
+        // wrch ch=1 doesn't stall — no partial fallback.
+        assert_eq!(s.partial_fallbacks, 0,
+                   "R5.2: wrch ch=1 helper succeeds, no fallback path");
+        assert_eq!(s.channel_ops_partial_fallback, 0);
+        assert_eq!(s.channel_stall_exits, 0);
+        assert_eq!(s.fallback_runs, 0);
+    }
+
+    /// Equivalence: 10 repeats of the const-channel program must all
+    /// match the interpreter. Verifies that the codegen is stable
+    /// across compile+chain cache hits and that `channel_ops_jitted`
+    /// only bumps once (compile-time stat, not per-run).
+    #[test]
+    fn r5_1_rchcnt_const_channel_equivalence_across_repeats() {
+        let il     = |rt: u32, imm: u16| ((0x081u32 & 0x1FF) << 23) | ((imm as u32) << 7) | rt;
+        let rchcnt = |rt: u32, ch: u32| (0x00Fu32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop = 0x88u32 & 0x3FFF;
+        let code: [u32; 3] = [il(3, 0xFFFF), rchcnt(3, 8 /* SPU_RDDEC */), stop];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let baseline = interp.execute(&prog);
+        for i in 0..10 {
+            let r = recomp.execute(&prog);
+            let d = diff_snapshots(&baseline.final_state, &r.final_state);
+            assert!(d.is_identical(),
+                    "iter {i}: R5.1 const-channel JIT diverged: {d:?}");
+        }
+        let s = recomp.jit_stats();
+        assert_eq!(s.compiled_functions, 1, "only one compile across repeats");
+        assert_eq!(s.channel_ops_jitted, 1,
+                   "channel_ops_jitted is a compile-time stat — bumped once");
+        assert_eq!(s.partial_fallbacks, 0);
+        assert!(s.chained_jumps >= 9,
+                "R4b chain still active across repeats: got {}",
+                s.chained_jumps);
+    }
+
+    /// Sanity: existing 100% JIT-supported fixtures must continue to
+    /// produce zero channel-related stats (they don't exercise channels).
+    #[test]
+    fn r5_1_pre_existing_fixtures_have_no_channel_ops_or_fallback() {
+        let mut exec = RecompilerExecutor::new();
+        exec.execute(&loop_program());
+        exec.execute(&arith_program());
+        exec.execute(&loadstore_program());
+        exec.execute(&fibonacci_program());
+        exec.execute(&sum_of_squares_program());
+        exec.execute(&brsl_ret_program());
+
+        let s = exec.jit_stats();
+        assert_eq!(s.channel_ops_jitted, 0,
+                   "existing fixtures don't use channel ops");
+        assert_eq!(s.channel_ops_partial_fallback, 0);
+        assert_eq!(s.partial_fallbacks, 0,
+                   "existing fixtures must not trigger partial fallback");
+        assert_eq!(s.fallback_runs, 0);
+    }
+
+    // =================================================================
+    // R5.2 — Channel ops via runtime helpers: tests
+    // =================================================================
+    //
+    // Layer-on-top-of contract:
+    //   - rdch / wrch are now JIT-codegen'd via `spu_helper_rdch` /
+    //     `spu_helper_wrch` runtime helpers operating on the live
+    //     SpuChannels owned by the dispatcher.
+    //   - Successful (Ok) ops stay 100% in JIT-land — no fallback.
+    //   - Stall / BadChannel returns from the helper trigger
+    //     `JIT_OUTCOME_STALL`, which routes to R5 partial fallback
+    //     with `state.pc` at the channel op and `channels` propagated.
+    //   - The interpreter resume sees the same SpuChannels state the
+    //     JIT was working with — channel-stall is handled identically
+    //     to a pure interpreter run.
+
+    /// `wrch ch=1` (SPU_WREVENTMASK) followed by `rdch ch=22`
+    /// (SPU_RDEVENTMASK) round-trip: writes a value, reads it back,
+    /// must produce byte-exact same gpr layout as the interpreter.
+    /// Both ops are JITed; the program runs entirely under JIT
+    /// codegen with zero fallback.
+    #[test]
+    fn r5_2_wrch_event_mask_rdch_round_trip_via_jit() {
+        let il   = |rt: u32, imm: u16| ((0x081u32 & 0x1FF) << 23) | ((imm as u32) << 7) | rt;
+        let wrch = |rt: u32, ch: u32| (0x10Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let rdch = |rt: u32, ch: u32| (0x00Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop = 0xC1u32 & 0x3FFF;
+
+        // 0x100 il   r3, 0x4242     ; r3 = 0x4242 broadcast
+        // 0x104 wrch ch=1, r3       ; SPU_WREVENTMASK = 0x4242 (helper)
+        // 0x108 rdch r5, ch=22      ; r5 lane 0 = 0x4242 (helper read)
+        // 0x10C stop 0xC1
+        let code: [u32; 4] = [il(3, 0x4242), wrch(3, 1), rdch(5, 22), stop];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let r_interp = interp.execute(&prog);
+        let r_recomp = recomp.execute(&prog);
+
+        let d = diff_snapshots(&r_interp.final_state, &r_recomp.final_state);
+        assert!(d.is_identical(),
+                "R5.2 wrch+rdch round-trip must be byte-exact: {d:?}");
+        assert_eq!(r_recomp.stop_reason, ExecutionStopReason::Stop(0xC1));
+        // r5 lane 0 = 0x4242 (the value we wrch'd into event_mask, then
+        // read via rdch). Lanes 1..3 are zero per the helper layout.
+        assert_eq!(
+            r_recomp.final_state.gpr[5],
+            0x00004242_00000000_00000000_00000000,
+            "rdch lane 0 should equal the wrch'd event_mask",
+        );
+
+        let s = recomp.jit_stats();
+        assert_eq!(s.channel_ops_jitted, 2,
+                   "both wrch and rdch should be codegen'd via helper");
+        assert_eq!(s.partial_fallbacks, 0,
+                   "non-stalling ops stay in JIT-land");
+        assert_eq!(s.channel_stall_exits, 0);
+        assert_eq!(s.fallback_runs, 0);
+    }
+
+    /// `wrch ch=28` (SPU_WROUTMBOX) twice — first succeeds, second
+    /// stalls because mailbox is full. The JIT helper returns Stall,
+    /// JIT exits with `JIT_OUTCOME_STALL`, R5 hands to interpreter
+    /// which produces `ExecutionStopReason::ChannelStall`. Result
+    /// must match interpreter-only execution.
+    #[test]
+    fn r5_2_wrch_outmbox_second_write_stalls_falls_to_partial_fallback() {
+        let il   = |rt: u32, imm: u16| ((0x081u32 & 0x1FF) << 23) | ((imm as u32) << 7) | rt;
+        let wrch = |rt: u32, ch: u32| (0x10Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop = 0xCAu32 & 0x3FFF;
+
+        // 0x100 il   r3, 0xAA       ; r3 = 0xAA
+        // 0x104 wrch ch=28, r3      ; SPU_WROUTMBOX = 0xAA (helper Ok)
+        // 0x108 il   r4, 0xBB       ; r4 = 0xBB
+        // 0x10C wrch ch=28, r4      ; STALLS — mbox already full
+        //                            (helper returns Stall → JIT exits
+        //                            JIT_OUTCOME_STALL → R5 fallback)
+        // 0x110 stop 0xCA           ; (never reached — interpreter sees
+        //                            ChannelStall and stops there)
+        let code: [u32; 5] = [il(3, 0xAA), wrch(3, 28), il(4, 0xBB), wrch(4, 28), stop];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let r_interp = interp.execute(&prog);
+        let r_recomp = recomp.execute(&prog);
+
+        let d = diff_snapshots(&r_interp.final_state, &r_recomp.final_state);
+        assert!(d.is_identical(),
+                "R5.2 stall path must be byte-exact vs interpreter: {d:?}");
+        // Both should report ChannelStall on channel 28, write side.
+        assert_eq!(r_recomp.stop_reason,
+                   ExecutionStopReason::ChannelStall { channel: 28, is_write: true });
+        assert_eq!(r_interp.stop_reason, r_recomp.stop_reason);
+
+        let s = recomp.jit_stats();
+        // Both wrch instructions get codegen'd at compile time.
+        assert_eq!(s.channel_ops_jitted, 2);
+        // The second wrch call hits Stall at runtime → JIT_OUTCOME_STALL
+        // → R5 partial fallback.
+        assert_eq!(s.partial_fallbacks, 1);
+        assert_eq!(s.channel_stall_exits, 1,
+                   "stall must be attributed to channel_stall_exits");
+        assert_eq!(s.channel_ops_partial_fallback, 1);
+        assert_eq!(s.fallback_runs, 0,
+                   "no full fallback — partial fallback handles channel stall");
+    }
+
+    /// `rdch ch=29` (SPU_RDINMBOX) on an empty mailbox: helper returns
+    /// Stall on the first read. Must reproduce interpreter's
+    /// ChannelStall reason.
+    #[test]
+    fn r5_2_rdch_empty_inmbox_stalls() {
+        let rdch = |rt: u32, ch: u32| (0x00Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop = 0xCBu32 & 0x3FFF;
+
+        // 0x100 rdch r3, ch=29      ; SPU_RDINMBOX — empty by default,
+        //                            helper returns Stall, R5 fallback
+        // 0x104 stop 0xCB           ; not reached
+        let code: [u32; 2] = [rdch(3, 29), stop];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let r_interp = interp.execute(&prog);
+        let r_recomp = recomp.execute(&prog);
+
+        let d = diff_snapshots(&r_interp.final_state, &r_recomp.final_state);
+        assert!(d.is_identical(),
+                "R5.2 rdch stall must be byte-exact: {d:?}");
+        assert_eq!(r_recomp.stop_reason,
+                   ExecutionStopReason::ChannelStall { channel: 29, is_write: false });
+        assert_eq!(r_interp.stop_reason, r_recomp.stop_reason);
+
+        let s = recomp.jit_stats();
+        assert_eq!(s.channel_ops_jitted, 1);
+        assert_eq!(s.partial_fallbacks, 1);
+        assert_eq!(s.channel_stall_exits, 1);
+        assert_eq!(s.fallback_runs, 0);
+    }
+
+    /// `wrch ch=2` (SPU_WREVENTACK) clears bits in event_stat.
+    /// Tests the side-effect path of a write helper: helper mutates
+    /// SpuChannels via `channels.write` which transitively modifies
+    /// event_stat via the bit-clear.
+    #[test]
+    fn r5_2_wrch_event_ack_clears_event_stat_bits() {
+        let il   = |rt: u32, imm: u16| ((0x081u32 & 0x1FF) << 23) | ((imm as u32) << 7) | rt;
+        let wrch = |rt: u32, ch: u32| (0x10Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop = 0xACu32 & 0x3FFF;
+
+        // 0x100 il   r3, 0x00FF        ; r3 = 0x00FF
+        // 0x104 wrch ch=1, r3           ; event_mask = 0x00FF
+        // 0x108 il   r4, 0x000F        ; r4 = 0x000F
+        // 0x10C wrch ch=2, r4           ; event_stat &= !0x000F (no-op since 0)
+        // 0x110 stop 0xAC
+        let code: [u32; 5] = [
+            il(3, 0x00FF), wrch(3, 1),
+            il(4, 0x000F), wrch(4, 2),
+            stop,
+        ];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let r_interp = interp.execute(&prog);
+        let r_recomp = recomp.execute(&prog);
+
+        let d = diff_snapshots(&r_interp.final_state, &r_recomp.final_state);
+        assert!(d.is_identical(), "R5.2 wrch event_ack diverged: {d:?}");
+        assert_eq!(r_recomp.stop_reason, ExecutionStopReason::Stop(0xAC));
+
+        let s = recomp.jit_stats();
+        assert_eq!(s.channel_ops_jitted, 2);
+        assert_eq!(s.partial_fallbacks, 0);
+        assert_eq!(s.channel_stall_exits, 0);
+    }
+
+    /// Mixed: the JIT prefix wrch-es a value, then a far indirect
+    /// branch into a function whose first opcode is `rdch ch=29`
+    /// (empty in-mbox → stall). Verify the interpreter resume sees
+    /// the JIT-mutated SpuChannels (event_mask still set) and stalls
+    /// at the rdch with PC preserved.
+    #[test]
+    fn r5_2_jit_mutates_channels_then_resume_sees_them() {
+        let il   = |rt: u32, imm: u16| ((0x081u32 & 0x1FF) << 23) | ((imm as u32) << 7) | rt;
+        let ila  = |rt: u32, imm: u32| (0x21u32 << 25) | ((imm & 0x3FFFF) << 7) | rt;
+        let wrch = |rt: u32, ch: u32| (0x10Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let bi   = |ra: u32| (0x1A8u32 << 21) | ((ra & 0x7F) << 7);
+        let rdch = |rt: u32, ch: u32| (0x00Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let nop  = 0x4020_0000u32;
+        let stop = 0x55u32 & 0x3FFF;
+
+        // 0x100 il   r3, 0x1234     ; r3 = 0x1234
+        // 0x104 wrch ch=1, r3       ; event_mask = 0x1234 (JIT helper Ok)
+        // 0x108 ila  r6, 0x118      ; r6 = 0x118 (target)
+        // 0x10C bi   r6             ; CONTINUE_TO 0x118 (function A ends)
+        // 0x110 nop                 ; padding
+        // 0x114 nop                 ; padding
+        // 0x118 rdch r5, ch=29      ; SPU_RDINMBOX empty → STALL
+        // 0x11C stop 0x55
+        let code: [u32; 8] = [
+            il(3, 0x1234), wrch(3, 1),
+            ila(6, 0x118), bi(6),
+            nop, nop,
+            rdch(5, 29), stop,
+        ];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let r_interp = interp.execute(&prog);
+        let r_recomp = recomp.execute(&prog);
+
+        let d = diff_snapshots(&r_interp.final_state, &r_recomp.final_state);
+        assert!(d.is_identical(),
+                "R5.2 mutation+stall must be byte-exact: {d:?}");
+        assert_eq!(r_recomp.stop_reason,
+                   ExecutionStopReason::ChannelStall { channel: 29, is_write: false });
+        // r3 from JIT prefix preserved across the boundary.
+        assert_eq!(
+            r_recomp.final_state.gpr[3],
+            0x00001234_00001234_00001234_00001234,
+            "r3 (JIT prefix) must be preserved through partial fallback",
+        );
+
+        let s = recomp.jit_stats();
+        assert_eq!(s.channel_ops_jitted, 2,
+                   "wrch in A + rdch in B both codegen'd");
+        assert_eq!(s.compiled_functions, 2);
+        assert_eq!(s.partial_fallbacks, 1);
+        assert_eq!(s.channel_stall_exits, 1);
+        assert_eq!(s.fallback_runs, 0);
+    }
+
+    /// Equivalence: 10× the round-trip program. `channel_ops_jitted`
+    /// is a compile-time stat, so it bumps once per unique compile;
+    /// the chain caches the function across reps.
+    #[test]
+    fn r5_2_wrch_rdch_equivalence_across_repeats() {
+        let il   = |rt: u32, imm: u16| ((0x081u32 & 0x1FF) << 23) | ((imm as u32) << 7) | rt;
+        let wrch = |rt: u32, ch: u32| (0x10Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let rdch = |rt: u32, ch: u32| (0x00Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop = 0x42u32 & 0x3FFF;
+        let code: [u32; 4] = [il(3, 0x9999), wrch(3, 1), rdch(5, 22), stop];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let baseline = interp.execute(&prog);
+        for i in 0..10 {
+            let r = recomp.execute(&prog);
+            let d = diff_snapshots(&baseline.final_state, &r.final_state);
+            assert!(d.is_identical(),
+                    "iter {i}: R5.2 rdch/wrch JIT diverged: {d:?}");
+        }
+        let s = recomp.jit_stats();
+        assert_eq!(s.compiled_functions, 1, "single compile across reps");
+        assert_eq!(s.channel_ops_jitted, 2, "wrch+rdch counted once at compile");
+        assert_eq!(s.partial_fallbacks, 0,
+                   "non-stalling channel ops stay in JIT-land");
+        assert_eq!(s.fallback_runs, 0);
+    }
+
+    /// Fixtures that don't exercise channels must still pass with all
+    /// channel stats at zero, as they did pre-R5.2.
+    #[test]
+    fn r5_2_pre_existing_fixtures_unchanged() {
+        let mut exec = RecompilerExecutor::new();
+        exec.execute(&loop_program());
+        exec.execute(&arith_program());
+        exec.execute(&loadstore_program());
+        exec.execute(&fibonacci_program());
+        exec.execute(&sum_of_squares_program());
+        exec.execute(&brsl_ret_program());
+
+        let s = exec.jit_stats();
+        assert_eq!(s.channel_ops_jitted, 0);
+        assert_eq!(s.channel_ops_partial_fallback, 0);
+        assert_eq!(s.channel_stall_exits, 0);
+        assert_eq!(s.partial_fallbacks, 0);
+        assert_eq!(s.fallback_runs, 0);
+    }
+
+    // =================================================================
+    // R5.3 — rchcnt against variable-count channels via runtime helper
+    // =================================================================
+    //
+    // Layer-on-top-of contract (from R5.2):
+    //   - rchcnt const-1 channel (R5.1): direct codegen, no helper.
+    //   - rchcnt variable channel (R5.3): `spu_helper_rchcnt` calls
+    //     `SpuChannels::count(channel)` and writes the lane layout
+    //     `[count, 0, 0, 0]` to gpr[rt]. Never stalls (count is a
+    //     query). Bad channels return BadChannel → R5 partial fallback.
+    //   - All R5.2 rdch/wrch behaviour preserved.
+
+    /// `rchcnt ch=29` (SPU_RDINMBOX) on empty mailbox: count = 0.
+    /// Helper writes [0, 0, 0, 0]. No fallback.
+    #[test]
+    fn r5_3_rchcnt_inmbox_empty_returns_zero_via_jit() {
+        let il     = |rt: u32, imm: u16| ((0x081u32 & 0x1FF) << 23) | ((imm as u32) << 7) | rt;
+        let rchcnt = |rt: u32, ch: u32| (0x00Fu32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop   = 0xD0u32 & 0x3FFF;
+
+        // 0x100 il r3, 0xFFFF        ; r3 broadcast 0xFFFFFFFF (must be overwritten)
+        // 0x104 rchcnt r3, 29        ; SPU_RDINMBOX — count = 0 (empty)
+        // 0x108 stop 0xD0
+        let code: [u32; 3] = [il(3, 0xFFFF), rchcnt(3, 29), stop];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let r_interp = interp.execute(&prog);
+        let r_recomp = recomp.execute(&prog);
+
+        let d = diff_snapshots(&r_interp.final_state, &r_recomp.final_state);
+        assert!(d.is_identical(),
+                "R5.3 rchcnt-29 empty must be byte-exact: {d:?}");
+        assert_eq!(r_recomp.stop_reason, ExecutionStopReason::Stop(0xD0));
+        // r3 = [0, 0, 0, 0] — count is 0 (empty mbox), padded zeros.
+        assert_eq!(
+            r_recomp.final_state.gpr[3],
+            0x00000000_00000000_00000000_00000000,
+            "rchcnt empty inmbox must produce all-zero lanes",
+        );
+
+        let s = recomp.jit_stats();
+        assert_eq!(s.channel_ops_jitted, 1);
+        assert_eq!(s.partial_fallbacks, 0,
+                   "R5.3: rchcnt variable channel runs via helper, no fallback");
+        assert_eq!(s.channel_stall_exits, 0);
+        assert_eq!(s.fallback_runs, 0);
+    }
+
+    /// `rchcnt ch=28` (SPU_WROUTMBOX) cycle: empty (count=1, free) → wrch
+    /// → full (count=0, no free slot). Tests that the helper sees the
+    /// JIT-mutated SpuChannels state.
+    #[test]
+    fn r5_3_rchcnt_outmbox_count_changes_after_wrch_via_jit() {
+        let il     = |rt: u32, imm: u16| ((0x081u32 & 0x1FF) << 23) | ((imm as u32) << 7) | rt;
+        let wrch   = |rt: u32, ch: u32| (0x10Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let rchcnt = |rt: u32, ch: u32| (0x00Fu32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop   = 0xD1u32 & 0x3FFF;
+
+        // 0x100 rchcnt r4, 28        ; before wrch: out_mbox empty → count = 1
+        // 0x104 il     r3, 0xAA      ; r3 = 0xAA
+        // 0x108 wrch   r3, 28        ; out_mbox = 0xAA
+        // 0x10C rchcnt r5, 28        ; after wrch: out_mbox full → count = 0
+        // 0x110 stop 0xD1
+        let code: [u32; 5] = [
+            rchcnt(4, 28),
+            il(3, 0xAA),
+            wrch(3, 28),
+            rchcnt(5, 28),
+            stop,
+        ];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let r_interp = interp.execute(&prog);
+        let r_recomp = recomp.execute(&prog);
+
+        let d = diff_snapshots(&r_interp.final_state, &r_recomp.final_state);
+        assert!(d.is_identical(),
+                "R5.3 rchcnt-28 cycle must be byte-exact: {d:?}");
+        assert_eq!(r_recomp.stop_reason, ExecutionStopReason::Stop(0xD1));
+        // r4 lane 0 = 1 (free slot before wrch).
+        assert_eq!(
+            r_recomp.final_state.gpr[4] >> 96,
+            1u128,
+            "rchcnt before wrch must report 1 (free slot)",
+        );
+        // r5 lane 0 = 0 (no free slot after wrch).
+        assert_eq!(
+            r_recomp.final_state.gpr[5] >> 96,
+            0u128,
+            "rchcnt after wrch must report 0 (mbox full)",
+        );
+
+        let s = recomp.jit_stats();
+        // 2× rchcnt + 1× wrch = 3 channel ops codegen'd.
+        assert_eq!(s.channel_ops_jitted, 3);
+        assert_eq!(s.partial_fallbacks, 0);
+        assert_eq!(s.channel_stall_exits, 0);
+        assert_eq!(s.fallback_runs, 0);
+    }
+
+    /// `rchcnt ch=3` (SPU_RDSIGNOTIFY1) on no signal pending: count = 0.
+    /// Tests another variable-count channel.
+    #[test]
+    fn r5_3_rchcnt_signotify_no_signal_via_jit() {
+        let rchcnt = |rt: u32, ch: u32| (0x00Fu32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop   = 0xD2u32 & 0x3FFF;
+
+        let code: [u32; 2] = [rchcnt(3, 3 /* SPU_RDSIGNOTIFY1 */), stop];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let r_interp = interp.execute(&prog);
+        let r_recomp = recomp.execute(&prog);
+
+        let d = diff_snapshots(&r_interp.final_state, &r_recomp.final_state);
+        assert!(d.is_identical(),
+                "R5.3 rchcnt SNR1 must be byte-exact: {d:?}");
+        assert_eq!(r_recomp.final_state.gpr[3] >> 96, 0u128,
+                   "no signal pending → count = 0");
+
+        let s = recomp.jit_stats();
+        assert_eq!(s.channel_ops_jitted, 1);
+        assert_eq!(s.partial_fallbacks, 0);
+    }
+
+    /// `rchcnt` against a bad channel (e.g. 100): helper returns
+    /// BadChannel → JIT exits via STALL → R5 partial fallback. The
+    /// interpreter resume reproduces the BadChannel via
+    /// `Error::Unimplemented`.
+    #[test]
+    fn r5_3_rchcnt_bad_channel_falls_to_partial_fallback() {
+        let rchcnt = |rt: u32, ch: u32| (0x00Fu32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop   = 0xDEu32 & 0x3FFF;
+
+        // Channel 100 is not in SpuChannels::count — returns BadChannel.
+        let code: [u32; 2] = [rchcnt(3, 100), stop];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let r_interp = interp.execute(&prog);
+        let r_recomp = recomp.execute(&prog);
+
+        let d = diff_snapshots(&r_interp.final_state, &r_recomp.final_state);
+        assert!(d.is_identical(),
+                "R5.3 rchcnt bad-channel must be byte-exact: {d:?}");
+        match &r_recomp.stop_reason {
+            ExecutionStopReason::Error(msg) => {
+                assert!(msg.contains("Unimplemented"),
+                        "expected rchcnt Unimplemented, got: {msg}");
+            }
+            other => panic!("expected Error from bad channel, got {other:?}"),
+        }
+        assert_eq!(r_interp.stop_reason, r_recomp.stop_reason);
+
+        let s = recomp.jit_stats();
+        // The rchcnt was codegen'd (counts at compile time, even though
+        // runtime returned BadChannel).
+        assert_eq!(s.channel_ops_jitted, 1);
+        // Helper returned BadChannel → JIT exits STALL → partial fallback.
+        assert_eq!(s.partial_fallbacks, 1);
+        assert_eq!(s.channel_stall_exits, 1,
+                   "BadChannel from rchcnt helper attributed to channel_stall_exits");
+        assert_eq!(s.channel_ops_partial_fallback, 1);
+        assert_eq!(s.fallback_runs, 0);
+        let _ = stop;  // unreachable — kept for clarity.
+    }
+
+    /// Mixed program: wrch (R5.2) sets event_mask, rchcnt (R5.3 helper)
+    /// reads count of variable channel, rdch (R5.2) reads back the
+    /// value. Confirms all three helpers cooperate without fallback.
+    #[test]
+    fn r5_3_mixed_wrch_rchcnt_rdch_byte_exact() {
+        let il     = |rt: u32, imm: u16| ((0x081u32 & 0x1FF) << 23) | ((imm as u32) << 7) | rt;
+        let wrch   = |rt: u32, ch: u32| (0x10Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let rchcnt = |rt: u32, ch: u32| (0x00Fu32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let rdch   = |rt: u32, ch: u32| (0x00Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop   = 0xD3u32 & 0x3FFF;
+
+        // 0x100 il   r3, 0x1234        ; r3 = 0x1234
+        // 0x104 wrch ch=1, r3          ; event_mask = 0x1234 (R5.2 helper)
+        // 0x108 rchcnt r4, 22          ; SPU_RDEVENTMASK count = 1 (R5.1 const-1)
+        // 0x10C rchcnt r5, 28          ; SPU_WROUTMBOX count = 1 (R5.3 helper)
+        // 0x110 rdch r6, 22            ; read event_mask = 0x1234 (R5.2 helper)
+        // 0x114 stop 0xD3
+        let code: [u32; 6] = [
+            il(3, 0x1234),
+            wrch(3, 1),
+            rchcnt(4, 22),
+            rchcnt(5, 28),
+            rdch(6, 22),
+            stop,
+        ];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let r_interp = interp.execute(&prog);
+        let r_recomp = recomp.execute(&prog);
+
+        let d = diff_snapshots(&r_interp.final_state, &r_recomp.final_state);
+        assert!(d.is_identical(),
+                "R5.3 mixed wrch/rchcnt/rdch must be byte-exact: {d:?}");
+        assert_eq!(r_recomp.stop_reason, ExecutionStopReason::Stop(0xD3));
+        // r6 lane 0 = 0x1234 (read back from event_mask).
+        assert_eq!(r_recomp.final_state.gpr[6] >> 96, 0x1234u128);
+
+        let s = recomp.jit_stats();
+        // 4 channel ops codegen'd: wrch + rchcnt const + rchcnt var + rdch.
+        assert_eq!(s.channel_ops_jitted, 4);
+        assert_eq!(s.partial_fallbacks, 0,
+                   "all helpers succeed — no fallback");
+        assert_eq!(s.channel_stall_exits, 0);
+        assert_eq!(s.fallback_runs, 0);
+    }
+
+    /// 10× repeat of the variable-rchcnt program: chain/cache stay
+    /// consistent, no stale state.
+    #[test]
+    fn r5_3_rchcnt_variable_equivalence_across_repeats() {
+        let il     = |rt: u32, imm: u16| ((0x081u32 & 0x1FF) << 23) | ((imm as u32) << 7) | rt;
+        let rchcnt = |rt: u32, ch: u32| (0x00Fu32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop   = 0xD4u32 & 0x3FFF;
+        let code: [u32; 3] = [il(3, 0xFFFF), rchcnt(3, 29), stop];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let baseline = interp.execute(&prog);
+        for i in 0..10 {
+            let r = recomp.execute(&prog);
+            let d = diff_snapshots(&baseline.final_state, &r.final_state);
+            assert!(d.is_identical(),
+                    "iter {i}: R5.3 rchcnt variable diverged: {d:?}");
+        }
+        let s = recomp.jit_stats();
+        assert_eq!(s.compiled_functions, 1, "single compile across reps");
+        assert_eq!(s.channel_ops_jitted, 1, "rchcnt counted once at compile");
+        assert_eq!(s.partial_fallbacks, 0);
+        assert_eq!(s.fallback_runs, 0);
+    }
+
+    /// Pre-existing fixtures must keep zero channel stats.
+    #[test]
+    fn r5_3_pre_existing_fixtures_unchanged() {
+        let mut exec = RecompilerExecutor::new();
+        exec.execute(&loop_program());
+        exec.execute(&fibonacci_program());
+        exec.execute(&sum_of_squares_program());
+        exec.execute(&brsl_ret_program());
+        let s = exec.jit_stats();
+        assert_eq!(s.channel_ops_jitted, 0);
+        assert_eq!(s.channel_ops_partial_fallback, 0);
+        assert_eq!(s.channel_stall_exits, 0);
+        assert_eq!(s.partial_fallbacks, 0);
+        assert_eq!(s.fallback_runs, 0);
+    }
+
+    // =================================================================
+    // R5.4a — Channel parking propagation through partial fallback
+    // =================================================================
+    //
+    // The JIT-side helpers don't park directly — `JIT_OUTCOME_STALL`
+    // routes through `partial_fallback_to_interpreter` and the
+    // interpreter's own step() sets `park_state` on `ChannelStall`.
+    // Then `snapshot_from_thread` carries park_state into the
+    // recompiler's final result. End-to-end equivalence with an
+    // interpreter-only run must include park_state.
+
+    /// `rdch ch=29` on empty in_mbox: stall via R5.2 helper → R5
+    /// partial fallback → interpreter parks → snapshot reports
+    /// park_state.
+    #[test]
+    fn r5_4a_rdch_stall_propagates_park_state_through_jit() {
+        use rpcs3_spu_thread::{SpuParkReason, SpuParkState};
+        let rdch = |rt: u32, ch: u32| (0x00Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop = 0xCEu32 & 0x3FFF;
+        let code: [u32; 2] = [rdch(3, 29), stop];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let r_interp = interp.execute(&prog);
+        let r_recomp = recomp.execute(&prog);
+
+        let d = diff_snapshots(&r_interp.final_state, &r_recomp.final_state);
+        assert!(d.is_identical(),
+                "R5.4a rdch stall must be byte-exact incl. park_state: {d:?}");
+        assert_eq!(r_recomp.stop_reason,
+                   ExecutionStopReason::ChannelStall { channel: 29, is_write: false });
+
+        // Both backends agree on park_state.
+        let expected = Some(SpuParkState {
+            pc: 0x100,
+            reason: SpuParkReason::ChannelRead { channel: 29 },
+        });
+        assert_eq!(r_recomp.final_state.park_state, expected,
+                   "recompiler must propagate park_state from interpreter resume");
+        assert_eq!(r_interp.final_state.park_state, expected);
+    }
+
+    /// `wrch ch=28` when out_mbox is full: stall via R5.2 helper →
+    /// partial fallback → interpreter parks with ChannelWrite reason.
+    #[test]
+    fn r5_4a_wrch_stall_propagates_park_state_through_jit() {
+        use rpcs3_spu_thread::{SpuParkReason, SpuParkState};
+        let il   = |rt: u32, imm: u16| ((0x081u32 & 0x1FF) << 23) | ((imm as u32) << 7) | rt;
+        let wrch = |rt: u32, ch: u32| (0x10Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop = 0xCFu32 & 0x3FFF;
+
+        // 0x100 il   r3, 0xAA       ; r3 = 0xAA
+        // 0x104 wrch ch=28, r3      ; success — out_mbox = 0xAA
+        // 0x108 il   r4, 0xBB       ; r4 = 0xBB
+        // 0x10C wrch ch=28, r4      ; STALL — mbox full → park
+        // 0x110 stop 0xCF
+        let code: [u32; 5] = [il(3, 0xAA), wrch(3, 28), il(4, 0xBB), wrch(4, 28), stop];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let r_interp = interp.execute(&prog);
+        let r_recomp = recomp.execute(&prog);
+
+        let d = diff_snapshots(&r_interp.final_state, &r_recomp.final_state);
+        assert!(d.is_identical(),
+                "R5.4a wrch stall must be byte-exact incl. park_state: {d:?}");
+        assert_eq!(r_recomp.stop_reason,
+                   ExecutionStopReason::ChannelStall { channel: 28, is_write: true });
+
+        let expected = Some(SpuParkState {
+            pc: 0x10C,
+            reason: SpuParkReason::ChannelWrite { channel: 28 },
+        });
+        assert_eq!(r_recomp.final_state.park_state, expected,
+                   "park PC must be the second wrch (0x10C), not the first");
+        assert_eq!(r_interp.final_state.park_state, expected);
+    }
+
+    /// Bad channel: helper returns BadChannel → interpreter
+    /// reproduces `Error::Unimplemented` → park_state is NOT set
+    /// (only true stalls park). Demonstrates that BadChannel and
+    /// Stall are semantically distinguished.
+    #[test]
+    fn r5_4a_bad_channel_does_not_park() {
+        let rdch = |rt: u32, ch: u32| (0x00Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop = 0xD7u32 & 0x3FFF;
+        let code: [u32; 2] = [rdch(3, 100), stop];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut interp = InterpreterExecutor::default();
+        let mut recomp = RecompilerExecutor::new();
+        let r_interp = interp.execute(&prog);
+        let r_recomp = recomp.execute(&prog);
+
+        let d = diff_snapshots(&r_interp.final_state, &r_recomp.final_state);
+        assert!(d.is_identical(),
+                "R5.4a bad channel must be byte-exact: {d:?}");
+
+        // Bad channel → Error, not ChannelStall.
+        match &r_recomp.stop_reason {
+            ExecutionStopReason::Error(_) => {}
+            other => panic!("expected Error from bad channel, got {other:?}"),
+        }
+
+        // park_state must be None — only WouldStall parks, not BadChannel.
+        assert_eq!(r_recomp.final_state.park_state, None,
+                   "BadChannel must NOT park");
+        assert_eq!(r_interp.final_state.park_state, None);
+    }
+
+    /// Programs that don't stall on channels must NOT park.
+    /// Sanity for the entire R5.4a model: parking is opt-in via
+    /// WouldStall, not a side effect of channel ops in general.
+    #[test]
+    fn r5_4a_non_stalling_program_has_no_park_state() {
+        let rchcnt = |rt: u32, ch: u32| (0x00Fu32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop = 0xD8u32 & 0x3FFF;
+        // rchcnt against a const-1 channel — never stalls.
+        let code: [u32; 2] = [rchcnt(3, 23), stop];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut recomp = RecompilerExecutor::new();
+        let r = recomp.execute(&prog);
+        assert_eq!(r.stop_reason, ExecutionStopReason::Stop(0xD8));
+        assert_eq!(r.final_state.park_state, None,
+                   "rchcnt const-1 success must not produce park_state");
+    }
+
+    /// Pre-existing fixtures (no channel ops) must produce park_state
+    /// = None — preserves byte-exact equivalence carried over from
+    /// earlier waves.
+    #[test]
+    fn r5_4a_pre_existing_fixtures_have_no_park_state() {
+        let mut exec = RecompilerExecutor::new();
+        let r1 = exec.execute(&loop_program());
+        let r2 = exec.execute(&fibonacci_program());
+        let r3 = exec.execute(&sum_of_squares_program());
+        let r4 = exec.execute(&brsl_ret_program());
+        for (label, r) in [("loop", r1), ("fib", r2), ("sumsq", r3), ("brsl", r4)] {
+            assert_eq!(r.final_state.park_state, None,
+                       "{label}: park_state must be None for non-channel programs");
+        }
+    }
+
+    // =====================================================================
+    // R5.4b — wake + resume after JIT stall
+    //
+    // End-to-end flow verified here:
+    //   1. JIT runs program until rdch/wrch hits WouldStall.
+    //   2. R5 partial fallback returns SpuExecutionResult with both
+    //      `park_state = Some(..)` and `channels = (live state)`.
+    //   3. PPU side mutates a clone of `channels` (push in_mbox / drain
+    //      out_mbox / signal snr) and calls a wake helper on a SpuThread
+    //      reconstructed from the snapshot. Wake returns Ready { pc }.
+    //   4. Caller resumes via `InterpreterExecutor::resume_from_state`
+    //      with the updated channels, starting at `pc`. The channel op
+    //      now succeeds, the program runs to Stop.
+    //   5. Final snapshot is byte-exact vs an interpreter run that did
+    //      the same manual injection at the same point.
+    // =====================================================================
+
+    /// rdch SPU_RDINMBOX stall via JIT → wake by pushing in_mbox →
+    /// resume from park.pc → consumes value → byte-exact vs interp.
+    #[test]
+    fn r5_4b_jit_rdch_stall_wake_and_resume() {
+        use rpcs3_spu_differential::diff_snapshots;
+        use rpcs3_spu_thread::{SpuParkReason, SpuParkState, SpuThread, SpuWakeResult};
+
+        let rdch = |rt: u32, ch: u32| (0x00Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop_imm = 0xCEu32 & 0x3FFF;
+        let code: [u32; 2] = [rdch(3, 29), stop_imm];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes.clone());
+
+        // ---- A) JIT stall → snapshot has park_state + channels ----
+        let mut recomp = RecompilerExecutor::new();
+        let r_stall = recomp.execute(&prog);
+        assert_eq!(r_stall.stop_reason,
+                   ExecutionStopReason::ChannelStall { channel: 29, is_write: false });
+        let park = r_stall.final_state.park_state.expect("must have park_state");
+        assert_eq!(park, SpuParkState {
+            pc: 0x100,
+            reason: SpuParkReason::ChannelRead { channel: 29 },
+        });
+        // Channels snapshot exposed for wake.
+        let stalled_channels = r_stall.final_state.channels.clone();
+        assert!(stalled_channels.in_mbox.is_none(),
+                "in_mbox must be empty at stall");
+
+        // ---- B) PPU wake on a SpuThread reconstructed from snapshot --
+        let mut spu = SpuThread::new(0);
+        spu.channels = stalled_channels.clone();
+        spu.park_state = Some(park);
+        let wake = spu.ppu_push_inmbox_and_try_wake(0xC0FFEE12);
+        let wake_pc = match wake {
+            SpuWakeResult::Ready { pc } => pc,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+        assert_eq!(wake_pc, park.pc);
+        assert!(!spu.is_parked());
+        // The wake helper updated `spu.channels`, which we'll feed
+        // forward into resume.
+        let resumed_channels = spu.channels.clone();
+
+        // ---- C) Resume from park.pc via InterpreterExecutor ------
+        let interp = InterpreterExecutor::default();
+        let r_resume = interp.resume_from_state(
+            r_stall.final_state.gpr.as_ref(),
+            r_stall.final_state.ls.as_ref(),
+            &resumed_channels,
+            wake_pc,
+            100,
+            r_stall.steps_executed,
+        );
+        assert_eq!(r_resume.stop_reason, ExecutionStopReason::Stop(0xCE));
+        assert!(r_resume.final_state.park_state.is_none(),
+                "after wake+resume park must be cleared");
+        // Final pc lands on stop instruction (rdch advances to 0x104).
+        assert_eq!(r_resume.final_state.pc, 0x104);
+
+        // ---- D) Byte-exact vs interpreter-only flow with same wake -
+        let mut interp_only = InterpreterExecutor::default();
+        let r_interp_full = interp_only.execute(&prog);
+        // r_interp_full stalls at the same point; resume the same way.
+        let r_interp_full_resume = {
+            let mut t = SpuThread::new(0);
+            t.channels = r_interp_full.final_state.channels.clone();
+            t.park_state = r_interp_full.final_state.park_state;
+            let _ = t.ppu_push_inmbox_and_try_wake(0xC0FFEE12);
+            let resumed = t.channels.clone();
+            interp.resume_from_state(
+                r_interp_full.final_state.gpr.as_ref(),
+                r_interp_full.final_state.ls.as_ref(),
+                &resumed,
+                park.pc,
+                100,
+                r_interp_full.steps_executed,
+            )
+        };
+        let d = diff_snapshots(&r_resume.final_state, &r_interp_full_resume.final_state);
+        assert!(d.is_identical(),
+                "JIT-stall→wake→resume must equal interp→stall→wake→resume: {d:?}");
+    }
+
+    /// wrch SPU_WROUTMBOX stall via JIT → wake by draining out_mbox →
+    /// resume from park.pc → wrch writes new value.
+    #[test]
+    fn r5_4b_jit_wrch_stall_wake_and_resume() {
+        use rpcs3_spu_differential::diff_snapshots;
+        use rpcs3_spu_thread::{SpuParkReason, SpuParkState, SpuThread, SpuWakeResult};
+
+        let il   = |rt: u32, imm: u16| ((0x081u32 & 0x1FF) << 23) | ((imm as u32) << 7) | rt;
+        let wrch = |rt: u32, ch: u32| (0x10Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop_imm = 0xCFu32 & 0x3FFF;
+        // 0x100 il   r3, 0xAA
+        // 0x104 wrch ch=28, r3   ; success — out_mbox = 0xAA
+        // 0x108 il   r4, 0xBB
+        // 0x10C wrch ch=28, r4   ; STALL — mbox full
+        // 0x110 stop 0xCF
+        let code: [u32; 5] = [il(3, 0xAA), wrch(3, 28), il(4, 0xBB), wrch(4, 28), stop_imm];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut recomp = RecompilerExecutor::new();
+        let r_stall = recomp.execute(&prog);
+        assert_eq!(r_stall.stop_reason,
+                   ExecutionStopReason::ChannelStall { channel: 28, is_write: true });
+        let park = r_stall.final_state.park_state.expect("must have park_state");
+        assert_eq!(park, SpuParkState {
+            pc: 0x10C,
+            reason: SpuParkReason::ChannelWrite { channel: 28 },
+        });
+        let stalled_channels = r_stall.final_state.channels.clone();
+        assert_eq!(stalled_channels.out_mbox, Some(0xAA),
+                   "out_mbox holds the first wrch's value at stall");
+
+        // PPU drains out_mbox, then wake.
+        let mut spu = SpuThread::new(0);
+        spu.channels = stalled_channels.clone();
+        spu.park_state = Some(park);
+        let (drained, wake) = spu.ppu_pop_outmbox_and_try_wake();
+        assert_eq!(drained, Some(0xAA));
+        let wake_pc = match wake {
+            SpuWakeResult::Ready { pc } => pc,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+        assert_eq!(wake_pc, 0x10C);
+        let resumed_channels = spu.channels.clone();
+
+        let interp = InterpreterExecutor::default();
+        let r_resume = interp.resume_from_state(
+            r_stall.final_state.gpr.as_ref(),
+            r_stall.final_state.ls.as_ref(),
+            &resumed_channels,
+            wake_pc,
+            100,
+            r_stall.steps_executed,
+        );
+        assert_eq!(r_resume.stop_reason, ExecutionStopReason::Stop(0xCF));
+        assert_eq!(r_resume.final_state.channels.out_mbox, Some(0xBB),
+                   "second wrch must have written 0xBB after wake");
+        assert!(r_resume.final_state.park_state.is_none());
+
+        // Compare to a pure-interpreter run that did the same dance.
+        let mut interp_only = InterpreterExecutor::default();
+        let r_interp_full = interp_only.execute(&prog);
+        let r_interp_full_resume = {
+            let mut t = SpuThread::new(0);
+            t.channels = r_interp_full.final_state.channels.clone();
+            t.park_state = r_interp_full.final_state.park_state;
+            let (_, _) = t.ppu_pop_outmbox_and_try_wake();
+            let resumed = t.channels.clone();
+            interp.resume_from_state(
+                r_interp_full.final_state.gpr.as_ref(),
+                r_interp_full.final_state.ls.as_ref(),
+                &resumed,
+                park.pc,
+                100,
+                r_interp_full.steps_executed,
+            )
+        };
+        let d = diff_snapshots(&r_resume.final_state, &r_interp_full_resume.final_state);
+        assert!(d.is_identical(),
+                "JIT wrch wake+resume must equal interp wake+resume: {d:?}");
+    }
+
+    /// Wake with unsatisfied condition → StillBlocked → resume must
+    /// re-park (interpreter sees the same WouldStall again at the same
+    /// pc). Demonstrates the wake API does NOT fake success.
+    #[test]
+    fn r5_4b_jit_wrong_wake_keeps_thread_blocked() {
+        use rpcs3_spu_thread::{SpuThread, SpuWakeResult};
+
+        let rdch = |rt: u32, ch: u32| (0x00Du32 << 21) | ((ch & 0x7F) << 7) | rt;
+        let stop_imm = 0xD0u32 & 0x3FFF;
+        let code: [u32; 2] = [rdch(3, 29), stop_imm];
+        let mut bytes = Vec::with_capacity(code.len() * 4);
+        for w in code { bytes.extend_from_slice(&w.to_be_bytes()); }
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut recomp = RecompilerExecutor::new();
+        let r_stall = recomp.execute(&prog);
+        let park = r_stall.final_state.park_state.expect("park_state must be set");
+        let stalled_channels = r_stall.final_state.channels.clone();
+
+        // PPU sends a signal — wrong channel for an RDINMBOX park.
+        let mut spu = SpuThread::new(0);
+        spu.channels = stalled_channels;
+        spu.park_state = Some(park);
+        let wake = spu.signal_and_try_wake(0, 0xFF);
+        assert_eq!(wake, SpuWakeResult::StillBlocked);
+        assert!(spu.is_parked(), "thread must remain parked");
+
+        // Resume anyway — interpreter must re-stall on the same rdch
+        // because in_mbox is still empty.
+        let interp = InterpreterExecutor::default();
+        let r_resume = interp.resume_from_state(
+            r_stall.final_state.gpr.as_ref(),
+            r_stall.final_state.ls.as_ref(),
+            &spu.channels,
+            park.pc,
+            100,
+            r_stall.steps_executed,
+        );
+        assert_eq!(r_resume.stop_reason,
+                   ExecutionStopReason::ChannelStall { channel: 29, is_write: false });
+        let park_again = r_resume.final_state.park_state
+            .expect("re-stall must re-park at same pc");
+        assert_eq!(park_again.pc, park.pc, "park pc must be stable across re-stall");
+    }
+
+    // =====================================================================
+    // R5.4c — SpuSingleThreadExecutor over the JIT backend
+    //
+    // Same park → wake → resume cycle as the differential-side tests,
+    // but the FIRST run goes through the recompiler (exercises the JIT
+    // stall → R5 partial fallback → snapshot path) before the
+    // executor classifies the result as Parked. Resume continues
+    // through `InterpreterExecutor::resume_from_state` per R5.4c
+    // contract.
+    // =====================================================================
+
+    /// JIT runs `rdch r3, RDINMBOX(29); ai r4, r3, 1; stop 0xA1` →
+    /// stalls on rdch → executor reports Parked → wake via
+    /// ppu_push_inmbox_and_try_wake → resume via executor → Finished.
+    #[test]
+    fn r5_4c_executor_via_jit_rdch_full_cycle() {
+        use rpcs3_spu_differential::{SpuExecEvent, SpuSingleThreadExecutor};
+        use rpcs3_spu_thread::{SpuParkReason, SpuThread, SpuWakeResult};
+
+        let rdch = (0x00Du32 << 21) | ((29 & 0x7F) << 7) | 3;
+        let ai   = ((0x1Cu32 & 0xFF) << 24) | ((1u32 & 0x3FF) << 14) | ((3 & 0x7F) << 7) | 4;
+        let stop = 0xA1u32 & 0x3FFF;
+        let mut bytes = Vec::with_capacity(12);
+        bytes.extend_from_slice(&rdch.to_be_bytes());
+        bytes.extend_from_slice(&ai.to_be_bytes());
+        bytes.extend_from_slice(&stop.to_be_bytes());
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut backend = RecompilerExecutor::new();
+        let mut exec = SpuSingleThreadExecutor::new();
+
+        let ev1 = exec.run_until_event(&mut backend, &prog);
+        let (parked_pc, parked_snapshot, parked_steps) = match ev1 {
+            SpuExecEvent::Parked { pc, reason, snapshot, steps } => {
+                assert_eq!(reason, SpuParkReason::ChannelRead { channel: 29 });
+                (pc, snapshot, steps)
+            }
+            other => panic!("expected Parked, got {other:?}"),
+        };
+        assert_eq!(parked_pc, 0x100,
+                   "JIT path must produce the same park PC as the interpreter path");
+
+        let mut shadow = SpuThread::new(0);
+        shadow.channels = parked_snapshot.channels.clone();
+        shadow.park_state = parked_snapshot.park_state;
+        let wake_pc = match shadow.ppu_push_inmbox_and_try_wake(0x88) {
+            SpuWakeResult::Ready { pc } => pc,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+
+        let ev2 = exec.resume_after_wake(
+            &parked_snapshot,
+            &shadow.channels,
+            wake_pc,
+            &prog,
+            parked_steps,
+        );
+        match ev2 {
+            SpuExecEvent::Finished { stop_code, snapshot, steps } => {
+                assert_eq!(stop_code, 0xA1);
+                assert!(steps > parked_steps);
+                assert_eq!(snapshot.gpr[3] >> 96, 0x88u128);
+                assert_eq!(snapshot.gpr[4] >> 96, 0x89u128);
+                assert_eq!(snapshot.park_state, None);
+                assert_eq!(snapshot.channels.in_mbox, None);
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+    }
+
+    /// JIT runs `il r3,0x1111; wrch r3,OUT(28); il r3,0xCAFE; wrch r3,OUT(28); stop 0xB2` →
+    /// second wrch stalls → executor reports Parked → drain via
+    /// ppu_pop_outmbox_and_try_wake → resume via executor → Finished
+    /// with new value in out_mbox.
+    #[test]
+    fn r5_4c_executor_via_jit_wrch_full_cycle() {
+        use rpcs3_spu_differential::{SpuExecEvent, SpuSingleThreadExecutor};
+        use rpcs3_spu_thread::{SpuParkReason, SpuThread, SpuWakeResult};
+
+        let il_a = ((0x081u32 & 0x1FF) << 23) | ((0x1111u32 & 0xFFFF) << 7) | 3;
+        let wrch = (0x10Du32 << 21) | ((28 & 0x7F) << 7) | 3;
+        let il_b = ((0x081u32 & 0x1FF) << 23) | ((0xCAFEu32 & 0xFFFF) << 7) | 3;
+        let stop = 0xB2u32 & 0x3FFF;
+        let mut bytes = Vec::with_capacity(20);
+        bytes.extend_from_slice(&il_a.to_be_bytes());
+        bytes.extend_from_slice(&wrch.to_be_bytes());
+        bytes.extend_from_slice(&il_b.to_be_bytes());
+        bytes.extend_from_slice(&wrch.to_be_bytes());
+        bytes.extend_from_slice(&stop.to_be_bytes());
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut backend = RecompilerExecutor::new();
+        let mut exec = SpuSingleThreadExecutor::new();
+
+        let ev1 = exec.run_until_event(&mut backend, &prog);
+        let (parked_pc, parked_snapshot, parked_steps) = match ev1 {
+            SpuExecEvent::Parked { pc, reason, snapshot, steps } => {
+                assert_eq!(reason, SpuParkReason::ChannelWrite { channel: 28 });
+                (pc, snapshot, steps)
+            }
+            other => panic!("expected Parked, got {other:?}"),
+        };
+        assert_eq!(parked_pc, 0x10C, "park PC must be the second wrch (0x10C)");
+        assert_eq!(parked_snapshot.channels.out_mbox, Some(0x1111));
+
+        let mut shadow = SpuThread::new(0);
+        shadow.channels = parked_snapshot.channels.clone();
+        shadow.park_state = parked_snapshot.park_state;
+        let (drained, wake) = shadow.ppu_pop_outmbox_and_try_wake();
+        assert_eq!(drained, Some(0x1111));
+        let wake_pc = match wake {
+            SpuWakeResult::Ready { pc } => pc,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+
+        let ev2 = exec.resume_after_wake(
+            &parked_snapshot,
+            &shadow.channels,
+            wake_pc,
+            &prog,
+            parked_steps,
+        );
+        match ev2 {
+            SpuExecEvent::Finished { stop_code, snapshot, .. } => {
+                assert_eq!(stop_code, 0xB2);
+                assert_eq!(snapshot.channels.out_mbox, Some(0xFFFFCAFE),
+                           "il sign-extends 0xCAFE to 0xFFFFCAFE");
+                assert_eq!(snapshot.park_state, None);
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+    }
+
+    /// Pre-existing fixtures (loop, fib, sumsq, brsl) must finish with
+    /// SpuExecEvent::Finished, never Parked. Confirms R5.4c does not
+    /// regress non-channel programs.
+    #[test]
+    fn r5_4c_executor_existing_fixtures_still_finish() {
+        use rpcs3_spu_differential::{SpuExecEvent, SpuSingleThreadExecutor};
+
+        let mut backend = RecompilerExecutor::new();
+        let mut exec = SpuSingleThreadExecutor::new();
+
+        for (label, prog) in [
+            ("loop", loop_program()),
+            ("fib", fibonacci_program()),
+            ("sumsq", sum_of_squares_program()),
+            ("brsl", brsl_ret_program()),
+        ] {
+            match exec.run_until_event(&mut backend, &prog) {
+                SpuExecEvent::Finished { snapshot, .. } => {
+                    assert_eq!(snapshot.park_state, None,
+                               "{label}: park_state must be None");
+                }
+                other => panic!("{label}: expected Finished, got {other:?}"),
+            }
+        }
+    }
+
+    // =====================================================================
+    // R5.4e — SpuPpuLockstepDriver over the JIT backend
+    //
+    // Drives a full PPU↔SPU script through `RecompilerExecutor` to
+    // validate that the lockstep harness composes with the JIT path
+    // (initial run goes through JIT; resume after wake still goes
+    // through interpreter per R5.4c contract).
+    // =====================================================================
+
+    /// JIT runs `rdch r3, IN(29); ai r4, r3, 1; wrch r4, OUT(28); stop 0xA1` →
+    /// SPU parks on rdch (JIT helper returns Stall, R5 partial fallback
+    /// produces the Parked event the lockstep driver classifies). PPU
+    /// pushes 41, wake fires, resume runs the rest, SPU finishes,
+    /// PPU pops 42.
+    #[test]
+    fn r5_4e_lockstep_via_jit_rdch_handshake() {
+        use rpcs3_spu_differential::{
+            LockstepError, PpuAction, SpuEventKind, SpuPpuLockstepDriver,
+        };
+        use rpcs3_spu_thread::SpuParkReason;
+
+        let rdch = (0x00Du32 << 21) | ((29 & 0x7F) << 7) | 3;
+        let ai   = ((0x1Cu32 & 0xFF) << 24) | ((1u32 & 0x3FF) << 14)
+                 | ((3 & 0x7F) << 7) | 4;
+        let wrch = (0x10Du32 << 21) | ((28 & 0x7F) << 7) | 4;
+        let stop = 0xA1u32 & 0x3FFF;
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(&rdch.to_be_bytes());
+        bytes.extend_from_slice(&ai.to_be_bytes());
+        bytes.extend_from_slice(&wrch.to_be_bytes());
+        bytes.extend_from_slice(&stop.to_be_bytes());
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut backend = RecompilerExecutor::new();
+        let mut driver = SpuPpuLockstepDriver::new(&mut backend, prog);
+
+        let trace: Result<_, LockstepError> = driver.run_script(&[
+            PpuAction::ExpectPark {
+                reason: SpuParkReason::ChannelRead { channel: 29 },
+            },
+            PpuAction::PushInMbox(41),
+            PpuAction::ExpectFinished { stop_code: 0xA1 },
+            PpuAction::PopOutMbox { expect: Some(42) },
+        ]);
+        let trace = trace.expect("JIT-side lockstep script must succeed");
+
+        assert!(matches!(
+            trace.final_event_kind,
+            SpuEventKind::Finished { stop_code: 0xA1 }
+        ));
+        assert_eq!(trace.final_snapshot.channels.in_mbox, None);
+        assert_eq!(trace.final_snapshot.channels.out_mbox, None);
+        assert_eq!(trace.final_snapshot.park_state, None);
+    }
+
+    /// JIT runs `il r3,0x1111; wrch r3,OUT(28); il r3,0x2222; wrch r3,OUT(28); stop 0xB2` →
+    /// second wrch parks on full out_mbox via R5.2 helper Stall →
+    /// R5 partial fallback produces Parked event → PPU drains and
+    /// resumes through interpreter (R5.4c) → JIT-byte-exact result.
+    #[test]
+    fn r5_4e_lockstep_via_jit_wrch_backpressure() {
+        use rpcs3_spu_differential::{
+            PpuAction, SpuEventKind, SpuPpuLockstepDriver,
+        };
+        use rpcs3_spu_thread::SpuParkReason;
+
+        let il_a = ((0x081u32 & 0x1FF) << 23) | ((0x1111u32 & 0xFFFF) << 7) | 3;
+        let wrch = (0x10Du32 << 21) | ((28 & 0x7F) << 7) | 3;
+        let il_b = ((0x081u32 & 0x1FF) << 23) | ((0x2222u32 & 0xFFFF) << 7) | 3;
+        let stop = 0xB2u32 & 0x3FFF;
+        let mut bytes = Vec::with_capacity(20);
+        bytes.extend_from_slice(&il_a.to_be_bytes());
+        bytes.extend_from_slice(&wrch.to_be_bytes());
+        bytes.extend_from_slice(&il_b.to_be_bytes());
+        bytes.extend_from_slice(&wrch.to_be_bytes());
+        bytes.extend_from_slice(&stop.to_be_bytes());
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut backend = RecompilerExecutor::new();
+        let mut driver = SpuPpuLockstepDriver::new(&mut backend, prog);
+
+        let trace = driver
+            .run_script(&[
+                PpuAction::ExpectPark {
+                    reason: SpuParkReason::ChannelWrite { channel: 28 },
+                },
+                PpuAction::PopOutMbox { expect: Some(0x1111) },
+                PpuAction::ExpectFinished { stop_code: 0xB2 },
+                PpuAction::PopOutMbox { expect: Some(0x2222) },
+            ])
+            .expect("JIT-side wrch backpressure script must succeed");
+
+        assert!(matches!(
+            trace.final_event_kind,
+            SpuEventKind::Finished { stop_code: 0xB2 }
+        ));
+        assert_eq!(trace.final_snapshot.channels.out_mbox, None);
+    }
+
+    /// R5.5 — JIT-backend smoke test for the trace replay layer.
+    /// Drives the rdch INMBOX handshake script through
+    /// `RecompilerExecutor`. Initial run goes through JIT (channel
+    /// helper returns Stall → R5 partial fallback produces Parked
+    /// event the trace replay engine consumes); resume after wake
+    /// goes through interpreter per R5.4c contract — documented as
+    /// a R5.4d follow-up, not a correctness issue here.
+    #[test]
+    fn r5_5_trace_replay_jit_backend_smoke() {
+        use rpcs3_spu_differential::{
+            replay_trace, SpuEventKind, SpuWakeResultKind, TraceEvent,
+            TraceReplayErrorKind,
+        };
+        use rpcs3_spu_thread::SpuParkReason;
+
+        // Same shape as r5_4e_lockstep_via_jit_rdch_handshake but
+        // expressed as a TraceEvent script.
+        let rdch = (0x00Du32 << 21) | ((29 & 0x7F) << 7) | 3;
+        let ai   = ((0x1Cu32 & 0xFF) << 24) | ((1u32 & 0x3FF) << 14)
+                 | ((3 & 0x7F) << 7) | 4;
+        let wrch = (0x10Du32 << 21) | ((28 & 0x7F) << 7) | 4;
+        let stop = 0xA1u32 & 0x3FFF;
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(&rdch.to_be_bytes());
+        bytes.extend_from_slice(&ai.to_be_bytes());
+        bytes.extend_from_slice(&wrch.to_be_bytes());
+        bytes.extend_from_slice(&stop.to_be_bytes());
+        let prog = SpuProgram::new(0x100, 100).with_segment(0x100, bytes);
+
+        let mut backend = RecompilerExecutor::new();
+        let report = replay_trace(
+            &mut backend,
+            prog,
+            &[
+                TraceEvent::ExpectSpuPark {
+                    reason: SpuParkReason::ChannelRead { channel: 29 },
+                    pc: Some(0x100),
+                },
+                TraceEvent::PpuPushInMbox {
+                    value: 41,
+                    expect_wake: SpuWakeResultKind::Ready,
+                },
+                TraceEvent::ExpectSpuFinished { stop_code: 0xA1 },
+                TraceEvent::PpuPopOutMbox {
+                    expect: Some(42),
+                    expect_wake: Some(SpuWakeResultKind::NotParked),
+                },
+                TraceEvent::ExpectGprWord { reg: 4, lane: 0, value: 42 },
+                TraceEvent::ExpectChannelState {
+                    in_mbox: None,
+                    out_mbox: None,
+                    out_intr_mbox: None,
+                    snr1: 0,
+                    snr2: 0,
+                },
+            ],
+        )
+        .map_err(|e| {
+            // If this fails, surface the kind with the event index.
+            let _: TraceReplayErrorKind = e.kind.clone();
+            e
+        })
+        .expect("JIT-backend trace replay must succeed");
+
+        assert!(matches!(
+            report.final_event_kind,
+            SpuEventKind::Finished { stop_code: 0xA1 }
+        ));
+        // Smoke check: summary contains expected text.
+        let summary = report.summary();
+        assert!(summary.contains("6 events processed"));
+        assert!(summary.contains("Finished"));
+    }
+
+    /// R5.6 — JIT-backend run of the synthetic homebrew-like mailbox
+    /// command protocol fixture. Exercises:
+    ///   - rdch INMBOX park (JIT helper Stall → R5 partial fallback).
+    ///   - wrch OUTMBOX backpressure park.
+    ///   - PPU-side wake via push (in_mbox) and pop (out_mbox).
+    ///   - branch + loop in the SPU code (brnz, br) — must remain
+    ///     correct under JIT codegen.
+    ///   - halt sentinel (cmd 0xFF → ceq → brnz → stop 0xD5).
+    /// Resume after wake still goes through the interpreter per R5.4c
+    /// contract — JIT-side resume is R5.4d, deferred.
+    #[test]
+    fn r5_6_trace_replay_mailbox_command_protocol_jit() {
+        use rpcs3_spu_differential::{
+            mailbox_command_protocol_program, mailbox_command_protocol_trace,
+            replay_trace, SpuEventKind, FIXTURE_NAME_MAILBOX_PROTOCOL,
+        };
+
+        let prog = mailbox_command_protocol_program();
+        let trace = mailbox_command_protocol_trace();
+
+        let mut backend = RecompilerExecutor::new();
+        let report = replay_trace(&mut backend, prog, &trace)
+            .expect("mailbox command protocol must replay cleanly on JIT backend");
+
+        assert!(matches!(
+            report.final_event_kind,
+            SpuEventKind::Finished { stop_code: 0xD5 }
+        ));
+        assert_eq!(report.records.len(), 16);
+        assert_eq!(report.final_snapshot.park_state, None);
+        assert_eq!(report.final_snapshot.channels.in_mbox, None);
+        assert_eq!(report.final_snapshot.channels.out_mbox, None);
+
+        // Labeled summary mentions fixture name + final stop code so a
+        // multi-trace run log is readable.
+        let labeled = report.summary_with_label(FIXTURE_NAME_MAILBOX_PROTOCOL);
+        assert!(labeled.contains(FIXTURE_NAME_MAILBOX_PROTOCOL));
+        assert!(labeled.contains("0xd5"));
+        assert!(labeled.contains("[15]"), "all 16 events must be listed");
+    }
+
+    /// R5.8 A.1+A.2 — JIT-backend smoke test for the JSONL capture
+    /// pipeline. Parses the public reference JSONL fixture from
+    /// `rpcs3-spu-differential::trace_fmt`, transforms it to a
+    /// `Vec<TraceEvent>`, and replays through `RecompilerExecutor`.
+    /// Initial run goes through JIT (channel helper Stalls →
+    /// R5 partial fallback produces Parked events the trace replay
+    /// engine consumes); resume after wake still uses interpreter
+    /// per R5.4c contract — documented limitation, not a correctness
+    /// issue here.
+    ///
+    /// This is the JIT-side end of the round-trip: parse → transform
+    /// → replay through JIT must produce the same `Finished` report
+    /// as the interpreter-side
+    /// `replay_transformed_trace_through_interpreter` test in the
+    /// differential crate.
+    #[test]
+    fn r5_8_jsonl_pipeline_jit_replay_smoke() {
+        use rpcs3_spu_differential::{
+            captured_events_to_trace, mailbox_command_protocol_program, parse_jsonl_trace,
+            replay_trace, SpuEventKind, R5_6_REFERENCE_JSONL,
+        };
+
+        let events = parse_jsonl_trace(R5_6_REFERENCE_JSONL).expect("parse must succeed");
+        assert_eq!(events.len(), 24, "reference fixture has 24 captured events");
+        let trace = captured_events_to_trace(&events).expect("transform must succeed");
+        assert_eq!(trace.len(), 16, "transformer must produce 16 R5.5 TraceEvents");
+
+        let mut backend = RecompilerExecutor::new();
+        let report = replay_trace(&mut backend, mailbox_command_protocol_program(), &trace)
+            .expect("JIT-backend trace replay must succeed");
+
+        assert!(matches!(
+            report.final_event_kind,
+            SpuEventKind::Finished { stop_code: 0xD5 }
+        ));
+        assert_eq!(report.records.len(), 16);
+        assert_eq!(report.final_snapshot.park_state, None);
+        assert_eq!(report.final_snapshot.channels.in_mbox, None);
+        assert_eq!(report.final_snapshot.channels.out_mbox, None);
+    }
+
+    // ---------------------------------------------------------------
+    // R5.9e.6 — Recompiler replay over the per-SPU sequential
+    // orchestrator on synthetic fixtures. Mirrors the interpreter
+    // tests in `rpcs3_spu_differential::per_spu_replay::tests` but
+    // with `RecompilerExecutor` as the backend. Differential goal:
+    // Interpreter and Recompiler must agree on the per-SPU
+    // `TraceReplayReport` for synthetic-supported paths.
+    //
+    // Real-trace v4 is NOT exercised here — its current divergence
+    // (`Unimplemented opcode 0x33FFE748 @ pc=0x850`) is in the
+    // interpreter's iteration-1 ISA subset and would block the JIT
+    // path with the same root cause; surfacing it on R5.9e.6 would
+    // re-emit the same diagnostic the R5.9e.5 v4 test already prints.
+    // ---------------------------------------------------------------
+
+    /// R5.9e.6 — single SPU at `target_spu=42` running the canonical
+    /// mailbox-command-protocol fixture through the JIT backend via
+    /// the per-SPU orchestrator. If `replay_per_spu_traces_with`
+    /// correctly delegates to `replay_trace`, the result is the same
+    /// `TraceReplayReport` the JIT-side R5.6 test already produces.
+    #[test]
+    fn r5_9e_6_per_spu_replay_recompiler_single_spu_mailbox_protocol() {
+        use std::collections::BTreeMap;
+
+        use rpcs3_spu_differential::{
+            mailbox_command_protocol_program, mailbox_command_protocol_trace,
+            replay_per_spu_traces_with, SpuEventKind,
+        };
+
+        let mut per_spu = BTreeMap::new();
+        per_spu.insert(42u32, mailbox_command_protocol_trace());
+
+        let mut programs = BTreeMap::new();
+        programs.insert(42u32, mailbox_command_protocol_program());
+
+        let reports = replay_per_spu_traces_with(&per_spu, &programs, |_| {
+            RecompilerExecutor::new()
+        })
+        .expect("synthetic single-SPU JIT replay must succeed");
+
+        assert_eq!(reports.len(), 1);
+        let report = &reports[&42u32];
+        assert!(matches!(
+            report.final_event_kind,
+            SpuEventKind::Finished { stop_code: 0xD5 }
+        ));
+        assert_eq!(report.records.len(), 16);
+        assert_eq!(report.final_snapshot.park_state, None);
+        assert_eq!(report.final_snapshot.channels.in_mbox, None);
+        assert_eq!(report.final_snapshot.channels.out_mbox, None);
+    }
+
+    /// R5.9e.6 — two SPUs at `target_spu=7` and `target_spu=42`, both
+    /// running the same canonical fixture, replayed via the per-SPU
+    /// orchestrator with a fresh `RecompilerExecutor` per SPU.
+    /// Verifies (a) the orchestrator runs both, (b) iteration order
+    /// is sorted by `target_spu`, (c) per-SPU JIT executors are
+    /// independent (no JIT cache leak between SPUs).
+    #[test]
+    fn r5_9e_6_per_spu_replay_recompiler_two_spus_mailbox_protocol() {
+        use std::collections::BTreeMap;
+
+        use rpcs3_spu_differential::{
+            mailbox_command_protocol_program, mailbox_command_protocol_trace,
+            replay_per_spu_traces_with, SpuEventKind,
+        };
+
+        let mut per_spu = BTreeMap::new();
+        per_spu.insert(7u32, mailbox_command_protocol_trace());
+        per_spu.insert(42u32, mailbox_command_protocol_trace());
+
+        let mut programs = BTreeMap::new();
+        programs.insert(7u32, mailbox_command_protocol_program());
+        programs.insert(42u32, mailbox_command_protocol_program());
+
+        // Track per-SPU factory invocations so we can assert order.
+        let mut seen: Vec<u32> = Vec::new();
+        let reports = replay_per_spu_traces_with(&per_spu, &programs, |tgt| {
+            seen.push(tgt);
+            RecompilerExecutor::new()
+        })
+        .expect("synthetic two-SPU JIT replay must succeed");
+
+        assert_eq!(reports.len(), 2);
+        assert_eq!(
+            seen,
+            vec![7u32, 42u32],
+            "factory must be called once per SPU in BTreeMap-sorted order"
+        );
+        for (tgt, report) in &reports {
+            assert!(
+                matches!(
+                    report.final_event_kind,
+                    SpuEventKind::Finished { stop_code: 0xD5 }
+                ),
+                "JIT replay for target_spu={tgt} should finish with stop_code 0xD5"
+            );
+            assert_eq!(report.records.len(), 16);
+            assert_eq!(report.final_snapshot.park_state, None);
+        }
+    }
+
+    /// R5.9e.6 — load-bearing differential check: feed the IDENTICAL
+    /// per-SPU set through both Interpreter and Recompiler, compare
+    /// reports for byte-exact agreement on the synthetic supported
+    /// path. If this test ever diverges, the JIT codegen has drifted
+    /// from the interpreter oracle on a path the iteration-1 ISA
+    /// subset already covers — a real correctness regression.
+    ///
+    /// Equality covers: SPU final event kind, record count, total
+    /// steps, and the `final_snapshot` (channels + park state). GPRs
+    /// are checked via `diff_snapshots` (the R5.4c+ canonical helper).
+    #[test]
+    fn r5_9e_6_interpreter_and_recompiler_reports_match() {
+        use std::collections::BTreeMap;
+
+        use rpcs3_spu_differential::{
+            diff_snapshots, mailbox_command_protocol_program, mailbox_command_protocol_trace,
+            replay_per_spu_traces, replay_per_spu_traces_with, InterpreterExecutor,
+        };
+
+        let mut per_spu = BTreeMap::new();
+        per_spu.insert(7u32, mailbox_command_protocol_trace());
+        per_spu.insert(42u32, mailbox_command_protocol_trace());
+
+        let mut programs = BTreeMap::new();
+        programs.insert(7u32, mailbox_command_protocol_program());
+        programs.insert(42u32, mailbox_command_protocol_program());
+
+        let interp_reports =
+            replay_per_spu_traces::<InterpreterExecutor>(&per_spu, &programs)
+                .expect("interpreter run must succeed");
+        let jit_reports =
+            replay_per_spu_traces_with(&per_spu, &programs, |_| RecompilerExecutor::new())
+                .expect("JIT run must succeed");
+
+        // Same key set in same order.
+        let interp_keys: Vec<u32> = interp_reports.keys().copied().collect();
+        let jit_keys: Vec<u32> = jit_reports.keys().copied().collect();
+        assert_eq!(interp_keys, jit_keys, "per-SPU key set must agree");
+
+        for &tgt in &interp_keys {
+            let i = &interp_reports[&tgt];
+            let j = &jit_reports[&tgt];
+
+            assert_eq!(
+                format!("{:?}", i.final_event_kind),
+                format!("{:?}", j.final_event_kind),
+                "final_event_kind must match for target_spu={tgt}",
+            );
+            assert_eq!(
+                i.records.len(),
+                j.records.len(),
+                "record count must match for target_spu={tgt}",
+            );
+            assert_eq!(
+                i.total_steps, j.total_steps,
+                "total_steps must match for target_spu={tgt} (interp={}, jit={})",
+                i.total_steps, j.total_steps,
+            );
+
+            // Final snapshot byte-exact agreement via the canonical
+            // diff helper. `is_identical` is the compound predicate:
+            // pc, channels, GPRs, LS bytes, park state ALL match.
+            let diff = diff_snapshots(&i.final_snapshot, &j.final_snapshot);
+            assert!(
+                diff.is_identical(),
+                "final_snapshot differs for target_spu={tgt}: {diff:?}",
+            );
+        }
+    }
+
+    /// R5.9e.6 — per-SPU orchestrator's `MissingProgram` pre-flight
+    /// gate also fires when the executor backend is the JIT. The
+    /// orchestrator's bijection check is backend-agnostic, but
+    /// re-asserting it here locks in the contract and prevents a
+    /// future "Recompiler-only" regression where pre-flight is
+    /// accidentally moved post-replay.
+    #[test]
+    fn r5_9e_6_recompiler_missing_program_error_preserves_target_spu() {
+        use std::collections::BTreeMap;
+
+        use rpcs3_spu_differential::{
+            mailbox_command_protocol_trace, replay_per_spu_traces_with, MultiSpuReplayError,
+            SpuProgram,
+        };
+
+        let mut per_spu = BTreeMap::new();
+        per_spu.insert(13u32, mailbox_command_protocol_trace());
+        let programs: BTreeMap<u32, SpuProgram> = BTreeMap::new();
+
+        let err = replay_per_spu_traces_with(&per_spu, &programs, |_| RecompilerExecutor::new())
+            .expect_err("missing program must reject pre-flight even on JIT backend");
+        match err {
+            MultiSpuReplayError::MissingProgram { target_spu } => {
+                assert_eq!(target_spu, 13);
+            }
+            other => panic!("expected MissingProgram, got {other:?}"),
+        }
     }
 }

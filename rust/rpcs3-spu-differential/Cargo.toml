@@ -15,5 +15,20 @@ crate-type = ["staticlib", "rlib"]
 rpcs3-spu-thread = { path = "../rpcs3-spu-thread" }
 rpcs3-spu-interpreter = { path = "../rpcs3-spu-interpreter" }
 
+# R5.8 trace_fmt: JSONL capture parser + transformer per docs/SPU_TRACE_CAPTURE.md.
+# Scoped to this crate only — no other workspace member uses serde today.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# R5.9e.4 spu_image_loader: SHA-256 of captured `.spuimg` side-file
+# bytes vs the JSONL `image_sha256` reference. `sha2` is already in
+# the workspace lockfile (transitive); used directly here.
+sha2 = "0.10"
+
+[dev-dependencies]
+# R5.9e.4: hermetic test scratch directories for side-file write/read
+# round-trips without polluting the workspace.
+tempfile = "3"
+
 [lints]
 workspace = true
