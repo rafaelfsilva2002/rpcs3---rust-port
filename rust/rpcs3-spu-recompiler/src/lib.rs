@@ -452,6 +452,13 @@ impl RecompilerExecutor {
                 state.store_gpr(reg as usize, value);
             }
         }
+        // R6.7 C.4 — feed the pre-populated tag-stat queue into the
+        // JIT's channels (same field on the heap-pinned SpuChannels
+        // that codegen mutates via state.channels_ptr). Empty queue
+        // for non-DMA programs.
+        channels.mfc_tag_stat_queue.extend(
+            program.initial_mfc_tag_stat_queue.iter().copied(),
+        );
 
         let max_iterations = (program.max_steps.max(1)) as usize;
         let mut total_steps: u64 = 0;

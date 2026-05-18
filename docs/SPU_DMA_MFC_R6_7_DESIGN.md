@@ -85,12 +85,22 @@ This is the correct behaviour today: the C++ executor handles MFC
 correctly via `do_mfc()` and `vm::` accessors, so the bridge
 yielding to it is the safe default.
 
-### 1.5 Existing oracle suite (6 fixtures)
+### 1.5 Oracle suite (7 fixtures since R6.7 A.5)
 
-All six are deliberately non-DMA. Their `.notes.md` companions
-each assert "zero `spu_wrch ch21`" as an acceptance criterion. The
-replay tests under `rust/rpcs3-spu-recompiler/tests/` enforce this
-via `assert!(mfc_cmd_events.is_empty())`.
+Six fixtures (`single_spu_mailbox_v1`, `single_spu_branch_loop_v1`,
+`single_spu_signal_v1`, `single_spu_loadstore_v1`,
+`single_spu_mailbox_multi_v1`, `game_like_mailbox_signal_v1`) are
+deliberately non-DMA. Their `.notes.md` companions each assert
+"zero `spu_wrch ch21`" as an acceptance criterion. The replay tests
+under `rust/rpcs3-spu-recompiler/tests/` enforce this via
+`assert!(mfc_cmd_events.is_empty())`.
+
+The seventh oracle, **`single_spu_dma_get_v1`** (landed R6.7 A.5,
+2026-05-03), is the project's first DMA-bound replay-validated
+fixture. It asserts the inverse: **exactly one** `spu_mfc_cmd`
+event (cmd=0x40 GET, tag=3, size=128, lsa=0x10000) plus exactly
+one `mfc_dma_complete` event. See § 11 closure section for the
+full landing record.
 
 ### 1.6 v4 diagnostic trace
 
@@ -568,8 +578,8 @@ because:
 | A.2 | Parser extension in `trace_fmt.rs`: new `CapturedEvent::SpuMfcCmd` and `CapturedEvent::MfcDmaComplete` variants. New rejection codes per § 4.3. The `UnsupportedDmaInTrace` becomes `UnsupportedMfcCmd` (for non-GET cmds) — existing tests update accordingly. **DONE 2026-05-02** — new variants + 8 new `TraceParseError` codes (`UnsupportedMfcCmd`, `UnsupportedMfcEah`, `BadDmaSize`, `BadDmaLsa`, `BadDmaSha`, `BadMfcTag`, `BadDmaTransferredBytes`, `MalformedMfcSequence`); ordering invariant (`spu_wrch ch21` immediately followed by matching `spu_mfc_cmd`) enforced in post-pass walk; bare `spu_wrch ch21` without follow-up still rejects with legacy `UnsupportedDmaInTrace`. Transformer adds `TraceTransformError::UnsupportedDmaInTrace` so MFC traces are NOT silently ignored — explicit hard-reject preserved until A.4 lands the replay state machine. 12 new unit tests (positive + negative + transformer rejection); 6 oracle replay tests stay green; `cargo test --workspace --lib` 5609 pass. `.dmachunk` loader + replay state machine deferred to A.3 / A.4. |
 | A.3 | Side-file loader: utility to resolve `<sha>.dmachunk` from `behavior-freeze/fixtures/spu/dma/` AND `<trace>.dma/` per-trace path (same fallback as `.spuimg`). **DONE 2026-05-02** — new `rust/rpcs3-spu-differential/src/dma_chunk.rs` module exposes `resolve_dma_chunk_side_file(trace_path, canonical_dma_dir, sha256, expected_size) -> Result<Vec<u8>, DmaChunkLoadError>` with per-trace precedence over canonical, defensive 64-lowercase-hex sha re-validation, empty / too-large / size-mismatch / sha-mismatch / missing / I/O failure variants, and the public `per_trace_dma_chunk_path` + `canonical_dma_chunk_path` builders for pre-flight checks. 11 new unit tests using `tempfile`; including `loader_does_not_change_transformer_policy` which proves `captured_events_to_traces_per_spu` STILL returns `TraceTransformError::UnsupportedDmaInTrace` for any MFC trace — A.3 does NOT relax the A.2 transformer policy. `.dmachunk` bytes are NEVER copied into LS at this phase (deferred to A.4). |
 | A.4 | Replay state machine in `MfcReplayState` next to the per-SPU executor. Both Interpreter and Recompiler wrappers consult the same instance. **DONE 2026-05-02 — ACEITO PARCIAL.** New `rust/rpcs3-spu-differential/src/mfc_replay.rs` lands the standalone state machine (PendingMfcCmd + MfcReplayState + MfcTagUpdate enum + 13 `MfcReplayError` variants) covering: ch16-23 wrch dispatch, ch21 GET-only arming, `process_mfc_cmd` (validates against pending packet + invokes A.3 loader + copies bytes into caller-supplied LS buffer), `process_mfc_dma_complete` (validates `transferred_bytes == size` + tag in flight), `process_rdch_tagstat` (Immediate / Any / All wait-mode oracle). 13 new unit tests using `tempfile` cover happy path + every error-class transition. **Wiring into the actual `replay_trace` flow is DEFERRED to Phase C (C.1-C.4)** — the Rust SPU thread (`rpcs3-spu-thread::ch::`) does NOT yet handle MFC channels (16-25), so the SPU executor would error on `wrch ch16` before reaching `MfcReplayState`. The transformer continues to hard-reject MFC traces with `TraceTransformError::UnsupportedDmaInTrace` (test `transformer_still_rejects_valid_get_mfc_trace_until_executor_supports_mfc_channels` pins the policy). 6 existing oracle replay fixtures unaffected (none contain MFC events). |
-| A.5 | First CC0 fixture `single_spu_dma_get_v1`: PPU writes table to EA, SPU GETs, computes checksum, halts. .self built via Docker. JSONL captured. .dmachunk + .spuimg produced. |
-| A.6 | Replay test `single_spu_dma_get_v1_replay.rs` mirroring the 6 existing tests. Acceptance: byte-identical interpreter+recompiler, OUT_MBOX matches canonical computation. |
+| A.5 | First CC0 fixture `single_spu_dma_get_v1`: PPU writes table to EA, SPU GETs, computes checksum, halts. .self built via Docker. JSONL captured. .dmachunk + .spuimg produced. **2026-05-02 v2 — PARTIAL: `.self` built + RPCS3 OFF canonical TTY confirmed; trace capture BLOCKED on rpcs3.exe rebuild**. PSL1GHT toolchain via Docker (`rpcs3-ps3dev-toolchain:local`) successfully built `single_spu_dma_get_v1.self` (939,475 bytes, sha256 `7b0761849ff64048dd4852d8fa9361cb70cec2dfe08ec5ef54e911fc53b333a0`, committed at `behavior-freeze/fixtures/spu/sources/single_spu_dma_get_v1/build/`). RPCS3 OFF runs the .self and reproduces the canonical TTY `[dma_get_v1] OK cause=0x1 status=0xdeada12f` exactly as designed. **However** the RPCS3 binary at `rpcs3-upstream-clean/bin/rpcs3.exe` is the R6.5b build (predates R6.7 A.1 patches) — capturing a trace with it produces JSONL events for `spu_image` / `spu_wrch ch28` / `spu_stop` / `final_state` but NO MFC events (no `spu_wrch ch16-23` / `spu_mfc_cmd` / `mfc_dma_complete` / `spu_rdch ch24`). To produce a full A.5 trace, the rpcs3.exe must be rebuilt with the R6.7 A.1 scaffolding patch (`cda976d7…`) + runtime hooks patch (`95bdcaae…`) applied. Source edits to `rpcs3-upstream-clean/rpcs3/Emu/Cell/{SPUTraceJsonl.h,SPUTraceJsonl.cpp,SPUThread.cpp}` were authored (R6.7 A.1 hooks ported to upstream-clean's R5.8/R5.9e.3 base) but the MSBuild rebuild hits cascading dependency issues: missing FFmpeg libs in `build/lib/Release-x64/` (resolvable by copying from `3rdparty/ffmpeg/lib/windows/x86_64/`), missing LLVM libs (resolvable by copying from `build/lib/Release-x64/llvm_build/lib/`), missing abseil libs (resolvable by copying from `build/lib/Release-x64/protobuf_build/lib/`), and a glslang↔spvtools mismatch (glslang.lib was rebuilt with new `SpvTools.cpp` references that pull in unresolved spvtools optimizer symbols — needs SPIRV-Tools subproject built from source which is out of scope for a single capture session). Resume path: (a) restore a known-good R6.7-aware rpcs3.exe (e.g., from CI artifact / dedicated build session), or (b) resolve the SPIRV-Tools build path in upstream-clean's CMake setup (likely needs `git submodule update --init --recursive` for the glslang submodule's External/spirv-tools subdir + a CMake configure pass). Once an R6.7-aware binary exists, the resume is mechanical: set `RPCS3_SPU_TRACE_JSONL`, run the .self, move side-files to canonical, remove `#[ignore]`. |
+| A.6 | Replay test `single_spu_dma_get_v1_replay.rs` mirroring the 6 existing tests. Acceptance: byte-identical interpreter+recompiler, OUT_MBOX matches canonical computation. **2026-05-02 — DONE as `#[ignore]`-gated scaffolding**. New `rust/rpcs3-spu-recompiler/tests/single_spu_dma_get_v1_replay.rs` (~270 lines) lands the full test mirroring the 6 existing oracles + the R6.7-specific assertions: exactly 1 `spu_mfc_cmd` (cmd=0x40, tag=3, size=128, eah=0, lsa=0x10000), exactly 1 `mfc_dma_complete`, exactly 1 `spu_wrch ch28` carrying status=0xDEADA12F, exactly 1 `spu_stop` 0x101, post-DMA LS at `[lsa..lsa+size]` matches the counting pattern, `apply_mfc_dma_pre_replay` produces 1 dispatch + 1-element queue, both Interpreter and Recompiler reach `Finished{0x101}` byte-identical via `diff_snapshots`, both `final_snapshot.channels.out_mbox == Some(0xDEADA12F)`. Test is `#[ignore]`d with a clear ungate instruction in the attribute message; once A.5 capture lands, removing the `#[ignore]` flips this to the 7th replay-validated oracle and the project's first DMA oracle. New `apply_mfc_dma_pre_replay` + `DmaPreReplayPlan` re-exports added to `rpcs3-spu-differential::lib`. |
 
 ### Phase B — bridge honest fallback
 
@@ -582,10 +592,11 @@ because:
 
 | Step | Deliverable |
 |------|-------------|
-| C.1 | Add ch16-25 to `rust/rpcs3-spu-thread/src/lib.rs` `ch::` module. |
-| C.2 | Wire wrch dispatcher to update `ch_mfc_cmd` fields. |
-| C.3 | wrch ch21 dispatcher: in REPLAY mode, replay state machine handles it (copies from `.dmachunk`). In NORMAL/runtime mode, returns `UnsupportedChannel` (bridge falls back). |
-| C.4 | rdch ch24 dispatcher: in REPLAY mode, returns the oracle tag stat. In NORMAL/runtime mode, returns `UnsupportedChannel`. |
+| C.1 | Add ch16-25 to `rust/rpcs3-spu-thread/src/lib.rs` `ch::` module. **DONE 2026-05-02** — `MFC_LSA, MFC_EAH, MFC_EAL, MFC_SIZE, MFC_TAG_ID, MFC_CMD, MFC_WR_TAG_MASK, MFC_WR_TAG_UPDATE, MFC_RD_TAG_STAT, MFC_RD_TAG_MASK` constants land. |
+| C.2 | Wire wrch dispatcher to update `ch_mfc_cmd` fields. **DONE 2026-05-02** — `SpuChannels` extended with `mfc_lsa`, `mfc_eah`, `mfc_eal`, `mfc_size`, `mfc_tag_id`, `mfc_wr_tag_mask`, `mfc_wr_tag_update`, `mfc_tag_stat_queue: VecDeque<u32>`. `write` accepts ch16-23 (param channels never stall, ch21 is a no-op in replay mode). `read` accepts ch24 (pops from `mfc_tag_stat_queue` or stalls) and ch25 (stateless mirror of `mfc_wr_tag_mask`). `count` updated. 4 new unit tests in `rpcs3-spu-thread`. |
+| C.3 | wrch ch21 dispatcher: in REPLAY mode, replay state machine handles it (copies from `.dmachunk`). In NORMAL/runtime mode, returns `UnsupportedChannel` (bridge falls back). **DONE 2026-05-02** — replay-mode integration uses **pre-application**: new `mfc_replay::apply_mfc_dma_pre_replay(events, trace_path, canonical_dma_dir, program) -> Result<DmaPreReplayPlan, MfcReplayError>` walks the captured event stream BEFORE the SPU runs, drives `MfcReplayState`, applies GET DMA bytes into a 256 KiB LS scratch (replacing the program's segments), and collects the rdch ch24 captured values into a queue. The SPU's own `wrch ch21` during replay is then a no-op (LS already has the post-DMA bytes). Runtime DMA is still out of scope. |
+| C.4 | rdch ch24 dispatcher: in REPLAY mode, returns the oracle tag stat. In NORMAL/runtime mode, returns `UnsupportedChannel`. **DONE 2026-05-02** — `SpuChannels::read(MFC_RD_TAG_STAT)` pops from `mfc_tag_stat_queue` (`WouldStall` when empty). Queue is fed via the new `SpuProgram::with_mfc_tag_stat_queue(queue) -> Self` builder + `initial_mfc_tag_stat_queue: Vec<u32>` field. Both `InterpreterExecutor::execute` and `RecompilerExecutor::execute` extend the program-load path to copy the queue into `spu.channels.mfc_tag_stat_queue` before the SPU runs. |
+| C.5 | Transformer: drop MFC events as pure context (no longer hard-reject) once executor wiring lands. **DONE 2026-05-02** — `transform_single_spu_subset` now treats `SpuMfcCmd` and `MfcDmaComplete` as pure context (same as `SpuRdch` / `SpuWrch` for non-mailbox channels). Pre-application is the layer that actually consumes them. Parser-level rejections (`UnsupportedMfcCmd`, `UnsupportedMfcEah`, `BadDmaSize`, `BadDmaLsa`, `BadDmaSha`, `BadMfcTag`, `BadDmaTransferredBytes`, `MalformedMfcSequence`, `UnsupportedDmaInTrace` for bare `wrch ch21`) all stay in place. End-to-end test `replay_executor_get_dma_copies_chunk_to_ls` runs synthetic SPU bytecode (assembled via `rpcs3_spu_interpreter::encode`) through the actual `InterpreterExecutor` with pre-applied DMA + populated tag-stat queue, asserting post-DMA LS holds the chunk bytes AND r10 (rdch ch24 destination) equals the popped tag-stat value. |
 
 ### Phase D — bridge runtime DMA opt-in (much later)
 
@@ -744,7 +755,174 @@ C, D) each have their own acceptance gates listed in § 8.
   file).
 - 6 existing oracles intact: the 6 replay tests still pass.
 - Bridge unchanged: sha256 `7d6b6bba…` pinned.
-- Trace patches unchanged: `d65aec91`/`8f253d7d` pinned.
+- Trace patches unchanged: `cda976d7…` / `95bdcaae…` pinned (sha
+  updated post-R6.7 A.1 vs original `d65aec91` / `8f253d7d`).
 - v4 still diagnostic-only.
-- No `.dmachunk` files exist yet anywhere.
-- No new schema variants in code.
+- No `.dmachunk` files exist yet anywhere (relaxed post-A.5: one
+  `.dmachunk` now exists at canonical `behavior-freeze/fixtures/spu/dma/471fb943…2be5.dmachunk`).
+- No new schema variants in code (relaxed post-A.2: `spu_mfc_cmd`
+  and `mfc_dma_complete` are now landed schema additions).
+
+---
+
+## 13. R6.7 closure (2026-05-03)
+
+R6.7 design + implementation phases A, C are **complete**. Phases
+B (bridge honest-fallback) and D (bridge runtime DMA opt-in) move
+to R7.
+
+### 13.1 Landed in R6.7
+
+| Phase | Deliverable | Status | Memory ref |
+|---|---|---|---|
+| Design | This document (§ 1-9) | ✅ committed 2026-05-01 | `project_r67_dma_mfc_design.md` |
+| A.1 | Writer extension — emits `spu_mfc_cmd` + `mfc_dma_complete` + content-addressed `.dmachunk` side-files | ✅ landed in upstream-clean C++ tree | `project_r67_a1_dma_writer_extension.md` |
+| A.2 | Parser extension (`trace_fmt.rs`) — recognizes the new event kinds with full validation; 8 rejection codes; ordering invariant ch21→spu_mfc_cmd | ✅ 12 new tests | `project_r67_a2_dma_parser_extension.md` |
+| A.3 | DMA chunk loader (`dma_chunk.rs`) — `resolve_dma_chunk_side_file()` per-trace + canonical fallback; SHA-256 + size validation; 7 error variants | ✅ 11 new tests | `project_r67_a3_dma_chunk_loader.md` |
+| A.4 | `MfcReplayState` (`mfc_replay.rs`) — state machine for ch16-25 + tag-stat queue + Immediate/Any/All wait modes | ✅ 13 new tests | `project_r67_a4_mfc_replay_state.md` |
+| Phase C | Executor wiring — ch16-25 in `rpcs3-spu-thread::ch`; `SpuChannels` extended; `apply_mfc_dma_pre_replay()` helper; transformer accepts MFC events as pure context | ✅ end-to-end synthetic test green | `project_r67_phase_c_mfc_executor_wiring.md` |
+| A.5 | First DMA-bound replay-validated oracle `single_spu_dma_get_v1` | ✅ landed 2026-05-03 | `project_r67_a5_landed_7th_oracle.md` |
+
+### 13.2 The seventh oracle: `single_spu_dma_get_v1`
+
+**Load-bearing acceptance:** OUT_MBOX = `0xDEADA12F` is only
+reachable when (a) the GET actually copied 128 bytes from EA into
+LS at lsa=0x10000, AND (b) the SPU computed the deterministic
+post-DMA sum + XOR. A silent fake-DMA path (zero-fill LS) would
+produce `0xDEADBEEF` (different) — the canonical comparison
+distinguishes "no DMA" from "wrong DMA" from "right DMA".
+
+**Trace shape (15 events):**
+
+```
+seq  0: spu_image          sha=97a38063…  size=0x40000
+seq  1: spu_wrch ch16=0x10000     (MFC_LSA)
+seq  2: spu_wrch ch17=0           (MFC_EAH)
+seq  3: spu_wrch ch18=0x10068400  (MFC_EAL)
+seq  4: spu_wrch ch19=128         (MFC_Size)
+seq  5: spu_wrch ch20=3           (MFC_TagID)
+seq  6: spu_wrch ch21=0x40        (MFC_Cmd = GET)
+seq  7: spu_mfc_cmd  cmd=0x40 tag=3 size=128 lsa=0x10000
+                     eah=0 eal=0x10068400
+                     ea_chunk_sha256=471fb943…2be5
+seq  8: mfc_dma_complete  tag=3  transferred=128
+seq  9: spu_wrch ch22=0x8         (WrTagMask)
+seq 10: spu_wrch ch23=0x2         (WrTagUpdate = ALL)
+seq 11: spu_rdch ch24=0x8         (RdTagStat returns 1<<3)
+seq 12: spu_wrch ch28=0xDEADA12F  (OUT_MBOX = canonical)
+seq 13: spu_stop  stop_code=0x101
+seq 14: final_state  r18=0x1FC0 r19=0xDEADBEEF r20=0xDEADA12F
+```
+
+**Canonical artifacts:**
+
+- `behavior-freeze/fixtures/spu/traces/single_spu_dma_get_v1.jsonl`
+  (15 events, 2,347 bytes)
+- `behavior-freeze/fixtures/spu/images/97a38063…ef56.spuimg`
+  (262,144 bytes — full LS at thread create)
+- `behavior-freeze/fixtures/spu/dma/471fb943…2be5.dmachunk`
+  (128 bytes — sum=8128, counting pattern 0x00..0x7F)
+
+### 13.3 Capture forensics (load-bearing for re-capture)
+
+Two non-obvious gotchas surfaced during the A.5 build-unblock
+work. Both must be re-established before any future R6.7 / R7
+re-capture from this MSBuild tree:
+
+1. **`R:\` SUBST drive must be active during build.** The
+   `rpcs3-upstream-clean/build/tmp/rpcs3-Release-x64/rpcs3.tlog/link.command.1.tlog`
+   has **545 burned-in `R:\` paths** (`/LIBPATH:R:\BUILD\LIB\RELEASE-X64\GLSLANG`,
+   `R:\BUILD\TMP\RPCS3-RELEASE-X64\*.OBJ`, `/OUT:R:\BIN\RPCS3.EXE`).
+   Without an active SUBST, link.exe silently skips the missing
+   `R:\` paths and falls through to `$(VULKAN_SDK)\Lib\glslang.lib`
+   (75 MB, /MD CRT vs our /MT) → 52 LNK2001 unresolved
+   `spvtools::Optimizer` externals from `glslang.lib(SpvTools.obj)`.
+   Fix: `subst R: "<repo-root>"` before invoking msbuild.
+
+2. **Interpreter mode required for the CAPTURE run only.** RPCS3
+   LLVM JIT bypasses the C++ `set_ch_value()` / `get_ch_value()`
+   for MFC channels (and all per-channel paths in general — the
+   existing 6 pre-A.5 oracles only get `spu_image + ch28 wrch +
+   stop + final_state` from JIT mode because their replay
+   reconstruction doesn't need per-channel events). The R6.7 A.1
+   trace hooks live INSIDE `set_ch_value()`, so JIT inlining
+   bypasses them. To capture full ch16-23 wrch + ch24 rdch +
+   spu_mfc_cmd + mfc_dma_complete events, set
+   `bin/config/config.yml`:
+   - `Core: SPU Decoder: Interpreter (static)`
+   - `Core: PPU Decoder: Interpreter (static)`
+
+   Restore to `Recompiler (LLVM)` after capture. The fixture's
+   `.notes.md` documents this in detail.
+
+### 13.4 What R7 covers (Phase B + Phase D — runtime DMA)
+
+R6.7 GET-only replay is complete. The remaining MFC work moves
+to R7:
+
+**R7 scope (proposed):**
+
+1. **Phase B — bridge honest-fallback (was deferred from R6.7
+   § 7.1):** when the runtime bridge encounters `MFC_Cmd` on a
+   delegated SPU, return `BridgeOutcome::FellBackToCpp` rather
+   than attempting DMA. The C++ side then handles the cmd
+   natively. Validates that bridge ON / OFF still produce the
+   same canonical TTY (`[dma_get_v1] OK cause=0x1
+   status=0xdeada12f`) for the A.5 fixture.
+
+2. **Phase D — bridge runtime DMA opt-in:** the bridge gains
+   real DMA execution via FFI back into RPCS3's
+   `process_mfc_cmd()`. This is the path needed for any SPU
+   program that branches on DMA results before stop (the A.5
+   fixture does — `cs = sum(LS[lsa..lsa+128]) ^ 0xDEADBEEF` is
+   computed AFTER the GET, then written to OUT_MBOX). Phase D
+   acceptance: bridge ON executes the A.5 .self end-to-end and
+   produces byte-identical state vs bridge OFF. The replay
+   oracle stays unchanged.
+
+3. **R7 non-scope (still deferred to R8+):**
+   - MFC PUT (LS → EA). Symmetric to GET but requires capturing
+     EA-before-PUT bytes; not in R7.
+   - DMA list cmds (GETL, PUTL, GETLB, etc.). Need per-list-element
+     event sequence.
+   - Atomic ops (GETLLAR, PUTLLC, PUTLLUC, PUTQLLUC). LL/SC
+     reservation tracking is its own work item.
+   - MFC barriers / fence bits. Not in scope until at least 2
+     overlapping DMAs are observed in a CC0 fixture.
+   - Multi-SPU DMA races on shared EA regions. R6.7+R7 single-SPU
+     only.
+
+**What stays DIAGNOSTIC-ONLY forever:**
+
+- `tests/data/spurs_test_v3_real.jsonl` (R5.9d-era multi-SPU
+  SPURS) — DMA-bound, contains commercial code, never promoted.
+- `tests/data/spurs_test_v4_real.jsonl` (R5.10a..p ISA-coverage
+  iteration's working trace) — DMA-bound at the protocol level,
+  contains commercial code, never promoted. v4 informed the
+  ISA-coverage push but is now retired; R6.7 closes the cycle by
+  delivering the fresh CC0 `single_spu_dma_get_v1` oracle as the
+  canonical first DMA-bound trace.
+
+### 13.5 Hard rules carried forward to R7
+
+The R6.7 § 11 rules ("Explicit refusal of fake DMA") are
+**unchanged** and carry into R7. The seventh oracle is the
+load-bearing proof that real captured DMA bytes — round-tripped
+through SHA-256 + content-addressed `.dmachunk` side-file +
+strict size/lsa validation — replay byte-identical across
+Interpreter and Recompiler. R7 must preserve this contract;
+synthesising MFC success without an oracle (replay) or RPCS3
+vm:: (runtime) is a hard reject. No manual JSONL editing. No
+fake `.dmachunk` content.
+
+### 13.6 Final acceptance state at R6 closure
+
+- ✅ 7 replay-validated oracles green (cross-backend byte-identical)
+- ✅ workspace `--lib --no-fail-fast` green
+- ✅ `check_trace_fixtures.py` green (7 fixtures listed)
+- ✅ `check_patch_separation.py` green (3 SHA-pinned patches intact)
+- ✅ Bridge `7d6b6bba…` unchanged
+- ✅ Scaffolding `cda976d7…` + runtime hooks `95bdcaae…` unchanged
+- ✅ v4 still diagnostic-only
+- ✅ `single_spu_dma_get_v1` is the project's first DMA-bound
+  replay-validated oracle; OUT_MBOX = `0xDEADA12F` canonical

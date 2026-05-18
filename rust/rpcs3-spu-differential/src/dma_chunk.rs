@@ -561,23 +561,18 @@ mod tests {
         }
     }
 
-    /// R6.7 A.3 invariant: this loader exists in isolation. Its
-    /// presence MUST NOT affect the transformer's hard-reject of
-    /// MFC traces — replay DMA still doesn't exist (A.4 scope).
-    /// The test verifies that `captured_events_to_traces_per_spu`
-    /// still returns `TraceTransformError::UnsupportedDmaInTrace`
-    /// when given a parsed MFC sequence, exactly as it did at
-    /// R6.7 A.2 closure.
+    /// R6.7 C.5 — after Phase C wired MFC channels into the executor
+    /// + the transformer started accepting MFC traces as context, the
+    /// loader's relationship to the transformer policy is the
+    /// inverse of the A.3 invariant: this test now confirms the
+    /// transformer ACCEPTS the same trace the A.3 loader would
+    /// resolve `.dmachunk` for. The loader itself is still
+    /// transformer-orthogonal — its job is bytes-on-disk, not trace
+    /// transformation.
     #[test]
-    fn loader_does_not_change_transformer_policy() {
-        use crate::trace_fmt::{
-            captured_events_to_traces_per_spu, parse_jsonl_trace, TraceTransformError,
-        };
+    fn loader_orthogonal_to_transformer_policy_post_phase_c() {
+        use crate::trace_fmt::{captured_events_to_traces_per_spu, parse_jsonl_trace};
 
-        // Same shape as the A.2 transformer-rejection test: a
-        // well-formed MFC GET pair followed by stop + final_state.
-        // The loader is NOT consulted here — we only confirm the
-        // transformer policy is unchanged from A.2.
         let valid_sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let jsonl = format!(
             r#"
@@ -589,12 +584,12 @@ mod tests {
 "#
         );
         let events = parse_jsonl_trace(&jsonl).expect("parser still accepts valid MFC sequence");
-        let err = captured_events_to_traces_per_spu(&events)
-            .expect_err("transformer must still reject MFC traces — A.3 loader changes nothing here");
-        assert!(
-            matches!(err, TraceTransformError::UnsupportedDmaInTrace { .. }),
-            "got {err:?} (expected UnsupportedDmaInTrace — replay DMA still not implemented)"
-        );
+        // The transformer now succeeds (post-C.5). The loader is
+        // not consulted by the transformer at any point — the
+        // pre-replay layer (`mfc_replay::apply_mfc_dma_pre_replay`)
+        // is where the loader is invoked.
+        let _per_spu = captured_events_to_traces_per_spu(&events)
+            .expect("transformer accepts valid MFC trace post Phase C");
     }
 
     /// Sanity: the public path-builder helpers produce the exact paths

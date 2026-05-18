@@ -1561,34 +1561,30 @@ fn transform_single_spu_subset(
                 // skipped so the transformer remains valid even when
                 // the trace stream includes images.
             }
-            CapturedEvent::SpuMfcCmd(m) => {
-                // R6.7 A.2: parser accepts the event + validates its
-                // fields, but the transformer still refuses to lower
-                // the trace because the replay state machine isn't
-                // ready (A.4) and the `.dmachunk` loader doesn't
-                // exist yet (A.3). Per the task spec, MFC events MUST
-                // NOT be silently ignored nor transformed into
-                // success — surface the failure here so the caller
-                // (e.g. a future replay test) sees a sharp error
-                // until A.4 lands.
-                return Err(TraceTransformError::UnsupportedDmaInTrace {
-                    event_index: idx,
-                    target_spu: m.target_spu,
-                    kind: "spu_mfc_cmd",
-                });
-            }
-            CapturedEvent::MfcDmaComplete(c) => {
-                // R6.7 A.2: same policy as `spu_mfc_cmd` — sharp
-                // refusal. The completion-only event won't appear
-                // without a preceding `spu_mfc_cmd` in a well-formed
-                // R6.7 trace (the writer always emits both), but the
-                // transformer guards it independently for defense in
-                // depth.
-                return Err(TraceTransformError::UnsupportedDmaInTrace {
-                    event_index: idx,
-                    target_spu: c.target_spu,
-                    kind: "mfc_dma_complete",
-                });
+            CapturedEvent::SpuMfcCmd(_) | CapturedEvent::MfcDmaComplete(_) => {
+                // R6.7 C.5 — MFC events are now legal context.
+                //
+                // The pre-replay step
+                // (`crate::mfc_replay::apply_mfc_dma_pre_replay`)
+                // walks the captured event stream BEFORE the SPU
+                // runs, applies any GET DMA into a 256 KiB LS scratch,
+                // and pre-populates the tag-stat queue
+                // (`SpuProgram::initial_mfc_tag_stat_queue`). By the
+                // time replay starts, the SPU's own `wrch ch16-21`
+                // are no-ops on the channel side (ch21 returns Ok
+                // without re-doing the DMA), and `rdch ch24` pops
+                // pre-populated values. So at THIS layer (the trace
+                // transformer that emits TraceEvents), MFC events are
+                // pure context — they neither produce TraceEvents
+                // nor advance the running/parked/finished state
+                // machine. Same treatment as `spu_wrch ch16-23`
+                // and `spu_rdch ch24`, which fall through to the
+                // catch-all "context-only" arm above.
+                //
+                // Parser-level validation (`UnsupportedMfcCmd`,
+                // `UnsupportedMfcEah`, etc.) still rejects malformed
+                // MFC traces at parse time. The transformer only sees
+                // events that already passed parser validation.
             }
             CapturedEvent::SpuPark(p) => {
                 let reason = park_reason(p.reason, p.channel);
@@ -3215,13 +3211,17 @@ mod tests {
         }
     }
 
-    /// Transformer: a parsed trace containing `spu_mfc_cmd` events is
-    /// rejected with `TraceTransformError::UnsupportedDmaInTrace`. R6.7
-    /// A.2 deliberately does NOT silently ignore MFC events nor
-    /// transform them into success — the rejection here is what makes
-    /// "no fake DMA" enforceable.
+    /// R6.7 C.5 — the transformer now ACCEPTS valid GET MFC traces
+    /// (drops MFC events as context, same as `spu_wrch` /
+    /// `spu_rdch`). The pre-replay helper
+    /// (`crate::mfc_replay::apply_mfc_dma_pre_replay`) is the layer
+    /// that actually applies DMA bytes to LS + populates the
+    /// rdch ch24 queue; the transformer itself only emits
+    /// `TraceEvent`s for PPU actions + `ExpectSpuFinished` +
+    /// `ExpectChannelState`. Updated from the A.2 / A.4
+    /// rejection-test that asserted hard-reject.
     #[test]
-    fn transform_rejects_mfc_trace_until_replay_support_lands() {
+    fn transformer_accepts_valid_get_mfc_trace_after_executor_wiring() {
         let jsonl = format!(
             r#"
 {{"seq":0,"side":"spu","kind":"spu_wrch","pc":256,"channel":21,"value":64,"would_stall":false,"target_spu":1}}
@@ -3231,30 +3231,32 @@ mod tests {
 {{"seq":4,"side":"spu","kind":"final_state","gpr_lane_zero":[],"channels":{{"in_mbox":null,"out_mbox":null,"out_intr_mbox":null,"snr1":0,"snr2":0}},"target_spu":1}}
 "#
         );
-        let events = parse_jsonl_trace(&jsonl).expect("parser must accept the MFC sequence");
-        let err = captured_events_to_trace(&events)
-            .expect_err("transformer must reject MFC trace");
-        match err {
-            TraceTransformError::UnsupportedDmaInTrace { target_spu, kind, .. } => {
-                assert_eq!(target_spu, 1);
-                // First MFC event encountered is the spu_mfc_cmd at
-                // per-SPU index 1 (the wrch ch21 above is consumed as
-                // pure state-machine context).
-                assert_eq!(kind, "spu_mfc_cmd");
-            }
-            other => panic!("expected UnsupportedDmaInTrace, got {other:?}"),
-        }
+        let events = parse_jsonl_trace(&jsonl).expect("parser accepts the MFC sequence");
+        let trace = captured_events_to_trace(&events)
+            .expect("transformer must accept valid GET MFC trace post Phase C wiring");
+        // The transformed trace contains the PpuPopOutMbox synthetic
+        // (from spu_stop with code 1, which doesn't trigger the
+        // 0x101/0x102 drain), ExpectSpuFinished, and
+        // ExpectChannelState from final_state. MFC events do NOT
+        // contribute additional TraceEvents — they're pure context.
+        // Specifically, no event of any kind references "MFC" or
+        // "DMA" since those are pre-replay-applied.
+        assert!(
+            trace.iter().any(|e| matches!(e, TraceEvent::ExpectSpuFinished { stop_code: 1 })),
+            "transform must include ExpectSpuFinished{{stop_code:1}}, got {trace:?}"
+        );
     }
 
-    /// Transformer: a trace that contains ONLY `mfc_dma_complete` (e.g.
-    /// reaching the transformer somehow without a preceding wrch ch21)
-    /// is also rejected. Belt-and-suspenders: the parser already
-    /// catches this via `MalformedMfcSequence`, but the transformer
-    /// guards the case independently for defense in depth.
+    /// R6.7 C.5 — `mfc_dma_complete` standalone (no preceding
+    /// `spu_wrch ch21` + matching `spu_mfc_cmd`) is now also
+    /// transformer-context. The parser would catch a malformed
+    /// trace at parse time (via `MalformedMfcSequence` for an
+    /// orphan `spu_mfc_cmd`); a hand-built event vec containing
+    /// `mfc_dma_complete` alone bypasses the parser, so we verify
+    /// the transformer treats it as inert context (no error, no
+    /// TraceEvent emitted, state machine proceeds to spu_stop).
     #[test]
-    fn transform_rejects_mfc_dma_complete_directly() {
-        // Build the captured-event vec by hand to bypass the parser's
-        // ordering invariant (which would otherwise reject this).
+    fn transformer_treats_mfc_events_as_pure_context() {
         let events = vec![
             CapturedEvent::MfcDmaComplete(MfcDmaCompleteEvent {
                 seq: 0,
@@ -3284,11 +3286,11 @@ mod tests {
                 target_spu: Some(1),
             }),
         ];
-        let err = captured_events_to_trace(&events)
-            .expect_err("transformer must reject mfc_dma_complete");
-        match err {
-            TraceTransformError::UnsupportedDmaInTrace { target_spu: 1, kind: "mfc_dma_complete", .. } => {}
-            other => panic!("expected UnsupportedDmaInTrace mfc_dma_complete, got {other:?}"),
-        }
+        let trace = captured_events_to_trace(&events)
+            .expect("transformer treats orphan mfc_dma_complete as inert context");
+        assert!(
+            trace.iter().any(|e| matches!(e, TraceEvent::ExpectSpuFinished { stop_code: 1 })),
+            "transform must still produce ExpectSpuFinished, got {trace:?}"
+        );
     }
 }

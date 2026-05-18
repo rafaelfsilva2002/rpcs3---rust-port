@@ -778,6 +778,12 @@ pub fn apply_mfc_dma_pre_replay(
         segments: vec![crate::SpuSegment { lsa: 0, data: ls }],
         max_steps: program.max_steps,
         initial_gpr_overrides: program.initial_gpr_overrides,
+        // The tag-stat queue is delivered via the returned plan, not
+        // baked into the program here — caller decides whether to
+        // call `with_mfc_tag_stat_queue` on this program. That keeps
+        // the helper composable with callers who already have a
+        // queue from another source.
+        initial_mfc_tag_stat_queue: Vec::new(),
     };
 
     Ok(DmaPreReplayPlan {
@@ -1075,17 +1081,19 @@ mod tests {
         assert_eq!(stat, 0x28);
     }
 
-    /// A.4 invariant: the transformer in `trace_fmt.rs` STILL hard-
-    /// rejects MFC traces with `TraceTransformError::UnsupportedDmaInTrace`.
-    /// Wiring `MfcReplayState` into the actual `replay_trace` flow
-    /// requires Phase C (Rust SPU MFC channel handling), which is
-    /// out of A.4 scope. This test pins the policy so a future
-    /// refactor can't accidentally relax it.
+    /// R6.7 C.5 — Phase C closure point: with executor wiring
+    /// landed (ch16-25 in `rpcs3-spu-thread::ch::`, MFC fields on
+    /// `SpuChannels`, pre-application via
+    /// [`apply_mfc_dma_pre_replay`]), the transformer now ACCEPTS
+    /// valid GET traces. This test (renamed from the A.4 rejection
+    /// gate) verifies the new policy: parse + transform succeed,
+    /// no `UnsupportedDmaInTrace` surfaces. The companion test
+    /// `transformer_accepts_valid_get_mfc_trace_after_executor_wiring`
+    /// in `trace_fmt::tests` pins the same invariant from the
+    /// transformer side.
     #[test]
-    fn transformer_still_rejects_valid_get_mfc_trace_until_executor_supports_mfc_channels() {
-        use crate::trace_fmt::{
-            captured_events_to_traces_per_spu, parse_jsonl_trace, TraceTransformError,
-        };
+    fn transformer_now_accepts_valid_get_mfc_trace_after_executor_wiring() {
+        use crate::trace_fmt::{captured_events_to_traces_per_spu, parse_jsonl_trace};
 
         let valid_sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let jsonl = format!(
@@ -1098,12 +1106,8 @@ mod tests {
 "#
         );
         let events = parse_jsonl_trace(&jsonl).expect("parser still accepts the MFC sequence");
-        let err = captured_events_to_traces_per_spu(&events)
-            .expect_err("transformer must STILL reject MFC traces — A.4 is state-machine-only");
-        assert!(
-            matches!(err, TraceTransformError::UnsupportedDmaInTrace { .. }),
-            "got {err:?} (expected UnsupportedDmaInTrace — Phase C wires the executor)"
-        );
+        let _per_spu = captured_events_to_traces_per_spu(&events)
+            .expect("transformer must accept valid MFC trace post Phase C — pre-replay layer takes over");
     }
 
     /// A.4 invariant: the 6 existing oracle replay fixtures don't
@@ -1194,5 +1198,277 @@ mod tests {
             MfcReplayError::BadLsBufferSize { actual: 4096, expected: 0x40000 } => {}
             other => panic!("expected BadLsBufferSize, got {other:?}"),
         }
+    }
+
+    // =================================================================
+    // R6.7 C.3 — apply_mfc_dma_pre_replay tests
+    //
+    // The pre-replay helper takes a CapturedEvent slice, threads it
+    // through MfcReplayState, and produces a DmaPreReplayPlan whose
+    // SpuProgram has the post-DMA LS image as a single segment AND
+    // whose tag_stat_queue is ready for the executor's
+    // SpuChannels::mfc_tag_stat_queue. These tests verify the helper
+    // composes A.3 (loader) + A.4 (state machine) + C.4 (program
+    // builder field) correctly.
+    // =================================================================
+
+    use crate::trace_fmt::{SpuRdchEvent, SpuStopEvent, SpuWrchEvent};
+
+    /// Build the canonical 8-event GET sequence as a Vec<CapturedEvent>:
+    /// ch16-20 + ch22-23 + ch21 wrches → spu_mfc_cmd → mfc_dma_complete
+    /// → rdch ch24. Tag-stat sequence + lsa parametrized so tests can
+    /// exercise variations.
+    fn build_get_event_sequence(
+        target_spu: u32,
+        lsa: u32,
+        size: u32,
+        tag: u32,
+        sha: &str,
+    ) -> Vec<CapturedEvent> {
+        let mask = 1u32 << tag;
+        vec![
+            CapturedEvent::SpuWrch(SpuWrchEvent {
+                seq: 0, side: CapturedSide::Spu, pc: 256, channel: 16,
+                value: lsa, would_stall: false, target_spu: Some(target_spu),
+            }),
+            CapturedEvent::SpuWrch(SpuWrchEvent {
+                seq: 1, side: CapturedSide::Spu, pc: 260, channel: 17,
+                value: 0, would_stall: false, target_spu: Some(target_spu),
+            }),
+            CapturedEvent::SpuWrch(SpuWrchEvent {
+                seq: 2, side: CapturedSide::Spu, pc: 264, channel: 18,
+                value: 0xD0010000, would_stall: false, target_spu: Some(target_spu),
+            }),
+            CapturedEvent::SpuWrch(SpuWrchEvent {
+                seq: 3, side: CapturedSide::Spu, pc: 268, channel: 19,
+                value: size, would_stall: false, target_spu: Some(target_spu),
+            }),
+            CapturedEvent::SpuWrch(SpuWrchEvent {
+                seq: 4, side: CapturedSide::Spu, pc: 272, channel: 20,
+                value: tag, would_stall: false, target_spu: Some(target_spu),
+            }),
+            CapturedEvent::SpuWrch(SpuWrchEvent {
+                seq: 5, side: CapturedSide::Spu, pc: 276, channel: 22,
+                value: mask, would_stall: false, target_spu: Some(target_spu),
+            }),
+            CapturedEvent::SpuWrch(SpuWrchEvent {
+                seq: 6, side: CapturedSide::Spu, pc: 280, channel: 23,
+                value: 2, would_stall: false, target_spu: Some(target_spu),
+            }),
+            CapturedEvent::SpuWrch(SpuWrchEvent {
+                seq: 7, side: CapturedSide::Spu, pc: 284, channel: 21,
+                value: MFC_GET_CMD, would_stall: false, target_spu: Some(target_spu),
+            }),
+            CapturedEvent::SpuMfcCmd(SpuMfcCmdEvent {
+                seq: 8, side: CapturedSide::Spu, target_spu, pc: 284,
+                cmd: MFC_GET_CMD, tag, size, lsa, eah: 0, eal: 0xD0010000,
+                ea_chunk_sha256: sha.to_owned(),
+            }),
+            CapturedEvent::MfcDmaComplete(MfcDmaCompleteEvent {
+                seq: 9, side: CapturedSide::Spu, target_spu,
+                tag, transferred_bytes: size,
+            }),
+            CapturedEvent::SpuRdch(SpuRdchEvent {
+                seq: 10, side: CapturedSide::Spu, pc: 288, channel: 24,
+                value: Some(mask), would_stall: false,
+                target_spu: Some(target_spu),
+            }),
+            CapturedEvent::SpuStop(SpuStopEvent {
+                seq: 11, side: CapturedSide::Spu, pc: 292, stop_code: 1,
+                target_spu: Some(target_spu),
+            }),
+        ]
+    }
+
+    #[test]
+    fn apply_mfc_dma_pre_replay_injects_chunk_into_ls_segment() {
+        let tmp = TempDir::new().unwrap();
+        let (bytes, sha) = synthetic_chunk(128);
+        let _ = setup_per_trace_chunk(&tmp, "capture.jsonl", &sha, &bytes);
+        let trace_path = tmp.path().join("capture.jsonl");
+        let canonical = tmp.path().join("canonical_dma");
+
+        let events = build_get_event_sequence(1, 0x1000, 128, 3, &sha);
+        // Input program: a tiny code segment at LS=0x100 (entry_pc).
+        let input = SpuProgram::new(0x100, 1_000_000)
+            .with_segment(0x100, vec![0xAB; 16]);
+
+        let plan = apply_mfc_dma_pre_replay(&events, &trace_path, &canonical, input)
+            .expect("pre-replay must apply DMA + collect tag-stat");
+
+        // Plan has one consolidated 256 KiB LS segment.
+        assert_eq!(plan.program.segments.len(), 1);
+        assert_eq!(plan.program.segments[0].lsa, 0);
+        assert_eq!(plan.program.segments[0].data.len(), SPU_LS_SIZE);
+
+        // Original code segment bytes preserved at 0x100.
+        let ls = &plan.program.segments[0].data;
+        assert_eq!(&ls[0x100..0x110], &[0xAB; 16][..],
+            "input program's segment bytes preserved through pre-replay");
+
+        // GET destination at lsa=0x1000 holds the chunk bytes.
+        assert_eq!(&ls[0x1000..0x1080], bytes.as_slice(),
+            "GET destination LS region holds the chunk's bytes");
+
+        // Tag-stat queue populated with the captured rdch ch24 value.
+        assert_eq!(plan.tag_stat_queue.len(), 1);
+        assert_eq!(plan.tag_stat_queue[0], 1u32 << 3);
+
+        // Dispatched count is exactly 1 (one SpuMfcCmd consumed).
+        assert_eq!(plan.dispatched_get_count, 1);
+
+        // Other program metadata flowed through unchanged.
+        assert_eq!(plan.program.entry_pc, 0x100);
+        assert_eq!(plan.program.max_steps, 1_000_000);
+    }
+
+    #[test]
+    fn apply_mfc_dma_pre_replay_returns_empty_plan_for_non_dma_trace() {
+        let tmp = TempDir::new().unwrap();
+        let trace_path = tmp.path().join("capture.jsonl");
+        let canonical = tmp.path().join("canonical_dma");
+        std::fs::create_dir_all(&canonical).unwrap();
+
+        // No MFC events; just a stop. The helper should produce a
+        // pass-through plan: same LS bytes, empty tag-stat queue,
+        // zero dispatches.
+        let events = vec![CapturedEvent::SpuStop(SpuStopEvent {
+            seq: 0, side: CapturedSide::Spu, pc: 256,
+            stop_code: 1, target_spu: Some(1),
+        })];
+
+        let input = SpuProgram::new(0x100, 1)
+            .with_segment(0x100, vec![0xCD; 32]);
+
+        let plan = apply_mfc_dma_pre_replay(&events, &trace_path, &canonical, input)
+            .expect("pre-replay on non-DMA trace must succeed");
+
+        // The resulting LS is 256 KiB with the input bytes preserved at 0x100.
+        let ls = &plan.program.segments[0].data;
+        assert_eq!(&ls[0x100..0x120], &[0xCD; 32][..]);
+        assert!(plan.tag_stat_queue.is_empty());
+        assert_eq!(plan.dispatched_get_count, 0);
+    }
+
+    #[test]
+    fn apply_mfc_dma_pre_replay_propagates_loader_errors() {
+        let tmp = TempDir::new().unwrap();
+        // No .dmachunk on disk — MissingDmaChunk surfaces from A.3
+        // through the state machine to the helper.
+        let trace_path = tmp.path().join("capture.jsonl");
+        let canonical = tmp.path().join("canonical_dma");
+        std::fs::create_dir_all(&canonical).unwrap();
+
+        let (_, sha) = synthetic_chunk(128);
+        let events = build_get_event_sequence(1, 0x1000, 128, 3, &sha);
+        let input = SpuProgram::new(0x100, 1);
+
+        let err = apply_mfc_dma_pre_replay(&events, &trace_path, &canonical, input)
+            .expect_err("missing chunk must propagate to caller");
+        match err {
+            MfcReplayError::DmaChunkLoad(DmaChunkLoadError::MissingDmaChunk { .. }) => {}
+            other => panic!("expected DmaChunkLoad(MissingDmaChunk), got {other:?}"),
+        }
+    }
+
+    /// R6.7 C — end-to-end: a synthetic SPU program runs the full
+    /// MFC GET sequence (wrch ch16-23 + wrch ch21 + rdch ch24 +
+    /// stop) through the actual InterpreterExecutor with pre-applied
+    /// DMA. Asserts the post-DMA LS contains the chunk bytes AND
+    /// the SPU stopped with the captured stop_code.
+    ///
+    /// This is the load-bearing Phase C integration test: it exercises
+    /// every layer (A.3 loader, A.4 state machine, C.1 channels, C.2
+    /// dispatch, C.3 pre-replay, C.4 program plumbing).
+    #[test]
+    fn replay_executor_get_dma_copies_chunk_to_ls() {
+        use rpcs3_spu_interpreter::encode;
+        use crate::{ExecutionStopReason, InterpreterExecutor, SpuExecutor};
+
+        let tmp = TempDir::new().unwrap();
+        let (bytes, sha) = synthetic_chunk(128);
+        let _ = setup_per_trace_chunk(&tmp, "capture.jsonl", &sha, &bytes);
+        let trace_path = tmp.path().join("capture.jsonl");
+        let canonical = tmp.path().join("canonical_dma");
+
+        // Synthetic SPU bytecode: do `wrch chN, rN` for ch16-20 + ch22-23
+        // + ch21, then `rdch r10, ch24`, then stop. We pre-load the GPRs
+        // with the param values via `with_initial_gpr` so we don't need
+        // immediates (which would require il/ila instructions and more
+        // complex assembly).
+        //
+        // r1 = lsa (0x1000)         → wrch ch16, r1
+        // r2 = eah (0)              → wrch ch17, r2
+        // r3 = eal (0xD001_0000)    → wrch ch18, r3
+        // r4 = size (128)           → wrch ch19, r4
+        // r5 = tag (3)              → wrch ch20, r5
+        // r6 = mask (1<<3)          → wrch ch22, r6
+        // r7 = mode (2 = ALL)       → wrch ch23, r7
+        // r8 = cmd (0x40)           → wrch ch21, r8
+        // rdch r10, ch24
+        // stop 1
+        let mut code: Vec<u8> = Vec::new();
+        let push = |c: &mut Vec<u8>, w: u32| c.extend_from_slice(&w.to_be_bytes());
+        push(&mut code, encode::wrch(1, 16));
+        push(&mut code, encode::wrch(2, 17));
+        push(&mut code, encode::wrch(3, 18));
+        push(&mut code, encode::wrch(4, 19));
+        push(&mut code, encode::wrch(5, 20));
+        push(&mut code, encode::wrch(6, 22));
+        push(&mut code, encode::wrch(7, 23));
+        push(&mut code, encode::wrch(8, 21));
+        push(&mut code, encode::rdch(10, 24));
+        push(&mut code, encode::stop(1));
+
+        // GPR preferred slot is at the high u32 (lane 0) of the u128 —
+        // shift left by 96. The interpreter reads `split_lanes(...)[0]`
+        // for wrch's rt value, which corresponds to the top u32.
+        let gpr = |v: u32| (v as u128) << 96;
+        let lsa = 0x1000u32;
+        let mask = 1u32 << 3;
+        let entry_pc = 0x200u32; // arbitrary, 4-byte aligned
+        let input = SpuProgram::new(entry_pc, 100)
+            .with_segment(entry_pc, code)
+            .with_initial_gpr(1, gpr(lsa))
+            .with_initial_gpr(2, gpr(0))
+            .with_initial_gpr(3, gpr(0xD001_0000))
+            .with_initial_gpr(4, gpr(128))
+            .with_initial_gpr(5, gpr(3))
+            .with_initial_gpr(6, gpr(mask))
+            .with_initial_gpr(7, gpr(2))
+            .with_initial_gpr(8, gpr(0x40));
+
+        // Pre-replay applies the GET DMA into LS at lsa=0x1000 +
+        // populates the tag-stat queue with `mask`.
+        let events = build_get_event_sequence(1, lsa, 128, 3, &sha);
+        let plan = apply_mfc_dma_pre_replay(&events, &trace_path, &canonical, input)
+            .expect("pre-replay applies DMA + collects tag-stat");
+
+        let program = plan.program
+            .with_mfc_tag_stat_queue(plan.tag_stat_queue.into_iter().collect());
+
+        // Execute through the real InterpreterExecutor.
+        let mut executor = InterpreterExecutor::default();
+        let result = executor.execute(&program);
+
+        // SPU stopped with code 1 (the stop instruction we encoded).
+        match &result.stop_reason {
+            ExecutionStopReason::Stop(1) => {}
+            other => panic!("expected Stop(1), got {other:?} (steps={})", result.steps_executed),
+        }
+
+        // Post-DMA LS holds the chunk bytes at lsa..lsa+size.
+        let ls_bytes = result.final_state.ls.as_ref();
+        assert_eq!(
+            &ls_bytes[lsa as usize..(lsa as usize + 128)],
+            bytes.as_slice(),
+            "post-execution LS must have the GET chunk bytes at lsa"
+        );
+
+        // r10 (the rdch ch24 destination) holds the tag-stat value
+        // (`mask` = 1<<3). Preferred slot is lane 0 = top u32 of u128.
+        let r10 = result.final_state.gpr[10];
+        let r10_lane0 = (r10 >> 96) as u32;
+        assert_eq!(r10_lane0, mask, "r10 must hold the popped tag-stat value");
     }
 }

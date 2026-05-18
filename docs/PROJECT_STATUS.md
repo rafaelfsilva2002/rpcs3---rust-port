@@ -1,6 +1,95 @@
-# Project Status — R5 CLOSED at R5.9e.7 + R5.11/R5.11b oracle suite expansion landed
+# Project Status — R6 CLOSED at R6.7 A.5 (7th oracle: first DMA-bound replay-validated)
 
 **Authoritative current source of truth for the RPCS3 → Rust port.**
+
+Last updated: 2026-05-03. **R6 phase status: FORMALLY CLOSED.** R6 delivered the full PPU↔SPU runtime bridge (R6.2 first delegation → R6.3a/b/c per-oracle delegation → R6.4a outcome contract + R6.4b persistent handle → R6.5/R6.5b bridge acceptance on real .self binaries → R6.6 game_like_v1 cross-path sentinel) and the DMA / MFC replay capability (R6.7 design + A.1-A.5 + Phase C → first DMA-bound oracle `single_spu_dma_get_v1`). All work committed to documentation + code is gated by the seven replay-validated oracles below; the runtime bridge runs ON without breaking any oracle (`bridge ON ≡ bridge OFF` byte-identical on all 7). The runtime DMA execution path (Phase B/D of the R6.7 design) is **explicitly out of R6 scope and moves to R7** — see § "R6 phase closure (2026-05-03)" below.
+
+**Seven replay-validated oracles** (all `diff_snapshots(interp, jit).is_identical()` byte-identical):
+
+1. `single_spu_mailbox_v1` (R5.9e.7) — first oracle; IN_MBOX + OUT_MBOX + stop 0x101
+2. `single_spu_branch_loop_v1` (R5.11) — + branch/loop ISA (Fibonacci)
+3. `single_spu_signal_v1` (R5.11) — + SNR1 + SNR-blocking semantics fix
+4. `single_spu_loadstore_v1` (R5.11b) — + LS load/store + 3 Cell BE compliance corrections (rotqby RR-form / C-family mask byte-order / RRR-form rt/rc positions)
+5. `single_spu_mailbox_multi_v1` (R6.4b-replay) — + real park/wake cycle (PPU `sysUsleep` between writes)
+6. `game_like_mailbox_signal_v1` (R6.6) — + IN_MBOX × LS load/store × branch/loop × SNR1 × park/wake combined; first "game-like" cross-path sentinel
+7. **`single_spu_dma_get_v1` (R6.7 A.5)** — **first DMA-bound oracle**; ch16-21 wrch + spu_mfc_cmd + mfc_dma_complete + ch22-23 + rdch ch24 + OUT_MBOX = `0xDEADA12F` canonical. See `docs/SPU_DMA_MFC_R6_7_DESIGN.md` § 13 for the closure record.
+
+R5 closure record (preserved verbatim below) and R6 closure section (immediately below this preamble) are both authoritative. R7 scope is defined in `docs/SPU_DMA_MFC_R6_7_DESIGN.md` § 13.4.
+
+---
+
+## R6 phase closure (2026-05-03)
+
+R6 is **formally closed** as of R6.7 A.5's landing. Phases delivered:
+
+**Stack landed (R6.1 → R6.7 A.5):**
+
+- **R6.2 first delegation** — the C++ runtime bridge `SPURustBridge.cpp` (sha `7d6b6bba…`) actually executes the SPU via the Rust executor via `try_delegate_execution()` + reuses lv2 `stop_and_signal()`. Default OFF preserved; opt-in toggle in `bin/config/config.yml`. Bridge ON / OFF produces byte-identical state on `single_spu_mailbox_v1`.
+- **R6.3a/b/c per-oracle delegation** — `single_spu_branch_loop_v1` + `single_spu_loadstore_v1` + `single_spu_signal_v1` all delegate through R6.2's bridge unchanged. R6.3c was the first to require a real logic extension (Phase 1b SNR forwarding via `rust_spu_signal()` FFI) — all 4 R5/R5.11 oracle fixtures now delegate ON.
+- **R6.4a outcome contract** — formalizes the `BridgeOutcome::Stop = COMMIT` semantic; `classify_stall_channel()` helper; per-outcome diagnostic logs; FFI test `continue_then_resume`. R6.4b deferred → tracked.
+- **R6.4b persistent handle** — `unordered_map<lv2_id, BridgeSession>` side-table + multi-round loop with `pop_wait` for Stalls. FFI gate green. Followed by **R6.4b-toolchain** (PSL1GHT/ps3toolchain in Docker image `rpcs3-ps3dev-toolchain:local`, 2.43 GB content) → real `single_spu_mailbox_multi_v1.self` built + **R6.4b-replay** the 5th replay-validated oracle (`sysUsleep` between rounds forces real park; OUT_MBOX=0x453 confirms both rounds consumed byte-identical).
+- **R6.5 / R6.5b runtime bridge acceptance** — bridge ON on real `.self` binary proves `stall_iters=1` + persistent re-entry via `pop_wait`. R6.5b added StallWrite OUT_MBOX depth-1 overwrite (cooperative-thread MMIO limitation: PSL1GHT cannot expose the path real-binary, FFI gate green).
+- **R6.6 game_like 6th oracle** — first "game-like" fixture combining IN_MBOX + LS load/store + branch/loop + SNR1 + StallRead in a single SPU program; OUT_MBOX = `0x051A03C9`; bridge ON `total_steps=488 stall_iters=1`; replay byte-identical.
+- **R6.7 DMA / MFC design + implementation** — design committed (`docs/SPU_DMA_MFC_R6_7_DESIGN.md`); writer extension A.1 (scaffolding `cda976d7…` + runtime hooks `95bdcaae…`) emits `spu_mfc_cmd` + `mfc_dma_complete` + content-addressed `.dmachunk` side-files; parser A.2 + chunk loader A.3 + MfcReplayState A.4 + Phase C executor wiring all landed; **A.5 the 7th oracle `single_spu_dma_get_v1`** (first DMA-bound replay-validated; OUT_MBOX = `0xDEADA12F`).
+
+**What R6 delivered:**
+
+1. A working PPU↔SPU runtime bridge that executes real .self binaries through the Rust executor (R6.2 → R6.6).
+2. The bridge ON / OFF byte-identical contract preserved across all 7 oracles.
+3. A complete DMA capture + replay pipeline (R6.7 A.1-A.5) for plain MFC GET commands — writer extension, parser, content-addressed `.dmachunk` side-files, state machine, executor wiring, and the load-bearing CC0 fixture.
+4. The seventh replay-validated oracle (`single_spu_dma_get_v1`) that distinguishes "no DMA" from "wrong DMA" from "right DMA" via the canonical `0xDEADA12F` status.
+
+**Trace shape of the DMA oracle:** `spu_image` + ch16-21 wrch + `spu_mfc_cmd` + `mfc_dma_complete` + ch22-23 wrch + rdch ch24 + ch28 OUT_MBOX = `0xDEADA12F` + stop `0x101` + final_state (15 events total).
+
+**Capture requirements** (load-bearing for re-capture):
+
+1. **`R:\` SUBST drive active.** The MSBuild link.command.1.tlog has 545 burned-in `R:\` paths from the legacy build configuration. Without `subst R: <repo-root>` active, link.exe silently skips the missing paths and falls through to `$(VULKAN_SDK)\Lib\glslang.lib` (75 MB, /MD CRT vs our /MT) → 52 unresolved `spvtools::Optimizer` externals. Fix is one command before the build.
+2. **`Core: SPU Decoder: Interpreter (static)`** (and PPU Decoder) in `bin/config/config.yml` for the CAPTURE run only. RPCS3 LLVM JIT bypasses `set_ch_value()` / `get_ch_value()` for MFC channels, and the R6.7 A.1 trace hooks live inside those functions — JIT inlining suppresses them. Restore to `Recompiler (LLVM)` after capture.
+
+**What stays out of R6 scope (moves to R7):**
+
+- **Bridge Phase B (honest-fallback for MFC_Cmd).** When the bridge encounters `wrch ch21` on a delegated SPU, it should return `BridgeOutcome::FellBackToCpp` so C++ handles the cmd natively. Validates bridge ON / OFF produce the same canonical TTY for the A.5 fixture. Out of R6 because the A.5 fixture already replay-validates the GET; the bridge runtime path is a separate workstream.
+- **Bridge Phase D (runtime DMA opt-in via FFI back into RPCS3's `process_mfc_cmd()`).** Required when bridge-delegated SPUs need to branch on DMA results before stop (which `single_spu_dma_get_v1` does — `cs = sum(LS[lsa..lsa+128]) ^ 0xDEADBEEF` is computed AFTER the GET). Acceptance: bridge ON executes A.5 end-to-end with byte-identical state vs bridge OFF.
+- **MFC PUT (LS → EA)** — symmetric to GET but needs EA-before-PUT capture. Defer to R8+.
+- **DMA list commands** (GETL, PUTL, GETLB, PUTLB) — per-element event sequencing. Defer to R8+.
+- **Atomic ops** (GETLLAR, PUTLLC, PUTLLUC, PUTQLLUC) — LL/SC reservation tracking is its own work item. Defer.
+- **MFC barriers / fence bits.** Defer until ≥2 overlapping DMAs are observed in a CC0 fixture.
+- **Multi-SPU DMA races on shared EA.** R6+R7 single-SPU only.
+
+**What stays diagnostic-only forever** (per R5.9e.2 § D.1, unchanged):
+
+- `tests/data/spurs_test_v3_real.jsonl` (R5.9d-era multi-SPU SPURS, 6 SPUs) — contains commercial code.
+- `tests/data/spurs_test_v4_real.jsonl` (R5.10a..p iteration trace) — DMA-bound, contains commercial code. R6.7 closes the cycle by delivering `single_spu_dma_get_v1` as the canonical fresh CC0 DMA oracle; v4 is now retired (informed the ISA-coverage push but is no longer promoted).
+
+**Hard rules carried forward to R7** (unchanged from R6.7 § 11 of the design doc):
+
+- ✅ Never commit a fabricated / hand-authored `.jsonl`.
+- ✅ Never commit a trace of a commercial PS3 game.
+- ✅ Never edit a trace manually after capture (single-byte mods break the oracle property).
+- ✅ Never weaken Rust pipeline assertions to accept a divergent trace — divergence = real bug to investigate.
+- ✅ Never synthesize `MFC_Cmd=0x40` success without consulting an oracle (replay) or RPCS3 vm:: (runtime).
+- ✅ Never return a fixed/zero/random tag stat for `rdch ch24`.
+- ✅ Never fake LS bytes after a GET.
+
+**Confirmations at R6 closure** (gates re-run 2026-05-03 as documented in the "Current verified status" table further below):
+
+- `cargo test --workspace --lib --no-fail-fast` → all OK
+- `cargo test -p rpcs3-spu-recompiler --test {7 replay tests}` → all 7 OK
+- `cargo test -p rpcs3-spu-differential --lib` → 137 OK
+- `cargo test -p rpcs3-spu-thread --lib` → 44 OK
+- `python behavior-freeze/harness/check_trace_fixtures.py` → OK (7 fixtures listed)
+- `python behavior-freeze/harness/check_patch_separation.py` → OK (3 SHAs pinned: scaffolding `cda976d7…`, runtime hooks `95bdcaae…`, bridge `7d6b6bba…`)
+
+**R7 recommended scope** (proposed; details in `docs/SPU_DMA_MFC_R6_7_DESIGN.md` § 13.4):
+
+1. **R7.1 — Bridge Phase B (honest-fallback for MFC_Cmd):** delegate-aware C++ path returns `BridgeOutcome::FellBackToCpp` for `wrch ch21`; bridge ON / OFF produce same canonical TTY on `single_spu_dma_get_v1.self`. Smallest possible slice, no FFI changes.
+2. **R7.2 — Bridge Phase D (runtime DMA opt-in):** bridge FFI gains `rust_spu_mfc_cmd_dispatch()` that calls back into RPCS3's `process_mfc_cmd()` for plain GET. Bridge ON executes the A.5 .self end-to-end with byte-identical state vs bridge OFF. The replay oracle stays unchanged.
+3. **R7.3 — Replay symmetry test:** add a regression gate that runs `single_spu_dma_get_v1.self` under bridge ON / OFF / replay and asserts all three produce the same final state (canonical OUT_MBOX, same LS, same regs).
+4. **R7-non-scope:** MFC PUT, list cmds, atomics, barriers, multi-SPU DMA races — all defer to R8+. Same hard rules as R6 apply.
+
+---
+
+## Post-R5 / pre-R6 historical preamble (preserved for context)
 
 Last updated: 2026-04-29. **R5 phase status: FORMALLY CLOSED.** Post-closure additive layers **R5.11** (signals + branch/loop) and **R5.11b** (LS load/store) have landed three additional CC0 replay-validated fixtures atop R5.9e.7's `single_spu_mailbox_v1`:
 

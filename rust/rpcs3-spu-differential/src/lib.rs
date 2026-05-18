@@ -60,7 +60,8 @@ pub use dma_chunk::{
 // continues to hard-reject MFC traces until that lands.
 pub mod mfc_replay;
 pub use mfc_replay::{
-    MfcInFlight, MfcReplayError, MfcReplayState, MfcTagUpdate, PendingMfcCmd,
+    apply_mfc_dma_pre_replay, DmaPreReplayPlan, MfcInFlight, MfcReplayError, MfcReplayState,
+    MfcTagUpdate, PendingMfcCmd,
 };
 
 pub mod per_spu_replay;

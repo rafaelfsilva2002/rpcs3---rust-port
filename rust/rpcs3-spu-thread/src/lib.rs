@@ -1206,4 +1206,88 @@ mod tests {
         assert_eq!(t.ls_read(0x40, 4), Some([0xAA, 0xBB, 0xCC, 0xDD].as_ref()));
         assert!(t.is_parked());
     }
+
+    // =================================================================
+    // R6.7 C.2 — MFC channel dispatch tests
+    //
+    // The MFC param channels (16-20, 22, 23) are write-only register
+    // stores; the SPU writes them to assemble a DMA cmd packet but the
+    // actual transfer happens on `wrch ch21` (which in REPLAY mode is
+    // a no-op because `apply_mfc_dma_pre_replay` already injected the
+    // bytes into LS). `rdch ch24` (RdTagStat) pops the next pre-
+    // populated tag-stat value; `rdch ch25` (RdTagMask) is a stateless
+    // mirror of the wr_tag_mask register. None of the MFC channels
+    // ever return BadChannel after Phase C.
+    // =================================================================
+
+    #[test]
+    fn mfc_param_channels_stash_value_and_never_stall() {
+        let mut t = SpuThread::new(0);
+        // Each ch16-20 + ch22 + ch23 wrch should succeed and store
+        // the value in the matching SpuChannels field.
+        assert_eq!(t.channels.write(ch::MFC_LSA, 0x3FF00), Ok(()));
+        assert_eq!(t.channels.mfc_lsa, 0x3FF00);
+        assert_eq!(t.channels.write(ch::MFC_EAH, 0), Ok(()));
+        assert_eq!(t.channels.mfc_eah, 0);
+        assert_eq!(t.channels.write(ch::MFC_EAL, 0xD0010000), Ok(()));
+        assert_eq!(t.channels.mfc_eal, 0xD0010000);
+        assert_eq!(t.channels.write(ch::MFC_SIZE, 128), Ok(()));
+        assert_eq!(t.channels.mfc_size, 128);
+        assert_eq!(t.channels.write(ch::MFC_TAG_ID, 3), Ok(()));
+        assert_eq!(t.channels.mfc_tag_id, 3);
+        assert_eq!(t.channels.write(ch::MFC_WR_TAG_MASK, 1u32 << 3), Ok(()));
+        assert_eq!(t.channels.mfc_wr_tag_mask, 1u32 << 3);
+        assert_eq!(t.channels.write(ch::MFC_WR_TAG_UPDATE, 2), Ok(()));
+        assert_eq!(t.channels.mfc_wr_tag_update, 2);
+        // ch21 (MFC_Cmd) accepted as no-op in replay mode.
+        assert_eq!(t.channels.write(ch::MFC_CMD, 0x40), Ok(()));
+    }
+
+    #[test]
+    fn mfc_rdtagstat_pops_pre_populated_queue_or_stalls_when_empty() {
+        let mut t = SpuThread::new(0);
+        // Empty queue → WouldStall.
+        assert_eq!(
+            t.channels.read(ch::MFC_RD_TAG_STAT),
+            Err(ChannelStatus::WouldStall)
+        );
+        // Pre-populate two tag-stat values.
+        t.channels.mfc_tag_stat_queue.push_back(1u32 << 3);
+        t.channels.mfc_tag_stat_queue.push_back(1u32 << 5);
+        assert_eq!(t.channels.read(ch::MFC_RD_TAG_STAT), Ok(1u32 << 3));
+        assert_eq!(t.channels.read(ch::MFC_RD_TAG_STAT), Ok(1u32 << 5));
+        // Drained → next read stalls again.
+        assert_eq!(
+            t.channels.read(ch::MFC_RD_TAG_STAT),
+            Err(ChannelStatus::WouldStall)
+        );
+    }
+
+    #[test]
+    fn mfc_rdtagmask_mirrors_wr_tag_mask_register() {
+        let mut t = SpuThread::new(0);
+        t.channels.mfc_wr_tag_mask = 0x1234;
+        // Stateless read — calling twice returns the same value.
+        assert_eq!(t.channels.read(ch::MFC_RD_TAG_MASK), Ok(0x1234));
+        assert_eq!(t.channels.read(ch::MFC_RD_TAG_MASK), Ok(0x1234));
+    }
+
+    #[test]
+    fn mfc_channel_count_reports_correct_capacity() {
+        let mut t = SpuThread::new(0);
+        // Param/cmd write channels: always 1 free slot.
+        assert_eq!(t.channels.count(ch::MFC_LSA), Ok(1));
+        assert_eq!(t.channels.count(ch::MFC_EAH), Ok(1));
+        assert_eq!(t.channels.count(ch::MFC_EAL), Ok(1));
+        assert_eq!(t.channels.count(ch::MFC_SIZE), Ok(1));
+        assert_eq!(t.channels.count(ch::MFC_TAG_ID), Ok(1));
+        assert_eq!(t.channels.count(ch::MFC_CMD), Ok(1));
+        // RdTagStat: count = queue depth.
+        assert_eq!(t.channels.count(ch::MFC_RD_TAG_STAT), Ok(0));
+        t.channels.mfc_tag_stat_queue.push_back(0xAA);
+        t.channels.mfc_tag_stat_queue.push_back(0xBB);
+        assert_eq!(t.channels.count(ch::MFC_RD_TAG_STAT), Ok(2));
+        // RdTagMask: always 1 (stateless).
+        assert_eq!(t.channels.count(ch::MFC_RD_TAG_MASK), Ok(1));
+    }
 }
