@@ -208,6 +208,16 @@ pub enum ExecutionStopReason {
     ChannelStall { channel: u32, is_write: bool },
     /// `max_steps` exhausted without reaching `Stop`.
     MaxStepsExceeded,
+    /// R7.1 — an MFC/DMA channel op (`wrch ch16-23`, `rdch ch24-25`,
+    /// or `rchcnt` against any of those) hit the runtime bridge's
+    /// honest-fallback gate (`SpuChannels::refuse_mfc == true`). PC
+    /// has NOT advanced past the refusing instruction and NO Rust
+    /// state was mutated; the C++ runtime bridge is expected to drop
+    /// the Rust session and resume execution in the C++ SPU executor.
+    /// Distinct from `Error` so the runtime bridge can route this
+    /// outcome to a clean fallback path instead of treating it as a
+    /// backend error.
+    MfcUnsupported { channel: u32, is_write: bool, is_count: bool },
     /// Backend-side error (out-of-bounds LS access, unimplemented
     /// opcode, segment validation failure, etc.).
     Error(String),
@@ -331,6 +341,13 @@ impl SpuExecutor for InterpreterExecutor {
             Ok((n, StepOutcome::ChannelStall { channel, is_write })) => {
                 (n as u64, ExecutionStopReason::ChannelStall { channel, is_write })
             }
+            // R7.1 — propagate MFC honest-fallback as its own stop
+            // reason so the runtime bridge can route this to a clean
+            // C++ fallback rather than treating it as a backend error.
+            Ok((n, StepOutcome::MfcUnsupported { channel, is_write, is_count })) => (
+                n as u64,
+                ExecutionStopReason::MfcUnsupported { channel, is_write, is_count },
+            ),
             Ok((n, StepOutcome::Continue)) => (n as u64, ExecutionStopReason::MaxStepsExceeded),
             Err(e) => (0, ExecutionStopReason::Error(format!("{e:?}"))),
         };
@@ -390,6 +407,15 @@ impl InterpreterExecutor {
             Ok((n, StepOutcome::ChannelStall { channel, is_write })) => {
                 (n as u64, ExecutionStopReason::ChannelStall { channel, is_write })
             }
+            // R7.1 — resume path also propagates MFC honest-fallback.
+            // The JIT prefix can reach `wrch ch16` and partial-fallback
+            // to the interpreter at that PC; the interpreter then
+            // refuses immediately (channels.refuse_mfc carried over
+            // via the `channels` argument).
+            Ok((n, StepOutcome::MfcUnsupported { channel, is_write, is_count })) => (
+                n as u64,
+                ExecutionStopReason::MfcUnsupported { channel, is_write, is_count },
+            ),
             Ok((n, StepOutcome::Continue)) => (n as u64, ExecutionStopReason::MaxStepsExceeded),
             Err(e) => (0, ExecutionStopReason::Error(format!("{e:?}"))),
         };
@@ -584,6 +610,20 @@ pub enum SpuExecEvent {
         snapshot: SpuStateSnapshot,
         steps: u64,
     },
+    /// R7.1 — the SPU hit an MFC/DMA channel op under
+    /// `SpuChannels::refuse_mfc=true` (the C++ runtime bridge's
+    /// honest-fallback policy). PC is at the refusing instruction;
+    /// no Rust state has been mutated. The caller MUST drop the
+    /// session and hand off to the C++ executor — there is no
+    /// resume contract for this event in R7.1 (R7.2 adds a runtime
+    /// DMA opt-in via FFI back into RPCS3's `process_mfc_cmd()`).
+    MfcRefused {
+        channel: u32,
+        is_write: bool,
+        is_count: bool,
+        snapshot: SpuStateSnapshot,
+        steps: u64,
+    },
 }
 
 impl SpuExecEvent {
@@ -596,7 +636,8 @@ impl SpuExecEvent {
             Self::Finished { snapshot, .. }
             | Self::Parked { snapshot, .. }
             | Self::Error { snapshot, .. }
-            | Self::BudgetExhausted { snapshot, .. } => snapshot,
+            | Self::BudgetExhausted { snapshot, .. }
+            | Self::MfcRefused { snapshot, .. } => snapshot,
         }
     }
 
@@ -607,7 +648,8 @@ impl SpuExecEvent {
             Self::Finished { steps, .. }
             | Self::Parked { steps, .. }
             | Self::Error { steps, .. }
-            | Self::BudgetExhausted { steps, .. } => *steps,
+            | Self::BudgetExhausted { steps, .. }
+            | Self::MfcRefused { steps, .. } => *steps,
         }
     }
 
@@ -733,6 +775,21 @@ impl SpuSingleThreadExecutor {
                 snapshot: result.final_state,
                 steps,
             },
+            // R7.1 — surface the bridge's honest-fallback signal as a
+            // first-class event. The runtime bridge (`SPURustBridge.cpp`)
+            // is the only caller that ever sets `refuse_mfc=true`, so
+            // the C++ side immediately recognises this event and
+            // resumes the SPU on the C++ executor without any Rust
+            // commit.
+            ExecutionStopReason::MfcUnsupported { channel, is_write, is_count } => {
+                SpuExecEvent::MfcRefused {
+                    channel,
+                    is_write,
+                    is_count,
+                    snapshot: result.final_state,
+                    steps,
+                }
+            }
         }
     }
 }
@@ -807,6 +864,10 @@ pub enum SpuEventKind {
     Finished { stop_code: u32 },
     Error { message: String },
     BudgetExhausted,
+    /// R7.1 — same shape as [`SpuExecEvent::MfcRefused`], lifted into
+    /// the lockstep trace so a post-mortem can show exactly where the
+    /// runtime bridge refused an MFC channel op.
+    MfcRefused { channel: u32, is_write: bool, is_count: bool },
 }
 
 impl SpuEventKind {
@@ -822,6 +883,13 @@ impl SpuEventKind {
                 Self::Error { message: message.clone() }
             }
             SpuExecEvent::BudgetExhausted { .. } => Self::BudgetExhausted,
+            SpuExecEvent::MfcRefused { channel, is_write, is_count, .. } => {
+                Self::MfcRefused {
+                    channel: *channel,
+                    is_write: *is_write,
+                    is_count: *is_count,
+                }
+            }
         }
     }
 }
@@ -1052,6 +1120,16 @@ impl<'b, E: SpuExecutor> SpuPpuLockstepDriver<'b, E> {
             SpuExecEvent::BudgetExhausted { snapshot, steps } => {
                 DriverState::Done {
                     kind: SpuEventKind::BudgetExhausted,
+                    snapshot,
+                    steps,
+                }
+            }
+            // R7.1 — terminal in the lockstep driver too: there is
+            // no resume contract for refused MFC in R7.1. The driver
+            // marks Done so callers can post-mortem the trace.
+            SpuExecEvent::MfcRefused { channel, is_write, is_count, snapshot, steps } => {
+                DriverState::Done {
+                    kind: SpuEventKind::MfcRefused { channel, is_write, is_count },
                     snapshot,
                     steps,
                 }

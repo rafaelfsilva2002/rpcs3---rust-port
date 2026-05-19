@@ -1,11 +1,14 @@
 diff --git a/rpcs3/Emu/CMakeLists.txt b/rpcs3/Emu/CMakeLists.txt
-index 1291999..d862b22 100644
+index f863a2b91..d862b2287 100644
 --- a/rpcs3/Emu/CMakeLists.txt
 +++ b/rpcs3/Emu/CMakeLists.txt
-@@ -187,6 +187,11 @@ target_sources(rpcs3_emu PRIVATE
-     # R5.8 A.3 -- SPU trace JSONL writer scaffolding (gated, disabled by default).
-     # See docs/SPU_TRACE_CAPTURE_RUNTIME_HOOKS.md for runtime-hook integration.
-     Cell/SPUTraceJsonl.cpp
+@@ -184,6 +184,14 @@ target_sources(rpcs3_emu PRIVATE
+     Cell/SPUCommonRecompiler.cpp
+     Cell/SPULLVMRecompiler.cpp
+     Cell/SPUThread.cpp
++    # R5.8 A.3 -- SPU trace JSONL writer scaffolding (gated, disabled by default).
++    # See docs/SPU_TRACE_CAPTURE_RUNTIME_HOOKS.md for runtime-hook integration.
++    Cell/SPUTraceJsonl.cpp
 +    # R6.1 -- Rust SPU bridge (opt-in via env var RPCS3_SPU_RUST_BRIDGE=1).
 +    # Compile-time gated by RPCS3_HAS_SPU_RUST_BRIDGE (set below
 +    # when the staticlib `rust/target/release/rpcs3_spu_ffi.lib` or
@@ -14,7 +17,7 @@ index 1291999..d862b22 100644
      Cell/lv2/lv2.cpp
      Cell/lv2/sys_bdemu.cpp
      Cell/lv2/sys_btsetting.cpp
-@@ -701,6 +706,28 @@ if(APPLE)
+@@ -698,6 +706,28 @@ if(APPLE)
      endif()
  endif()
  
@@ -45,15 +48,17 @@ index 1291999..d862b22 100644
      target_precompile_headers(rpcs3_emu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../stdafx.h")
 diff --git a/rpcs3/Emu/Cell/SPURustBridge.cpp b/rpcs3/Emu/Cell/SPURustBridge.cpp
 new file mode 100644
-index 0000000..e1df939
+index 000000000..07a0f7543
 --- /dev/null
 +++ b/rpcs3/Emu/Cell/SPURustBridge.cpp
-@@ -0,0 +1,793 @@
+@@ -0,0 +1,908 @@
 +#include "stdafx.h"
 +#include "SPURustBridge.h"
 +
 +#include "SPUThread.h"
 +#include "Utilities/StrUtil.h"
++#include "Emu/Memory/vm.h"  // R7.2 — for vm::_ptr<u8>(eal) in the
++                            // runtime DMA GET callback.
 +
 +#include <atomic>
 +#include <cstdlib>
@@ -169,15 +174,55 @@ index 0000000..e1df939
 +		}
 +	}
 +
++	// R7.2 — runtime DMA GET callback. Reads `size` bytes from RPCS3
++	// EA `eal` via `vm::_ptr<u8>` (the same path the C++ executor uses
++	// in `process_mfc_cmd()`'s simple-GET branch — see SPUThread.cpp
++	// line 2091) and copies them into `dst_ls_ptr` (a writable pointer
++	// into the Rust SPU handle's LS at the captured `mfc_lsa`). The
++	// Rust interpreter has already validated cmd=0x40, eah=0, tag<32,
++	// size, lsa+size<=256 KiB before calling here.
++	//
++	// `user_data` is the originating `spu_thread*` (passed at callback
++	// install time, used for diagnostic logging). Returns 0 on
++	// success, -1 if the EA does not map to host memory (the bridge
++	// then surfaces MfcUnsupported and falls back to C++).
++	static int32_t bridge_dma_get_callback(
++		void* user_data,
++		uint32_t eal,
++		uint8_t* dst_ls_ptr,
++		uint32_t size,
++		uint32_t tag)
++	{
++		spu_thread* spu = static_cast<spu_thread*>(user_data);
++		const u8* src = vm::_ptr<const u8>(eal);
++		if (!src)
++		{
++			spu_rust_bridge_log.warning(
++				"[Rust SPU bridge] bridge_dma_get_callback: vm::_ptr<u8>(0x%x) "
++				"returned null on '%s'; refusing GET, bridge will fall back to C++",
++				eal, spu ? spu->get_name().c_str() : "<unknown>");
++			return -1;
++		}
++		std::memcpy(dst_ls_ptr, src, size);
++		spu_rust_bridge_log.success(
++			"[Rust SPU bridge] R7.2 DMA GET dispatched: cmd=0x40 eal=0x%x size=%u "
++			"tag=%u on '%s'; real EA/LS path (vm::_ptr<u8>); tag-stat 0x%x queued "
++			"for subsequent rdch ch24",
++			eal, size, tag, spu ? spu->get_name().c_str() : "<unknown>",
++			1u << tag);
++		return 0;
++	}
++
 +	static const char* outcome_name(rust_spu_outcome_t o)
 +	{
 +		switch (o)
 +		{
-+		case rust_spu_outcome_t_Continue:    return "Continue";
-+		case rust_spu_outcome_t_Stop:        return "Stop";
-+		case rust_spu_outcome_t_StallRead:   return "StallRead";
-+		case rust_spu_outcome_t_StallWrite:  return "StallWrite";
-+		case rust_spu_outcome_t_Error:       return "Error";
++		case rust_spu_outcome_t_Continue:        return "Continue";
++		case rust_spu_outcome_t_Stop:            return "Stop";
++		case rust_spu_outcome_t_StallRead:       return "StallRead";
++		case rust_spu_outcome_t_StallWrite:      return "StallWrite";
++		case rust_spu_outcome_t_Error:           return "Error";
++		case rust_spu_outcome_t_MfcUnsupported:  return "MfcUnsupported";
 +		}
 +		return "Unknown";
 +	}
@@ -341,6 +386,44 @@ index 0000000..e1df939
 +			spu_rust_bridge_log.warning(
 +				"[Rust SPU bridge] try_delegate: rust_spu_new() returned null; "
 +				"falling back to C++ executor on '%s'", spu.get_name());
++			return false;
++		}
++
++		// R7.1 — enable the honest-fallback gate for MFC/DMA channels.
++		// Any subsequent `wrch` to ch16..=23 or `rdch` ch24/ch25 (or
++		// `rchcnt` on any of those) will short-circuit BEFORE touching
++		// any per-channel state and surface
++		// `rust_spu_outcome_t_MfcUnsupported` UNLESS the R7.2 runtime
++		// DMA GET callback (installed immediately below) handles it.
++		// The interpreter prefers the callback path over the refuse
++		// gate when both are present (see `SpuChannels::write` —
++		// "gate relaxed when dma_get_callback is some").
++		if (rust_spu_set_refuse_mfc(h, 1) != 0)
++		{
++			spu_rust_bridge_log.warning(
++				"[Rust SPU bridge] try_delegate: rust_spu_set_refuse_mfc(1) failed on '%s'; "
++				"falling back to C++ executor (the staticlib appears stale — rebuild "
++				"`rpcs3-spu-ffi` to expose the R7.1 surface).", spu.get_name());
++			rust_spu_drop(h);
++			return false;
++		}
++
++		// R7.2 — install the runtime DMA GET callback. The Rust
++		// interpreter invokes this on `wrch ch21 (MFC_Cmd)` with
++		// cmd=0x40, having already populated MFC_LSA / EAH / EAL /
++		// Size / TagID via the prior ch16-20 wrch's. The callback
++		// reads the EA bytes via RPCS3 `vm::_ptr<u8>` and copies them
++		// into the Rust handle's LS — the SPU continues end-to-end
++		// without any C++ fallback. Non-GET cmds (PUT, list, atomic,
++		// etc.) and validation failures still produce MfcUnsupported,
++		// so the bridge falls back honestly for those.
++		if (rust_spu_set_dma_get_callback(h, &bridge_dma_get_callback, &spu) != 0)
++		{
++			spu_rust_bridge_log.warning(
++				"[Rust SPU bridge] try_delegate: rust_spu_set_dma_get_callback failed "
++				"on '%s'; falling back to C++ executor (R7.1 honest-fallback path will "
++				"still trigger, but R7.2 runtime DMA path is unavailable).", spu.get_name());
++			rust_spu_drop(h);
 +			return false;
 +		}
 +
@@ -701,6 +784,41 @@ index 0000000..e1df939
 +						  "and may diverge from a clean run."
 +						: "Channel state intact (no destructive ops performed before Error).");
 +				break;
++			case rust_spu_outcome_t_MfcUnsupported:
++			{
++				// R7.1 — honest fallback. The Rust executor refused
++				// `wrch ch{16..23}` / `rdch ch{24,25}` / `rchcnt` on
++				// any of those BEFORE mutating per-channel state.
++				// Runtime DMA execution is R7.2 scope (Phase D); for
++				// now we always hand off to the C++ executor.
++				//
++				// Important state-correctness invariant: the Rust
++				// handle owns its own LS/GPR/channels copy that was
++				// initialised from RPCS3 at delegation start, and we
++				// have NOT synced it back to RPCS3 at any point along
++				// the fallback path. The C++ executor therefore
++				// resumes from RPCS3's untouched original state.
++				const char* mfc_kind =
++					(out_code <= 21) ? "MFC param/cmd wrch (ch16-21)" :
++					(out_code == 22) ? "MFC_WrTagMask (ch22)" :
++					(out_code == 23) ? "MFC_WrTagUpdate (ch23)" :
++					(out_code == 24) ? "MFC_RdTagStat (ch24)" :
++					(out_code == 25) ? "MFC_RdTagMask (ch25)" :
++					"MFC range (out-of-spec)";
++				spu_rust_bridge_log.warning(
++					"[Rust SPU bridge] try_delegate: MFC/DMA detected at ch%u (%s), "
++					"total_steps=%u on '%s'; falling back honestly to C++ executor "
++					"before Rust-side MFC mutation. Runtime DMA bridge is R7.2 scope; "
++					"%s",
++					out_code, mfc_kind, session->total_steps, spu.get_name(),
++					session->in_mbox_consumed > 0 || session->snr1_forwarded || session->snr2_forwarded
++						? "WARNING: this session already pop_wait'd RPCS3 channel values — "
++						  "those values are now lost; C++ executor will see partially-drained "
++						  "channels and may diverge from a clean run. (Pre-MFC channel "
++						  "activity is unusual for a pure DMA workload; investigate.)"
++						: "Channel state intact (no destructive ops performed before MFC refusal).");
++				break;
++			}
 +			default:
 +				spu_rust_bridge_log.warning(
 +					"[Rust SPU bridge] try_delegate: unexpected outcome=%s code=0x%x on '%s'; "
@@ -844,13 +962,13 @@ index 0000000..e1df939
 +}
 diff --git a/rpcs3/Emu/Cell/SPURustBridge.h b/rpcs3/Emu/Cell/SPURustBridge.h
 new file mode 100644
-index 0000000..e948e0b
+index 000000000..b78310753
 --- /dev/null
 +++ b/rpcs3/Emu/Cell/SPURustBridge.h
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,188 @@
 +#pragma once
 +
-+// R6.1 / R6.2 / R6.3a / R6.3b / R6.3c / R6.4a / R6.4b / R6.5b — RPCS3 ↔ Rust SPU bridge (opt-in, default OFF).
++// R6.1 / R6.2 / R6.3a / R6.3b / R6.3c / R6.4a / R6.4b / R6.5b / R7.1 / R7.2 — RPCS3 ↔ Rust SPU bridge (opt-in, default OFF).
 +//
 +// This header is the C++-side facade over the `rpcs3_spu_ffi` Rust
 +// staticlib. It lets the SPU thread loop optionally delegate
@@ -952,6 +1070,35 @@ index 0000000..e948e0b
 +// `single_spu_signal_v1`. Other fixtures and game workloads
 +// still fall back honestly.
 +//
++// R7.1 scope: honest fallback for MFC/DMA workloads. On every
++// `rust_spu_new` we call `rust_spu_set_refuse_mfc(handle, 1)`.
++// Without R7.2's callback installed, this makes any MFC channel op
++// surface `rust_spu_outcome_t_MfcUnsupported` BEFORE per-channel
++// mutation; the outer switch logs "MFC/DMA detected at ch%u, ...
++// falling back honestly to C++ executor before Rust-side MFC
++// mutation" and drops the session. R7.1 verified on
++// `single_spu_dma_get_v1.self` with the callback uninstalled.
++//
++// R7.2 scope: runtime DMA GET execution. On every `rust_spu_new`
++// we ALSO call `rust_spu_set_dma_get_callback(handle,
++// &bridge_dma_get_callback, &spu)`. The callback reads `size`
++// bytes from RPCS3 EA `eal` via `vm::_ptr<u8>` (the same path the
++// C++ executor's `process_mfc_cmd()` simple-GET branch uses) and
++// memcpys them into the Rust handle's LS at `mfc_lsa`. The Rust
++// interpreter validates cmd=0x40, eah=0, tag<32, size, and
++// lsa+size<=256 KiB before calling the callback, so unsupported
++// MFC ops (PUT, list, atomic, barriers, multi-SPU races) still
++// surface `MfcUnsupported` and the bridge falls back honestly to
++// the C++ executor for those.
++// Acceptance verified on `single_spu_dma_get_v1.self`: bridge ON
++// runs end-to-end through the Rust executor (no fallback at all),
++// produces `[dma_get_v1] OK cause=0x1 status=0xdeada12f` exactly
++// like bridge OFF, with `total_steps` ≈ the full SPU program
++// length (vs `total_steps=4` for the R7.1 R7.1-only path that
++// fell back at ch16).
++// PUT, list DMA, atomics, barriers, multi-SPU DMA / SPURS — out
++// of R7.2 scope; defer to R8+.
++//
 +// The whole bridge is compile-time gated by `RPCS3_HAS_SPU_RUST_BRIDGE`,
 +// which the CMake build system sets only when the Rust staticlib
 +// (`rust/target/release/rpcs3_spu_ffi.lib` or `.a`) is present.
@@ -1007,157 +1154,3 @@ index 0000000..e948e0b
 +	// defined or `is_enabled()` returns false.
 +	bool try_delegate_execution(spu_thread& spu);
 +}
-diff --git a/rpcs3/Emu/Cell/SPUThread.cpp b/rpcs3/Emu/Cell/SPUThread.cpp
-index 84cd254..618845b 100644
---- a/rpcs3/Emu/Cell/SPUThread.cpp
-+++ b/rpcs3/Emu/Cell/SPUThread.cpp
-@@ -21,6 +21,7 @@
- #include "Emu/Cell/SPUAnalyser.h"
- #include "Emu/Cell/SPUThread.h"
- #include "Emu/Cell/SPURecompiler.h"
-+#include "Emu/Cell/SPURustBridge.h"
- #include "Emu/Cell/SPUTraceJsonl.h"
- #include "Emu/Cell/timers.hpp"
- 
-@@ -1579,6 +1580,35 @@ void spu_thread::cpu_task()
- 		}
- 	}
- 
-+	// R6.1 / R6.2 — Rust SPU bridge (opt-in, default OFF).
-+	// R6.1: hello-world FFI proof (linkage check, ONCE per spu_thread).
-+	// R6.2: first DELEGATED execution path. When the bridge is enabled,
-+	// every cpu_task() entry first attempts to delegate to the Rust
-+	// executor. On success the SPU has terminated via stop_and_signal()
-+	// and we return immediately. On failure we fall back honestly to the
-+	// existing C++ executor (jit / interpreter) — RPCS3 state is
-+	// preserved unchanged on the fallback path.
-+	// The bridge is compile-time gated by RPCS3_HAS_SPU_RUST_BRIDGE
-+	// (set by CMake when the staticlib is present) and runtime-gated by
-+	// the env var RPCS3_SPU_RUST_BRIDGE=1.
-+	if (spu_rust_bridge::is_enabled())
-+	{
-+		[[maybe_unused]] static thread_local bool s_announced = false;
-+		if (!s_announced)
-+		{
-+			s_announced = true;
-+			spu_rust_bridge::hello_world_proof(*this);
-+		}
-+
-+		if (spu_rust_bridge::try_delegate_execution(*this))
-+		{
-+			// Bridge took over: stop_and_signal() set cpu_flag::stop;
-+			// exit cpu_task() so the thread group joins normally.
-+			return;
-+		}
-+		// else: fall through to C++ executor (no state mutated).
-+	}
-+
- 	if (jit)
- 	{
- 		while (true)
-diff --git a/rpcs3/emucore.vcxproj b/rpcs3/emucore.vcxproj
-index a8bbc94..0ed482f 100644
---- a/rpcs3/emucore.vcxproj
-+++ b/rpcs3/emucore.vcxproj
-@@ -546,6 +546,7 @@
-     <ClCompile Include="Emu\Cell\RawSPUThread.cpp" />
-     <ClCompile Include="Emu\Cell\SPUCommonRecompiler.cpp" />
-     <ClCompile Include="Emu\Cell\SPULLVMRecompiler.cpp" />
-+    <ClCompile Include="Emu\Cell\SPURustBridge.cpp" />
-     <ClCompile Include="Emu\Cell\SPUThread.cpp" />
-     <ClCompile Include="Emu\Cell\SPUTraceJsonl.cpp" />
-     <ClCompile Include="Emu\CPU\CPUThread.cpp" />
-@@ -1000,6 +1001,7 @@
-     <ClInclude Include="Emu\Cell\SPUInterpreter.h" />
-     <ClInclude Include="Emu\Cell\SPUOpcodes.h" />
-     <ClInclude Include="Emu\Cell\SPURecompiler.h" />
-+    <ClInclude Include="Emu\Cell\SPURustBridge.h" />
-     <ClInclude Include="Emu\Cell\SPUThread.h" />
-     <ClInclude Include="Emu\Cell\SPUTraceJsonl.h" />
-     <ClInclude Include="Emu\Cell\timers.hpp" />
-@@ -1138,4 +1140,25 @@
-   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
-   <ImportGroup Label="ExtensionTargets">
-   </ImportGroup>
-+  <!--
-+    R6.1 - Rust SPU bridge link integration.
-+    Conditional on the rpcs3-spu-ffi staticlib being present at
-+    $(MSBuildProjectDirectory)\..\rust\target\release\rpcs3_spu_ffi.lib
-+    (= R:\rust\target\release\... when building from R:\rpcs3.sln).
-+    When present, adds the staticlib to AdditionalDependencies, the
-+    cbindgen-generated header dir to AdditionalIncludeDirectories,
-+    and defines RPCS3_HAS_SPU_RUST_BRIDGE=1 so SPURustBridge.cpp
-+    compiles in the FFI calls. When absent, the bridge is
-+    compile-time disabled and rpcs3.exe builds + runs unchanged.
-+    Build via: scripts\build_rust_spu_ffi.ps1 (relative to repo root).
-+  -->
-+  <ItemDefinitionGroup Condition="Exists('$(MSBuildProjectDirectory)\..\rust\target\release\rpcs3_spu_ffi.lib')">
-+    <ClCompile>
-+      <PreprocessorDefinitions>RPCS3_HAS_SPU_RUST_BRIDGE=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-+      <AdditionalIncludeDirectories>$(MSBuildProjectDirectory)\..\rust\rpcs3-spu-ffi\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-+    </ClCompile>
-+    <Link>
-+      <AdditionalDependencies>$(MSBuildProjectDirectory)\..\rust\target\release\rpcs3_spu_ffi.lib;%(AdditionalDependencies)</AdditionalDependencies>
-+    </Link>
-+  </ItemDefinitionGroup>
- </Project>
-\ No newline at end of file
-diff --git a/rpcs3/emucore.vcxproj.filters b/rpcs3/emucore.vcxproj.filters
-index 362bbf4..07d26bd 100644
---- a/rpcs3/emucore.vcxproj.filters
-+++ b/rpcs3/emucore.vcxproj.filters
-@@ -183,6 +183,9 @@
-     <ClCompile Include="Emu\Cell\RawSPUThread.cpp">
-       <Filter>Emu\Cell</Filter>
-     </ClCompile>
-+    <ClCompile Include="Emu\Cell\SPURustBridge.cpp">
-+      <Filter>Emu\Cell</Filter>
-+    </ClCompile>
-     <ClCompile Include="Emu\Cell\SPUThread.cpp">
-       <Filter>Emu\Cell</Filter>
-     </ClCompile>
-@@ -1512,6 +1515,9 @@
-     <ClInclude Include="Emu\Cell\SPURecompiler.h">
-       <Filter>Emu\Cell</Filter>
-     </ClInclude>
-+    <ClInclude Include="Emu\Cell\SPURustBridge.h">
-+      <Filter>Emu\Cell</Filter>
-+    </ClInclude>
-     <ClInclude Include="Emu\Cell\SPUThread.h">
-       <Filter>Emu\Cell</Filter>
-     </ClInclude>
-diff --git a/rpcs3/rpcs3.vcxproj b/rpcs3/rpcs3.vcxproj
-index 8bf5e5b..66d6b79 100644
---- a/rpcs3/rpcs3.vcxproj
-+++ b/rpcs3/rpcs3.vcxproj
-@@ -2339,4 +2339,29 @@
-       <UserProperties MocDir=".\QTGeneratedFiles\$(ConfigurationName)" Qt5Version_x0020_x64="$(DefaultQtVersion)" RccDir=".\QTGeneratedFiles" UicDir=".\QTGeneratedFiles" />
-     </VisualStudio>
-   </ProjectExtensions>
-+  <!--
-+    R6.1 - Propagate the Rust SPU bridge staticlib dependency to the
-+    final EXE link. emucore is built as a static .lib, so its
-+    references to rust_spu_new/rust_spu_drop don't resolve until
-+    rpcs3.exe is linked. The same Exists() condition as in
-+    emucore.vcxproj keeps this opt-in: when the staticlib is absent,
-+    nothing is added.
-+  -->
-+  <ItemDefinitionGroup Condition="Exists('$(MSBuildProjectDirectory)\..\rust\target\release\rpcs3_spu_ffi.lib')">
-+    <Link>
-+      <!--
-+        rpcs3_spu_ffi.lib drags in Rust's std crate which links
-+        against several Windows system libraries via #[link]
-+        attributes. MSVC's linker doesn't auto-resolve those from
-+        the staticlib metadata, so we list them explicitly:
-+          - userenv.lib    : GetUserProfileDirectoryW (std::env)
-+          - ws2_32.lib     : Windows Sockets (std::net)
-+          - bcrypt.lib     : RtlGenRandom / BCryptGenRandom (std::sys::rand)
-+          - iphlpapi.lib   : IP helper APIs (std::net adapter enumeration)
-+          - userenv.lib + ntdll.lib already exported by emucore;
-+            duplicate names are deduped by the linker (harmless).
-+      -->
-+      <AdditionalDependencies>$(MSBuildProjectDirectory)\..\rust\target\release\rpcs3_spu_ffi.lib;userenv.lib;ws2_32.lib;bcrypt.lib;iphlpapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
-+    </Link>
-+  </ItemDefinitionGroup>
- </Project>
-\ No newline at end of file

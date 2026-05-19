@@ -627,3 +627,347 @@ fn rust_spu_continue_then_resume_on_same_handle() {
         rust_spu_drop(h);
     }
 }
+
+// =====================================================================
+// R7.1 — refuse_mfc honest-fallback FFI acceptance
+// =====================================================================
+
+/// R7.1 — default `refuse_mfc=false` keeps the previous semantics:
+/// `wrch ch16 (MFC_LSA)` succeeds silently (Phase C wiring), so the
+/// SPU continues until the next event (here, `stop`).
+#[test]
+fn rust_spu_default_allows_mfc_wrch() {
+    unsafe {
+        let h = rust_spu_new();
+
+        // wrch ch16, r0 (encode: top 11 bits 0x10D = WRCH, ra=16, rt=0)
+        // SPU WRCH encoding from `rpcs3-spu-interpreter/src/lib.rs`:
+        // primary 0x10D in bits 0..10, channel in `ra` field bits 18..24.
+        // RR-form layout: [opcode 11b][rb 7b][ra 7b][rt 7b]
+        // opcode 0x10D, ra=16, rb=0, rt=0.
+        let wrch_ch16: u32 = (0x10D_u32 << 21) | (0u32 << 14) | (16u32 << 7) | 0u32;
+        // stop 0xC1
+        let stop_c1: u32 = 0xC1_u32 & 0x3FFF;
+
+        let mut bytes = Vec::with_capacity(8);
+        bytes.extend_from_slice(&wrch_ch16.to_be_bytes()); // pc=0
+        bytes.extend_from_slice(&stop_c1.to_be_bytes());   // pc=4
+
+        assert_eq!(rust_spu_load_ls(h, bytes.as_ptr(), bytes.len() as u32), 0);
+        assert_eq!(rust_spu_set_pc(h, 0), 0);
+
+        // refuse_mfc defaults to false → wrch ch16 succeeds → run
+        // continues to the stop.
+        let mut code = 0u32;
+        let mut steps = 0u32;
+        let outcome = rust_spu_run_until_event(h, 10, &mut code, &mut steps);
+        assert_eq!(
+            outcome,
+            RustSpuOutcome::Stop,
+            "default refuse_mfc=false must let wrch ch16 succeed",
+        );
+        assert_eq!(code, 0xC1);
+
+        rust_spu_drop(h);
+    }
+}
+
+/// R7.1 — with `refuse_mfc=true`, `wrch ch16 (MFC_LSA)` returns
+/// `MfcUnsupported` at the refusing PC. No state mutation: PC has
+/// NOT advanced past the wrch; the MFC LSA field has NOT been
+/// stored; out_steps reports `1` (the instruction was attempted).
+#[test]
+fn rust_spu_refuse_mfc_intercepts_wrch_ch16() {
+    unsafe {
+        let h = rust_spu_new();
+
+        let wrch_ch16: u32 = (0x10D_u32 << 21) | (0u32 << 14) | (16u32 << 7) | 0u32;
+        let stop_c1: u32 = 0xC1_u32 & 0x3FFF;
+
+        let mut bytes = Vec::with_capacity(8);
+        bytes.extend_from_slice(&wrch_ch16.to_be_bytes());
+        bytes.extend_from_slice(&stop_c1.to_be_bytes());
+
+        assert_eq!(rust_spu_load_ls(h, bytes.as_ptr(), bytes.len() as u32), 0);
+        assert_eq!(rust_spu_set_pc(h, 0), 0);
+
+        // Activate the bridge's honest-fallback gate.
+        assert_eq!(
+            rust_spu_set_refuse_mfc(h, 1),
+            0,
+            "set_refuse_mfc must succeed on a live handle",
+        );
+
+        let mut code = 0u32;
+        let mut steps = 0u32;
+        let outcome = rust_spu_run_until_event(h, 10, &mut code, &mut steps);
+        assert_eq!(
+            outcome,
+            RustSpuOutcome::MfcUnsupported,
+            "wrch ch16 under refuse_mfc must surface the new outcome",
+        );
+        assert_eq!(code, 16, "out_code must carry the refusing channel");
+
+        // PC must NOT have advanced past the wrch (re-runnable under
+        // C++ executor on bridge fallback).
+        let mut pc = 0u32;
+        assert_eq!(rust_spu_get_pc(h, &mut pc), 0);
+        assert_eq!(pc, 0, "PC must be at the refusing instruction");
+
+        rust_spu_drop(h);
+    }
+}
+
+/// R7.1 — with `refuse_mfc=true`, `rdch ch24 (RdTagStat)` also
+/// returns `MfcUnsupported`. The channel range covers both wrch
+/// targets (16..=23) and rdch targets (24..=25).
+#[test]
+fn rust_spu_refuse_mfc_intercepts_rdch_ch24() {
+    unsafe {
+        let h = rust_spu_new();
+
+        // rdch r0, ch24 — RR-form, primary 0x00D, ra=24, rt=0.
+        let rdch_ch24: u32 = (0x00D_u32 << 21) | (0u32 << 14) | (24u32 << 7) | 0u32;
+        let stop_c1: u32 = 0xC1_u32 & 0x3FFF;
+
+        let mut bytes = Vec::with_capacity(8);
+        bytes.extend_from_slice(&rdch_ch24.to_be_bytes());
+        bytes.extend_from_slice(&stop_c1.to_be_bytes());
+
+        assert_eq!(rust_spu_load_ls(h, bytes.as_ptr(), bytes.len() as u32), 0);
+        assert_eq!(rust_spu_set_pc(h, 0), 0);
+        assert_eq!(rust_spu_set_refuse_mfc(h, 1), 0);
+
+        let mut code = 0u32;
+        let mut steps = 0u32;
+        let outcome = rust_spu_run_until_event(h, 10, &mut code, &mut steps);
+        assert_eq!(outcome, RustSpuOutcome::MfcUnsupported);
+        assert_eq!(code, 24);
+
+        rust_spu_drop(h);
+    }
+}
+
+/// R7.1 — `refuse_mfc=true` does not perturb non-MFC channel ops.
+/// A wrch to ch28 (OUT_MBOX) is NOT in the MFC range, so it follows
+/// the existing path (succeeds silently, the SPU continues to stop).
+#[test]
+fn rust_spu_refuse_mfc_preserves_outmbox_path() {
+    unsafe {
+        let h = rust_spu_new();
+
+        // wrch ch28, r0
+        let wrch_ch28: u32 = (0x10D_u32 << 21) | (0u32 << 14) | (28u32 << 7) | 0u32;
+        let stop_c1: u32 = 0xC1_u32 & 0x3FFF;
+
+        let mut bytes = Vec::with_capacity(8);
+        bytes.extend_from_slice(&wrch_ch28.to_be_bytes());
+        bytes.extend_from_slice(&stop_c1.to_be_bytes());
+
+        assert_eq!(rust_spu_load_ls(h, bytes.as_ptr(), bytes.len() as u32), 0);
+        assert_eq!(rust_spu_set_pc(h, 0), 0);
+        assert_eq!(rust_spu_set_refuse_mfc(h, 1), 0);
+
+        let mut code = 0u32;
+        let mut steps = 0u32;
+        let outcome = rust_spu_run_until_event(h, 10, &mut code, &mut steps);
+        assert_eq!(outcome, RustSpuOutcome::Stop, "ch28 is not MFC; bridge gate must not affect it");
+        assert_eq!(code, 0xC1);
+
+        // OUT_MBOX should have the value the wrch produced (r0 = 0).
+        let mut got = u32::MAX;
+        assert_eq!(rust_spu_pop_outmbox(h, &mut got), 0);
+        assert_eq!(got, 0);
+
+        rust_spu_drop(h);
+    }
+}
+
+/// R7.1 — null-handle invariants for the new setter.
+#[test]
+fn rust_spu_set_refuse_mfc_null_handle_returns_minus_one() {
+    unsafe {
+        assert_eq!(rust_spu_set_refuse_mfc(std::ptr::null_mut(), 1), -1);
+    }
+}
+
+// =====================================================================
+// R7.2 — Runtime DMA GET callback FFI acceptance
+// =====================================================================
+
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static R72_CB_CALLS: AtomicU32 = AtomicU32::new(0);
+static R72_LAST_EAL: AtomicU32 = AtomicU32::new(0);
+static R72_LAST_SIZE: AtomicU32 = AtomicU32::new(0);
+static R72_LAST_TAG: AtomicU32 = AtomicU32::new(0);
+
+/// Test callback — fills the destination LS region with a counting
+/// pattern derived from `eal` (so the test can assert the right
+/// address was passed). Never touches `user_data` directly.
+unsafe extern "C" fn r72_test_callback(
+    user_data: *mut core::ffi::c_void,
+    eal: u32,
+    dst: *mut u8,
+    size: u32,
+    tag: u32,
+) -> i32 {
+    R72_CB_CALLS.fetch_add(1, Ordering::SeqCst);
+    R72_LAST_EAL.store(eal, Ordering::SeqCst);
+    R72_LAST_SIZE.store(size, Ordering::SeqCst);
+    R72_LAST_TAG.store(tag, Ordering::SeqCst);
+    let _ = user_data;
+    for i in 0..size {
+        unsafe { *dst.add(i as usize) = (eal as u8).wrapping_add(i as u8) };
+    }
+    0
+}
+
+const SPU_LS_SIZE_FFI: usize = 256 * 1024;
+
+/// R7.2 — wrch ch21 (MFC_Cmd=0x40) with callback installed executes
+/// the GET via the callback; subsequent rdch ch24 pops the matching
+/// tag-stat. Whole sequence runs to stop under the runtime-DMA path.
+#[test]
+fn rust_spu_runtime_dma_get_callback_round_trip() {
+    unsafe {
+        R72_CB_CALLS.store(0, Ordering::SeqCst);
+
+        let h = rust_spu_new();
+
+        fn wrch(ch: u32, rt: u32) -> u32 {
+            (0x10D_u32 << 21) | (0u32 << 14) | (ch << 7) | rt
+        }
+        fn rdch(rt: u32, ch: u32) -> u32 {
+            (0x00D_u32 << 21) | (0u32 << 14) | (ch << 7) | rt
+        }
+        let stop_c2: u32 = 0xC2_u32 & 0x3FFF;
+
+        let mut bytes: Vec<u8> = Vec::with_capacity(64);
+        for w in [
+            wrch(16, 1),
+            wrch(17, 2),
+            wrch(18, 3),
+            wrch(19, 4),
+            wrch(20, 5),
+            wrch(21, 6),
+            wrch(22, 7),
+            wrch(23, 8),
+            rdch(9, 24),
+            stop_c2,
+        ] {
+            bytes.extend_from_slice(&w.to_be_bytes());
+        }
+        assert_eq!(rust_spu_load_ls(h, bytes.as_ptr(), bytes.len() as u32), 0);
+
+        let preferred = |v: u32| -> [u8; 16] {
+            let mut out = [0u8; 16];
+            out[0..4].copy_from_slice(&v.to_be_bytes());
+            out
+        };
+        let lsa: u32 = 0x10000;
+        let eah: u32 = 0;
+        let eal: u32 = 0x9000_0000;
+        let size: u32 = 128;
+        let tag: u32 = 3;
+        let cmd: u32 = 0x40;
+        let mask: u32 = 1 << tag;
+        let mode: u32 = 2;
+
+        assert_eq!(rust_spu_set_gpr(h, 1, preferred(lsa).as_ptr()), 0);
+        assert_eq!(rust_spu_set_gpr(h, 2, preferred(eah).as_ptr()), 0);
+        assert_eq!(rust_spu_set_gpr(h, 3, preferred(eal).as_ptr()), 0);
+        assert_eq!(rust_spu_set_gpr(h, 4, preferred(size).as_ptr()), 0);
+        assert_eq!(rust_spu_set_gpr(h, 5, preferred(tag).as_ptr()), 0);
+        assert_eq!(rust_spu_set_gpr(h, 6, preferred(cmd).as_ptr()), 0);
+        assert_eq!(rust_spu_set_gpr(h, 7, preferred(mask).as_ptr()), 0);
+        assert_eq!(rust_spu_set_gpr(h, 8, preferred(mode).as_ptr()), 0);
+        assert_eq!(rust_spu_set_pc(h, 0), 0);
+
+        assert_eq!(
+            rust_spu_set_dma_get_callback(h, Some(r72_test_callback), core::ptr::null_mut()),
+            0,
+        );
+
+        let mut code = 0u32;
+        let mut steps = 0u32;
+        let outcome = rust_spu_run_until_event(h, 100, &mut code, &mut steps);
+        assert_eq!(outcome, RustSpuOutcome::Stop);
+        assert_eq!(code, 0xC2);
+
+        assert_eq!(R72_CB_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(R72_LAST_EAL.load(Ordering::SeqCst), eal);
+        assert_eq!(R72_LAST_SIZE.load(Ordering::SeqCst), size);
+        assert_eq!(R72_LAST_TAG.load(Ordering::SeqCst), tag);
+
+        let mut ls = vec![0u8; SPU_LS_SIZE_FFI];
+        assert_eq!(rust_spu_get_ls(h, ls.as_mut_ptr(), ls.len() as u32), 0);
+        for i in 0..size as usize {
+            let want = (eal as u8).wrapping_add(i as u8);
+            assert_eq!(
+                ls[lsa as usize + i],
+                want,
+                "post-DMA LS byte at offset {i} mismatch",
+            );
+        }
+
+        rust_spu_drop(h);
+    }
+}
+
+/// R7.2 — non-GET cmd (e.g., PUT 0x20) returns `MfcUnsupported`
+/// even with a callback installed. R7.2 scope is GET-only.
+#[test]
+fn rust_spu_runtime_dma_callback_refuses_non_get() {
+    unsafe {
+        R72_CB_CALLS.store(0, Ordering::SeqCst);
+        let h = rust_spu_new();
+
+        let wrch = |ch: u32, rt: u32| -> u32 {
+            (0x10D_u32 << 21) | (0u32 << 14) | (ch << 7) | rt
+        };
+        let stop_c1: u32 = 0xC1_u32 & 0x3FFF;
+
+        let mut bytes: Vec<u8> = Vec::with_capacity(20);
+        for w in [wrch(21, 1), stop_c1] {
+            bytes.extend_from_slice(&w.to_be_bytes());
+        }
+        assert_eq!(rust_spu_load_ls(h, bytes.as_ptr(), bytes.len() as u32), 0);
+
+        let mut put_bytes = [0u8; 16];
+        put_bytes[0..4].copy_from_slice(&0x20u32.to_be_bytes());
+        assert_eq!(rust_spu_set_gpr(h, 1, put_bytes.as_ptr()), 0);
+        assert_eq!(rust_spu_set_pc(h, 0), 0);
+        assert_eq!(
+            rust_spu_set_dma_get_callback(h, Some(r72_test_callback), core::ptr::null_mut()),
+            0,
+        );
+
+        let mut code = 0u32;
+        let mut steps = 0u32;
+        let outcome = rust_spu_run_until_event(h, 10, &mut code, &mut steps);
+        assert_eq!(outcome, RustSpuOutcome::MfcUnsupported);
+        assert_eq!(code, 21);
+        assert_eq!(R72_CB_CALLS.load(Ordering::SeqCst), 0);
+
+        rust_spu_drop(h);
+    }
+}
+
+/// R7.2 — clearing the callback (pass None) reverts to refuse_mfc path.
+#[test]
+fn rust_spu_clear_dma_get_callback() {
+    unsafe {
+        let h = rust_spu_new();
+        assert_eq!(
+            rust_spu_set_dma_get_callback(h, Some(r72_test_callback), core::ptr::null_mut()),
+            0,
+        );
+        assert_eq!(rust_spu_set_dma_get_callback(h, None, core::ptr::null_mut()), 0);
+        assert_eq!(
+            rust_spu_set_dma_get_callback(core::ptr::null_mut(), None, core::ptr::null_mut()),
+            -1,
+        );
+        rust_spu_drop(h);
+    }
+}

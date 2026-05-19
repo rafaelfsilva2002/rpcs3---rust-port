@@ -24,6 +24,12 @@
  *   the channel index that stalled (29 = IN_MBOX, 28 = OUT_MBOX, 3 = SNR1, etc.)
  * - [`RustSpuOutcome::Error`]: the program counter at which the
  *   error fired (an unsupported opcode or LS-OOB read).
+ * - [`RustSpuOutcome::MfcUnsupported`] (R7.1): the channel index in
+ *   the MFC/DMA range 16..=25 that the runtime bridge's
+ *   honest-fallback policy refused. The C++ bridge logs and drops
+ *   the Rust session; no Rust state is committed back to
+ *   `spu_thread`. Surfaced only when `rust_spu_set_refuse_mfc(h, 1)`
+ *   was called on the handle.
  */
 typedef enum {
   rust_spu_outcome_t_Continue = 0,
@@ -31,6 +37,7 @@ typedef enum {
   rust_spu_outcome_t_StallRead = 2,
   rust_spu_outcome_t_StallWrite = 3,
   rust_spu_outcome_t_Error = 4,
+  rust_spu_outcome_t_MfcUnsupported = 5,
 } rust_spu_outcome_t;
 
 /**
@@ -120,6 +127,57 @@ int32_t rust_spu_pop_outmbox(rust_spu_t *h, uint32_t *out_value);
 int32_t rust_spu_signal(rust_spu_t *h, uint32_t slot, uint32_t value);
 
 /**
+ * R7.1 — toggle the SPU thread's MFC/DMA honest-fallback gate. When
+ * `enabled` is non-zero, any subsequent `wrch` to ch16..=23 or `rdch`
+ * from ch24/ch25 (or `rchcnt` on any of those) will short-circuit
+ * BEFORE touching any per-channel state and surface
+ * `rust_spu_outcome_t_MfcUnsupported` through
+ * `rust_spu_run_until_event`. The C++ runtime bridge
+ * (`SPURustBridge.cpp`) is the only intended caller; replay paths
+ * never set this flag.
+ *
+ * R7.2 — the gate is RELAXED when `rust_spu_set_dma_get_callback`
+ * is installed in addition. ch16-20 / ch22-23 wrch and ch24/25
+ * rdch fall through to Phase C semantics, and `wrch ch21 (MFC_Cmd)`
+ * invokes the callback to execute the real EA→LS DMA via RPCS3
+ * `vm::` memory.
+ *
+ * Returns 0 on success, -1 if `h` is null.
+ */
+int32_t rust_spu_set_refuse_mfc(rust_spu_t *h, int32_t enabled);
+
+/**
+ * R7.2 — runtime DMA GET callback signature.
+ *
+ * Called from the SPU interpreter on `wrch ch21 (MFC_Cmd)` with
+ * cmd=0x40 (plain GET) after the SPU has populated MFC_LSA / EAH /
+ * EAL / Size / TagID via prior ch16-20 wrch's. The callback reads
+ * `size` bytes from RPCS3 EA `eal` and writes them to the buffer at
+ * `dst_ls_ptr` (a pointer into the Rust handle's LS at the
+ * captured `mfc_lsa` offset, valid for `size` bytes).
+ *
+ * Returns 0 on success, non-zero to refuse (the interpreter then
+ * surfaces `MfcUnsupported`, the bridge falls back honestly).
+ */
+typedef int32_t (*rust_spu_dma_get_cb_t)(void *user_data,
+                                         uint32_t eal,
+                                         uint8_t *dst_ls_ptr,
+                                         uint32_t size,
+                                         uint32_t tag);
+
+/**
+ * R7.2 — install (or clear) the runtime DMA GET callback. Pass
+ * `func = NULL` to clear an existing callback. The (`func`,
+ * `user_data`) pair must remain valid for the lifetime of the
+ * handle's `rust_spu_run_until_event` calls.
+ *
+ * Returns 0 on success, -1 if `h` is null.
+ */
+int32_t rust_spu_set_dma_get_callback(rust_spu_t *h,
+                                      rust_spu_dma_get_cb_t func,
+                                      void *user_data);
+
+/**
  * Run up to `max_steps` instructions. Returns the outcome that
  * caused the run to halt:
  *
@@ -132,6 +190,12 @@ int32_t rust_spu_signal(rust_spu_t *h, uint32_t slot, uint32_t value);
  *   channel index.
  * - [`RustSpuOutcome::Error`] (4): unsupported opcode / LS-OOB.
  *   `*out_code` set to the program counter at which the error fired.
+ * - [`RustSpuOutcome::MfcUnsupported`] (5, R7.1): an MFC/DMA channel
+ *   op (`wrch ch16-23`, `rdch ch24/25`, or `rchcnt` on any) was
+ *   refused under the runtime bridge's honest-fallback policy.
+ *   `*out_code` set to the refusing channel index. No Rust state
+ *   was mutated; the bridge MUST drop the session and fall back to
+ *   the C++ executor.
  */
 rust_spu_outcome_t rust_spu_run_until_event(rust_spu_t *h,
                                             uint32_t max_steps,

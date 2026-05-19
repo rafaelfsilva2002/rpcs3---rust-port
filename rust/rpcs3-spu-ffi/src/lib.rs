@@ -56,6 +56,13 @@ pub struct RustSpu {
 ///   the channel index that stalled (29 = IN_MBOX, 28 = OUT_MBOX, 3 = SNR1, etc.)
 /// - [`RustSpuOutcome::Error`]: the program counter at which the
 ///   error fired (an unsupported opcode or LS-OOB read).
+/// - [`RustSpuOutcome::MfcUnsupported`] (R7.1): the channel index in
+///   the MFC/DMA range 16..=25 that the runtime bridge's
+///   honest-fallback policy refused. The C++ bridge logs and drops
+///   the Rust session; no Rust state is committed back to
+///   `spu_thread`. Surfaced only when
+///   [`rust_spu_set_refuse_mfc`] was called with `true` (default
+///   stays `false`, so all replay tests are unaffected).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RustSpuOutcome {
@@ -64,6 +71,7 @@ pub enum RustSpuOutcome {
     StallRead = 2,
     StallWrite = 3,
     Error = 4,
+    MfcUnsupported = 5,
 }
 
 // =====================================================================
@@ -304,6 +312,101 @@ pub unsafe extern "C" fn rust_spu_signal(
 }
 
 // =====================================================================
+// R7.1 — Runtime-bridge MFC honest-fallback policy
+// =====================================================================
+
+/// R7.1 — toggle the SPU thread's MFC/DMA honest-fallback gate. When
+/// `enabled` is non-zero, any subsequent `wrch` to a channel in the
+/// MFC range 16..=23 (LSA/EAH/EAL/Size/TagID/Cmd/WrTagMask/WrTagUpdate)
+/// or `rdch` from ch24/ch25 (RdTagStat/RdTagMask) — or `rchcnt` on any
+/// of those — will short-circuit BEFORE touching any per-channel
+/// state and surface the dedicated [`RustSpuOutcome::MfcUnsupported`]
+/// outcome through [`rust_spu_run_until_event`]. The C++ runtime
+/// bridge (`SPURustBridge.cpp`) is the only intended caller; replay
+/// paths never set this flag, so all seven replay-validated oracle
+/// tests are unaffected.
+///
+/// R7.2 — the gate is RELAXED when [`rust_spu_set_dma_get_callback`]
+/// is installed in addition: ch16-20 / ch22-23 wrch and ch24/25 rdch
+/// fall through to Phase C, and `wrch ch21 (MFC_Cmd)` invokes the
+/// callback to execute the real EA→LS DMA via RPCS3 `vm::` memory.
+///
+/// Returns 0 on success, -1 if `h` is null.
+///
+/// # Safety
+///
+/// `h` must be a valid handle from [`rust_spu_new`] (or null).
+#[no_mangle]
+pub unsafe extern "C" fn rust_spu_set_refuse_mfc(h: *mut RustSpu, enabled: i32) -> i32 {
+    guard(
+        || {
+            let Some(h) = handle_mut(h) else { return -1 };
+            h.spu.channels.refuse_mfc = enabled != 0;
+            0
+        },
+        -100,
+    )
+}
+
+/// R7.2 — runtime DMA GET callback type, matches
+/// [`rpcs3_spu_thread::DmaGetCallback::func`]. Called from the SPU
+/// interpreter on `wrch ch21 (MFC_Cmd)` with cmd=0x40 (plain GET).
+///
+/// Parameters:
+/// - `user_data`: opaque context passed back unchanged.
+/// - `eal`: 32-bit effective address low (PSL1GHT scope; high half
+///   = 0 always validated separately).
+/// - `dst_ls_ptr`: writable pointer into the Rust SPU handle's LS
+///   at the previously-captured `mfc_lsa` offset, valid for `size`
+///   bytes.
+/// - `size`: transfer size in bytes (validated to {1,2,4,8} ∪
+///   multiples of 16 up to 16384; lsa+size <= 256 KiB).
+/// - `tag`: MFC tag id (validated <32). On success the interpreter
+///   pushes `1 << tag` into the SPU's tag-stat queue so a subsequent
+///   `rdch ch24` returns the right mask.
+///
+/// Returns 0 on success, non-zero to refuse (the interpreter then
+/// surfaces `MfcUnsupported`, the bridge falls back to C++).
+pub type DmaGetCallbackFn = unsafe extern "C" fn(
+    user_data: *mut core::ffi::c_void,
+    eal: u32,
+    dst_ls_ptr: *mut u8,
+    size: u32,
+    tag: u32,
+) -> i32;
+
+/// R7.2 — install (or clear) the runtime DMA GET callback on the
+/// handle. Pass `func = NULL` to clear an existing callback.
+///
+/// Returns 0 on success, -1 if `h` is null.
+///
+/// # Safety
+///
+/// `h` must be a valid handle from [`rust_spu_new`] (or null). The
+/// (`func`, `user_data`) pair must remain valid for as long as the
+/// handle is reachable from `rust_spu_run_until_event`. The bridge
+/// guarantees this by clearing the callback before drop_session or
+/// rust_spu_drop on the same call stack.
+#[no_mangle]
+pub unsafe extern "C" fn rust_spu_set_dma_get_callback(
+    h: *mut RustSpu,
+    func: Option<DmaGetCallbackFn>,
+    user_data: *mut core::ffi::c_void,
+) -> i32 {
+    guard(
+        || {
+            let Some(h) = handle_mut(h) else { return -1 };
+            h.spu.channels.dma_get_callback = func.map(|f| rpcs3_spu_thread::DmaGetCallback {
+                func: f,
+                user_data,
+            });
+            0
+        },
+        -100,
+    )
+}
+
+// =====================================================================
 // Run / step
 // =====================================================================
 
@@ -347,6 +450,14 @@ pub unsafe extern "C" fn rust_spu_run_until_event(
                             channel,
                             is_write: true,
                         } => (RustSpuOutcome::StallWrite, channel),
+                        // R7.1 — propagate the honest-fallback signal
+                        // to the C bridge. `code` carries the refusing
+                        // channel id (16..=25). The C bridge does NOT
+                        // commit any Rust state back to RPCS3 on this
+                        // outcome.
+                        StepOutcome::MfcUnsupported { channel, .. } => {
+                            (RustSpuOutcome::MfcUnsupported, channel)
+                        }
                     }
                 }
                 Err(_e) => {

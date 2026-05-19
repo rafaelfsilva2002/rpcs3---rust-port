@@ -354,6 +354,91 @@ pub struct SpuChannels {
     /// parks; runtime-mode MFC is out of R6.7 scope so this is the
     /// expected halting behaviour for any unanticipated read).
     pub mfc_tag_stat_queue: std::collections::VecDeque<u32>,
+
+    // R7.1 — honest fallback flag for MFC/DMA channels in runtime
+    // bridge mode. Default `false` preserves the existing replay
+    // semantics (all 7 oracle replay tests rely on the C.2/C.3/C.4
+    // wiring for ch16-25 to succeed). The C++ runtime bridge
+    // (`SPURustBridge.cpp`) sets this to `true` on every handle it
+    // creates so that an SPU program attempting any MFC channel op
+    // (`wrch ch16-23` or `rdch ch24-25`) returns
+    // `ChannelStatus::MfcRefused` BEFORE any state mutation. The
+    // bridge then sees a corresponding outcome variant (the
+    // interpreter maps the refusal to `StepOutcome::MfcUnsupported`)
+    // and falls back honestly to the C++ executor without committing
+    // any Rust-side MFC state back to RPCS3.
+    //
+    // R7.2 — the gate is RELAXED when [`SpuChannels::dma_get_callback`]
+    // is installed: ch16-20 / ch22-23 wrch and ch24/25 rdch fall
+    // through to their normal Phase C semantics (store or pop), and
+    // `wrch ch21 (MFC_Cmd)` is special-cased by the interpreter to
+    // invoke the callback (executing the GET via real RPCS3 vm::
+    // memory). Only `cmd != 0x40` (non-GET) and validation failures
+    // still produce `MfcRefused` under the R7.2 path.
+    pub refuse_mfc: bool,
+
+    /// R7.2 — optional runtime DMA GET callback. When `Some`, the
+    /// interpreter intercepts `wrch ch21 (MFC_Cmd)` to invoke the
+    /// callback with the current MFC param state. The C++ runtime
+    /// bridge installs a callback that reads EA bytes via `vm::_ptr`
+    /// (real RPCS3 memory, no synthesis) and copies them into the
+    /// Rust handle's LS at `mfc_lsa`. On success the interpreter
+    /// pushes `1 << tag` into [`Self::mfc_tag_stat_queue`] so the
+    /// subsequent `rdch ch24 (RdTagStat)` succeeds.
+    ///
+    /// Default `None`: replay paths get the existing Phase C no-op,
+    /// pure-FFI users without a callback get [`Self::refuse_mfc`]
+    /// honest-fallback (R7.1) semantics.
+    pub dma_get_callback: Option<DmaGetCallback>,
+}
+
+/// R7.2 — function pointer + opaque context for the runtime DMA GET
+/// callback. The callback returns `0` on success, non-zero to refuse
+/// (the interpreter then surfaces `MfcRefused` so the bridge falls
+/// back honestly to the C++ executor).
+///
+/// Stored on [`SpuChannels`] via [`rust_spu_set_dma_get_callback`]
+/// (FFI). The pointers are NOT followed by Rust code in this crate;
+/// the interpreter dereferences them only inside the wrch ch21
+/// special case where it owns the matching `&mut SpuThread` borrow.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmaGetCallback {
+    /// C ABI function pointer. Signature:
+    ///   `int32_t cb(void* user_data, uint32_t eal, uint8_t* dst_ls_ptr,
+    ///               uint32_t size, uint32_t tag)`
+    /// where `dst_ls_ptr` is a pointer to the Rust handle's LS at
+    /// the captured `mfc_lsa` offset, valid for `size` bytes.
+    pub func: unsafe extern "C" fn(
+        user_data: *mut core::ffi::c_void,
+        eal: u32,
+        dst_ls_ptr: *mut u8,
+        size: u32,
+        tag: u32,
+    ) -> i32,
+    /// Opaque user-data passed back to `func`. The bridge typically
+    /// stores a `spu_thread*` here for diagnostic logging.
+    pub user_data: *mut core::ffi::c_void,
+}
+
+// SAFETY: `DmaGetCallback` carries raw pointers, but the FFI
+// callback contract (the C++ bridge owns and serialises access) is
+// what keeps it safe. `unsafe impl Send/Sync` is NOT used —
+// callbacks travel with their handle (single-threaded in R7.2 use).
+// The raw pointer ergonomics are deliberate: we keep zero borrowed
+// state across the FFI boundary.
+
+/// R7.1 — predicate identifying MFC / DMA channels (the channel
+/// range the runtime bridge currently refuses to execute Rust-side).
+/// Covers the wrch param channels (ch16-23) plus the rdch tag-stat
+/// channels (ch24, ch25). The R6.7 design § 1.5 lists every member
+/// of this range. Used by [`SpuChannels::read`] / [`SpuChannels::write`]
+/// / [`SpuChannels::count`] together with [`SpuChannels::refuse_mfc`]
+/// to short-circuit BEFORE mutating any per-channel state.
+#[inline]
+#[must_use]
+pub const fn is_mfc_channel(channel: u32) -> bool {
+    matches!(channel, 16..=25)
 }
 
 /// Outcome of a channel op when the channel is empty/full. Matches
@@ -365,6 +450,14 @@ pub enum ChannelStatus {
     Ok,
     WouldStall,
     BadChannel,
+    /// R7.1 — channel is in the MFC/DMA range (16..=25) and the
+    /// owning [`SpuChannels`] has `refuse_mfc=true`. The caller (the
+    /// interpreter's rdch/wrch/rchcnt dispatch) maps this to a
+    /// dedicated outcome that lets the C++ runtime bridge fall back
+    /// honestly to the C++ executor without committing any Rust
+    /// state. NEVER returned when `refuse_mfc=false` (the replay
+    /// path always leaves it false).
+    MfcRefused,
 }
 
 /// R5.4a: why an SPU thread is currently parked. The variant carries
@@ -453,6 +546,20 @@ impl SpuChannels {
     /// [`ChannelStatus::WouldStall`] instead of blocking.
     pub fn read(&mut self, channel: u32) -> Result<u32, ChannelStatus> {
         use ch::*;
+        // R7.1 / R7.2 — honest-fallback gate for MFC/DMA channels
+        // under the runtime bridge. Checked BEFORE any per-channel
+        // mutation so the SPU sees no Rust-side state change before
+        // the bridge falls back to C++. `refuse_mfc` is false by
+        // default; replay tests never set it.
+        //
+        // R7.2 — the gate is RELAXED when a runtime DMA callback is
+        // installed: the bridge has explicitly opted into executing
+        // MFC ops itself, so rdch ch24 (RdTagStat) / ch25 (RdTagMask)
+        // proceed via the normal Phase C path. The callback is the
+        // entity that populates `mfc_tag_stat_queue`.
+        if self.refuse_mfc && is_mfc_channel(channel) && self.dma_get_callback.is_none() {
+            return Err(ChannelStatus::MfcRefused);
+        }
         match channel {
             SPU_RDEVENTSTAT => Ok(self.event_stat & self.event_mask),
             SPU_RDEVENTMASK => Ok(self.event_mask),
@@ -510,6 +617,18 @@ impl SpuChannels {
     /// `wrch` — blocking write.
     pub fn write(&mut self, channel: u32, value: u32) -> Result<(), ChannelStatus> {
         use ch::*;
+        // R7.1 / R7.2 — honest-fallback gate for MFC/DMA channels.
+        // See [`Self::read`] for the rationale. R7.2 relaxes the gate
+        // when a runtime DMA GET callback is installed: ch16-20 /
+        // ch22-23 wrch fall through to the Phase C store so the
+        // captured MFC param state is available when the interpreter
+        // dispatches the callback on `wrch ch21 (MFC_Cmd)`. The
+        // interpreter intercepts ch21 BEFORE this method when the
+        // callback is set, so the ch21 arm of the match below is
+        // unreachable along the R7.2 path.
+        if self.refuse_mfc && is_mfc_channel(channel) && self.dma_get_callback.is_none() {
+            return Err(ChannelStatus::MfcRefused);
+        }
         match channel {
             SPU_WREVENTMASK => { self.event_mask = value; Ok(()) }
             SPU_WREVENTACK => { self.event_stat &= !value; Ok(()) }
@@ -557,6 +676,11 @@ impl SpuChannels {
     /// channels) or how many slots are free (for write channels).
     pub fn count(&self, channel: u32) -> Result<u32, ChannelStatus> {
         use ch::*;
+        // R7.1 / R7.2 — same honest-fallback gate as `read`/`write`,
+        // relaxed when a runtime DMA callback is installed.
+        if self.refuse_mfc && is_mfc_channel(channel) && self.dma_get_callback.is_none() {
+            return Err(ChannelStatus::MfcRefused);
+        }
         let count = match channel {
             // Read channels: 1 if data available.
             SPU_RDINMBOX => if self.in_mbox.is_some() { 1 } else { 0 },
@@ -783,6 +907,23 @@ impl SpuThread {
         }
         self.ls[start..end].copy_from_slice(data);
         true
+    }
+
+    /// R7.2 — raw pointer into LS at `lsa`. Used by the interpreter's
+    /// wrch ch21 special case to hand a writable destination buffer
+    /// to the C++ runtime DMA GET callback. The caller is responsible
+    /// for ensuring the [`lsa`, `lsa + size`) range stays inside the
+    /// 256 KiB LS — the interpreter validates that BEFORE calling.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer is valid for `SPU_LS_SIZE - (lsa &
+    /// (SPU_LS_SIZE - 1))` bytes (LS is contiguously allocated).
+    /// Concurrent reads/writes via Rust references are UB; the
+    /// interpreter holds an exclusive borrow during the callback call.
+    pub unsafe fn ls_mut_ptr_unchecked(&mut self, lsa: u32) -> *mut u8 {
+        let start = (lsa as usize) & (SPU_LS_SIZE - 1);
+        unsafe { self.ls.as_mut_ptr().add(start) }
     }
 }
 

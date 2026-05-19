@@ -406,6 +406,10 @@ impl EmuCore {
             SpuStepOutcome::Stop(code) => code,
             SpuStepOutcome::Continue => return Err(Error::StepsExhausted),
             SpuStepOutcome::ChannelStall { .. } => return Err(Error::StepsExhausted),
+            // R7.1 — refuse_mfc defaults to false on a fresh SpuThread,
+            // so this arm is unreachable in the emu-core test
+            // harness. Listed explicitly to satisfy exhaustiveness.
+            SpuStepOutcome::MfcUnsupported { .. } => return Err(Error::StepsExhausted),
         };
 
         // 4) Retire the thread, join the group, destroy.

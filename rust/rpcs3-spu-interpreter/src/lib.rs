@@ -35,6 +35,16 @@ pub enum StepOutcome {
     /// the channel. `pc` has NOT been advanced — a later `step` call
     /// will retry the same instruction.
     ChannelStall { channel: u32, is_write: bool },
+    /// R7.1 — an MFC/DMA channel op (`wrch ch16-23` / `rdch ch24-25`
+    /// / `rchcnt` on any of those) ran into the honest-fallback
+    /// gate (`SpuChannels::refuse_mfc == true`). `pc` is the address
+    /// of the refusing instruction (NOT advanced); the SPU's MFC
+    /// state and the parked-thread state are both untouched. The
+    /// caller (typically the C++ runtime bridge via
+    /// `rust_spu_run_until_event`) is expected to drop the Rust
+    /// session and fall back to the C++ SPU executor without
+    /// committing any Rust state.
+    MfcUnsupported { channel: u32, is_write: bool, is_count: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -838,6 +848,16 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
                     spu.park_on_channel(pc, SpuParkReason::ChannelRead { channel });
                     return Ok(StepOutcome::ChannelStall { channel, is_write: false });
                 }
+                Err(ChannelStatus::MfcRefused) => {
+                    // R7.1 honest-fallback: do NOT advance PC, do NOT
+                    // park, do NOT mutate any MFC state — `SpuChannels`
+                    // already short-circuited before touching anything.
+                    return Ok(StepOutcome::MfcUnsupported {
+                        channel,
+                        is_write: false,
+                        is_count: false,
+                    });
+                }
                 Err(_) => {
                     return Err(Error::Unimplemented {
                         inst, pc,
@@ -850,6 +870,62 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
         0x10D => {
             let channel = ra(inst) as u32 & 0x7F;
             let value = split_lanes(spu.gpr[rt(inst)])[0];
+            // R7.2 — runtime DMA GET callback path for ch21 (MFC_Cmd).
+            // When the C++ bridge has installed a `dma_get_callback`,
+            // we intercept the wrch BEFORE delegating to
+            // `SpuChannels::write` so the callback can execute the
+            // real EA→LS DMA via RPCS3 vm:: memory. Pre-conditions:
+            // ch16-20 wrch already populated mfc_lsa / eah / eal /
+            // size / tag_id; the captured MFC param state is read
+            // straight from `spu.channels`. Validation mirrors the
+            // R6.7 design § 3 supported subset (cmd=0x40, eah=0,
+            // tag<32, size in {1,2,4,8} ∪ {16k | k>0, 16k<=16384},
+            // lsa+size<=256 KiB). Any failure surfaces as
+            // `MfcUnsupported` so the bridge falls back honestly.
+            if channel == 21 /* MFC_CMD */ {
+                if let Some(cb) = spu.channels.dma_get_callback {
+                    let cmd = value & 0xff;
+                    if cmd != 0x40 {
+                        // Non-GET cmd (PUT, list, atomic, etc.) — out of R7.2 scope.
+                        return Ok(StepOutcome::MfcUnsupported {
+                            channel,
+                            is_write: true,
+                            is_count: false,
+                        });
+                    }
+                    let lsa = spu.channels.mfc_lsa as usize;
+                    let eah = spu.channels.mfc_eah;
+                    let eal = spu.channels.mfc_eal;
+                    let size = spu.channels.mfc_size as usize;
+                    let tag = spu.channels.mfc_tag_id;
+                    let size_ok = size > 0
+                        && size <= 0x4000
+                        && (matches!(size, 1 | 2 | 4 | 8) || size.is_multiple_of(16));
+                    let lsa_ok = lsa.checked_add(size).map_or(false, |end| end <= SPU_LS_SIZE);
+                    if eah == 0 && tag < 32 && size_ok && lsa_ok {
+                        // Pointer into Rust's LS at `lsa`, valid for
+                        // `size` bytes. The callback writes EA bytes
+                        // here via memcpy; ownership stays with the
+                        // SPU thread for the duration of the call.
+                        let dst_ptr = unsafe { spu.ls_mut_ptr_unchecked(lsa as u32) };
+                        let rc = unsafe { (cb.func)(cb.user_data, eal, dst_ptr, size as u32, tag) };
+                        if rc == 0 {
+                            spu.channels.mfc_tag_stat_queue.push_back(1u32 << tag);
+                            spu.pc = pc.wrapping_add(4);
+                            return Ok(StepOutcome::Continue);
+                        }
+                    }
+                    // Validation failure OR callback refused — honest fallback.
+                    return Ok(StepOutcome::MfcUnsupported {
+                        channel,
+                        is_write: true,
+                        is_count: false,
+                    });
+                }
+                // No callback installed: fall through to SpuChannels::write
+                // (which applies the R7.1 refuse_mfc gate or, in replay
+                // mode with refuse_mfc=false, the Phase C no-op).
+            }
             match spu.channels.write(channel, value) {
                 Ok(()) => {
                     spu.pc = pc.wrapping_add(4);
@@ -861,6 +937,20 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
                     // the mailbox drains.
                     spu.park_on_channel(pc, SpuParkReason::ChannelWrite { channel });
                     return Ok(StepOutcome::ChannelStall { channel, is_write: true });
+                }
+                Err(ChannelStatus::MfcRefused) => {
+                    // R7.1 honest-fallback — see comment in the rdch
+                    // arm above. The wrch case is the load-bearing
+                    // path for `single_spu_dma_get_v1` because the
+                    // FIRST MFC channel touch is `wrch ch16 (MFC_LSA)`
+                    // at the SPU's entry block, so the bridge sees
+                    // this outcome before any LS / GPR / channel
+                    // mutation has happened.
+                    return Ok(StepOutcome::MfcUnsupported {
+                        channel,
+                        is_write: true,
+                        is_count: false,
+                    });
                 }
                 Err(_) => {
                     return Err(Error::Unimplemented {
@@ -878,6 +968,16 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
                     spu.gpr[rt(inst)] = join_lanes([count, 0, 0, 0]);
                     spu.pc = pc.wrapping_add(4);
                     return Ok(StepOutcome::Continue);
+                }
+                Err(ChannelStatus::MfcRefused) => {
+                    // R7.1 honest-fallback for `rchcnt` on an MFC
+                    // channel. Same semantics as the rdch/wrch arms
+                    // above: PC unchanged, no GPR write, no park.
+                    return Ok(StepOutcome::MfcUnsupported {
+                        channel,
+                        is_write: false,
+                        is_count: true,
+                    });
                 }
                 Err(_) => {
                     return Err(Error::Unimplemented {
@@ -2281,6 +2381,13 @@ pub fn run_n(spu: &mut SpuThread, max_steps: usize) -> Result<(usize, StepOutcom
             StepOutcome::Stop(code) => return Ok((i + 1, StepOutcome::Stop(code))),
             StepOutcome::ChannelStall { channel, is_write } => {
                 return Ok((i + 1, StepOutcome::ChannelStall { channel, is_write }));
+            }
+            // R7.1 — early exit on MFC refusal so the caller can hand
+            // off to the C++ executor before any further SPU state
+            // is mutated. PC has not been advanced past the refusing
+            // instruction.
+            StepOutcome::MfcUnsupported { channel, is_write, is_count } => {
+                return Ok((i + 1, StepOutcome::MfcUnsupported { channel, is_write, is_count }));
             }
             StepOutcome::Continue => {}
         }

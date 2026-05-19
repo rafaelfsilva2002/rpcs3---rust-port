@@ -66,8 +66,31 @@ RUNTIME_HOOKS = PATCH_DIR / "spu_trace_jsonl_runtime_hooks.patch"
 # if the file is absent, the gate stays green (R6.0 / pre-R6.1
 # states are valid).
 RUST_BRIDGE = PATCH_DIR / "spu_rust_bridge.patch"
+# R7.2 (2026-05-18) — superseded R7.1 sha
+# eeb57616830f424c1fb2fecf30349914b028acc70067ba2fe130b64b563ee64a
+# Adds runtime DMA GET dispatch on top of R7.1's honest-fallback path:
+#   - bridge_dma_get_callback() — reads RPCS3 EA bytes via
+#     vm::_ptr<u8>(eal) and memcpys into the Rust handle's LS at
+#     the captured mfc_lsa (same path the C++ executor's
+#     process_mfc_cmd() simple-GET branch uses).
+#   - rust_spu_set_dma_get_callback(handle, &bridge_dma_get_callback,
+#     &spu) installed in try_delegate_execution() alongside
+#     rust_spu_set_refuse_mfc(handle, 1). The refuse gate is
+#     RELAXED by the Rust interpreter when a callback is installed,
+#     so ch16-20 / ch22-23 wrch and ch24/25 rdch fall through to
+#     Phase C and wrch ch21 (MFC_Cmd) invokes the callback.
+#   - SUCCESS log on every GET dispatch: "R7.2 DMA GET dispatched:
+#     cmd=0x40 eal=0x... size=N tag=T ... real EA/LS path
+#     (vm::_ptr<u8>); tag-stat 1<<T queued for subsequent rdch ch24".
+#   - Non-GET cmds, validation failures, and a NULL EA still surface
+#     MfcUnsupported via the R7.1 outcome arm — bridge falls back
+#     honestly for any path R7.2 does not handle.
+# R7.1 + R7.2 acceptance verified on single_spu_dma_get_v1.self:
+# bridge OFF and bridge ON both produce canonical TTY
+# 0xdeada12f; bridge ON with R7.2 delegates end-to-end (total_steps
+# >1000, stall_iters=0, NO MfcUnsupported fallback).
 RUST_BRIDGE_PINNED_SHA256 = (
-    "7d6b6bba3d1c590ec16f2ff175b262a4f95bdf95ace92eb91636824488436c03"
+    "a1e810264d8d9474018c279606111b543eb3f6b6c5845839382e4a657e220e70"
 )
 
 # Hot-path source files that runtime hooks edit; scaffolding MUST NOT
