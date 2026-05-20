@@ -1073,3 +1073,121 @@ branch specifically adds these:
   dispatches, distinct tags. Three-or-more dispatches are
   in-scope mechanically (the data structures generalize) but
   no fixture exercises that case yet.
+
+---
+
+## 16. R8.3a closure note (2026-05-20) — ANY wait mode + ch24 drain-aggregate
+
+R8.3a is the first DMA fixture to surface a **real runtime/replay
+divergence** and co-fix it. The 10th oracle
+`single_spu_dma_get_any_v1` exercises `WrTagUpdate = ANY` (= 1)
+on top of the R8.2 multi-DMA shape. The fixture's SPU embeds
+the actual ch24 returned value into the canonical OUT_MBOX
+status via `(tag_stat << 24) ^ 0xBEEFBEAD` — this is what
+exposed the bug.
+
+### 16.1 The divergence
+
+C++ executor (`rpcs3/Emu/Cell/SPUThread.cpp`'s `process_mfc_cmd`)
+exposes `RdTagStat` (ch24) as `completed_tags & wr_tag_mask` —
+a snapshot of all completed tag bits intersected with the
+current SPU mask register. Pre-R8.3a, the Rust SPU runtime
+treated `mfc_tag_stat_queue` as a FIFO: each ch21 GET/PUT
+dispatch callback pushed `1 << tag`; each ch24 read popped one
+front entry.
+
+For single-DMA fixtures (R6.7 GET v1, R8.1 PUT v1), pop-one
+worked because the queue always had exactly one entry. For
+R8.2 multi-DMA ALL, pop-one returned `1 << 3 = 0x8` instead of
+`0x28`, but the SPU C source discarded the value (`(void)
+tag_stat;`) so the divergence didn't surface in the canonical
+status. R8.3a's tag_stat embed broke the latency.
+
+### 16.2 The fix
+
+Single function, single file: `SpuChannels::read` in
+`rust/rpcs3-spu-thread/src/lib.rs`. New shape:
+
+```rust
+ch::MFC_RD_TAG_STAT => {
+    if self.mfc_tag_stat_queue.is_empty() {
+        return Err(ChannelStatus::WouldStall);
+    }
+    let mut completed: u32 = 0;
+    while let Some(v) = self.mfc_tag_stat_queue.pop_front() {
+        completed |= v;
+    }
+    Ok(completed & self.mfc_wr_tag_mask)
+}
+```
+
+**Drain-OR-AND** semantics:
+- **Drain**: empty the queue in one read.
+- **OR**: aggregate all entries into a single `completed`
+  bitmap (matches the C++ executor's `completed_tags` register).
+- **AND** with `mfc_wr_tag_mask`: filter per the SPU's wait
+  mask (matches the C++ executor's mask-intersection).
+
+This unifies the two producer paths:
+- **Pre-replay** pushes a single pre-aggregated value
+  (= the captured ch24 return) per `spu_rdch ch24` event in
+  the trace. Drain returns that value; AND is a no-op (the
+  captured value is already mask-filtered by RPCS3).
+- **Runtime** pushes individual `1 << tag` bits per ch21
+  dispatch. Drain aggregates them; AND filters.
+
+### 16.3 Limitation (documented for R8.4+)
+
+The drain semantic empties the queue. A future fixture that
+performs MULTIPLE ch24 reads in the same SPU session (e.g.
+polling at different wait windows) would see the first read
+consume all pending bits and subsequent reads stall. That's
+NOT Cell BE behavior — the hardware exposes `completed_tags`
+as a register that retains state across reads. The R8.3a fix
+is observationally correct for one-shot reads (all 10 current
+oracles do exactly one ch24 read per session) but a future
+fixture would force a refactor to a persistent
+`completed_tags: u32` field on `SpuChannels`.
+
+This is the empirical-scoping policy in action: the smallest
+fix that closes the current gap, documented limit so the next
+divergence is anticipated.
+
+### 16.4 R8.3a acceptance state
+
+- ✅ 10 replay-validated oracles green (cross-backend byte-identical)
+- ✅ workspace `--lib --no-fail-fast` green (all crates)
+- ✅ `check_trace_fixtures.py` green (10 fixtures listed)
+- ✅ `check_patch_separation.py` green (3 SHA-pinned patches
+  UNCHANGED — R8.3a fix is Rust core only, no C++ patch
+  regeneration)
+- ✅ `check_triple_symmetry.py --fixture {get,put,get_multi,get_any}`
+  all four green
+- ✅ rpcs3.exe rebuilt to `3d25d782…` (relinked new
+  `rpcs3_spu_ffi.lib`)
+- ✅ v4 still diagnostic-only
+- ✅ `single_spu_dma_get_any_v1` is the project's first
+  ANY-wait-mode oracle AND the first oracle whose authoring
+  exposed a real engine bug; status = `0x892FAE2D` byte-identical
+  across the three execution paths.
+
+### 16.5 R8.3a hard rules carried forward to R8.4+
+
+The § 11 + § 13.5 + § 14.3 + § 15.3 rules carry verbatim.
+The ANY branch + ch24 drain-aggregate fix specifically adds:
+
+- No silent ch24 truncation. `completed & mfc_wr_tag_mask`
+  is the load-bearing semantic; weakening to "return whatever
+  is in the queue head" recreates the R8.3a divergence.
+- No fake RdTagStat in fixtures. The captured ch24 IS the
+  canonical for the backend that produced the trace. If a
+  future backend (real hardware, async-DMA emulator) returns
+  a different value, that's a backend change → re-capture,
+  re-document, bump the oracle.
+- ANY mode oracles MUST embed the tag_stat into the canonical
+  status arithmetic. Discarding the value via `(void)` would
+  hide divergences (the R8.2 latency).
+- One ch24 read per SPU session in R8.3a-era oracles. The
+  drain-clear semantic doesn't support multi-read polling;
+  R8.4+ must refactor to persistent `completed_tags` if such
+  a fixture is required.

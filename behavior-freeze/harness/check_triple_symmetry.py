@@ -146,10 +146,32 @@ GET_MULTI_FIXTURE = FixtureSpec(
 )
 
 
+# R8.3a — multi-DMA GET fixture using ANY wait mode (10th oracle).
+# Same shape as R8.2 multi but with WrTagUpdate=ANY (=1). The SPU
+# embeds the actual ch24 returned value into the canonical status
+# via `(tag_stat << 24) XOR 0xBEEFBEAD`, so the oracle round-trips
+# any backend choice. Captured RPCS3 sync-DMA produces ch24=0x28
+# (full mask), yielding canonical status 0x892FAE2D.
+GET_ANY_FIXTURE = FixtureSpec(
+    name="single_spu_dma_get_any_v1",
+    rust_test_target="single_spu_dma_get_any_v1_replay",
+    canonical_tty_substr="[dma_get_any_v1] OK cause=0x1 status=0x892fae2d",
+    canonical_status_summary=(
+        "status = ((sum1 << 16) | sum2) ^ (tag_stat << 24) ^ 0xBEEFBEAD "
+        "where sum1 = 0x1FC0 (counting pattern, 128 B), sum2 = 0x1080 "
+        "(constant 0x42, 64 B), tag_stat = 0x28 (captured RPCS3 sync "
+        "DMA ANY return) = 0x892FAE2D"
+    ),
+    delegation_log_marker="DMA GET dispatched",
+    rust_log_intro="R7.2 DMA GET (multi-dispatch, ANY wait)",
+)
+
+
 FIXTURES = {
     "get": GET_FIXTURE,
     "put": PUT_FIXTURE,
     "get_multi": GET_MULTI_FIXTURE,
+    "get_any": GET_ANY_FIXTURE,
 }
 
 

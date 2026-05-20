@@ -642,16 +642,48 @@ impl SpuChannels {
                     None => Err(ChannelStatus::WouldStall),
                 }
             }
-            // R6.7 C.4 — RdTagStat (ch24): pop the next pre-populated
-            // tag-stat value. Empty queue → `WouldStall` (the SPU
-            // parks; runtime-mode MFC is out of R6.7 scope, so an
-            // unexpected empty-queue read indicates the captured
-            // trace's pre-replay setup is incomplete or the SPU
-            // diverged from the trace).
-            ch::MFC_RD_TAG_STAT => match self.mfc_tag_stat_queue.pop_front() {
-                Some(v) => Ok(v),
-                None => Err(ChannelStatus::WouldStall),
-            },
+            // R6.7 C.4 + R8.3a — RdTagStat (ch24): drain ALL pending
+            // tag-stat values via bitwise OR and return the aggregate
+            // intersected with `mfc_wr_tag_mask`. The drain shape
+            // unifies two producer paths that historically diverged:
+            //
+            // - **Pre-replay path** (R6.7 C.3 `apply_mfc_dma_pre_replay`):
+            //   pushes a SINGLE pre-aggregated value per captured
+            //   `spu_rdch ch24` event — exactly what RPCS3 returned
+            //   in the capture run (e.g. 0x28 for multi-tag ALL/ANY).
+            //   Drain-OR returns that value; mask-AND is a no-op
+            //   because the captured value is already a subset of
+            //   the captured `mfc_wr_tag_mask`.
+            //
+            // - **Runtime path** (R7.2 GET / R8.1 PUT callback): each
+            //   ch21 `MFC_Cmd` dispatch pushes `1 << tag` for the
+            //   just-completed transfer. Back-to-back dispatches (R8.2
+            //   multi, R8.3a ANY) accumulate N entries in the queue.
+            //   Drain-OR aggregates them into the equivalent of
+            //   `completed_tags`; mask-AND filters per the SPU's
+            //   `WrTagMask` register. This matches Cell BE / C++
+            //   `process_mfc_cmd` semantics where ch24 returns
+            //   `completed_tags & wr_tag_mask` rather than a single
+            //   per-tag bit (the divergence surfaced by R8.3a's
+            //   embedded tag_stat in the canonical status).
+            //
+            // Empty queue → `WouldStall`. The current oracles all
+            // perform exactly one ch24 read per session, so the
+            // drain-clear semantics are observationally correct. A
+            // future fixture needing repeated ch24 reads (e.g. polling
+            // multiple wait windows) would need persistent
+            // `completed_tags` state — deferred until such a fixture
+            // exists per the empirical scoping policy.
+            ch::MFC_RD_TAG_STAT => {
+                if self.mfc_tag_stat_queue.is_empty() {
+                    return Err(ChannelStatus::WouldStall);
+                }
+                let mut completed: u32 = 0;
+                while let Some(v) = self.mfc_tag_stat_queue.pop_front() {
+                    completed |= v;
+                }
+                Ok(completed & self.mfc_wr_tag_mask)
+            }
             // R6.7 C.4 — RdTagMask (ch25): stateless read of the
             // current tag-mask register.
             ch::MFC_RD_TAG_MASK => Ok(self.mfc_wr_tag_mask),
@@ -1439,23 +1471,56 @@ mod tests {
     }
 
     #[test]
-    fn mfc_rdtagstat_pops_pre_populated_queue_or_stalls_when_empty() {
+    fn mfc_rdtagstat_drains_queue_and_aggregates_with_mask() {
+        // R8.3a semantics: rdch ch24 drains the entire pending
+        // tag-stat queue via bitwise OR, then intersects with
+        // `mfc_wr_tag_mask`. This unifies the pre-replay path
+        // (queue carries a single pre-aggregated value matching
+        // the captured ch24 return) and the runtime callback
+        // path (each ch21 GET/PUT pushes 1<<tag, multiple
+        // dispatches accumulate). The C++ executor's
+        // `process_mfc_cmd` semantic for ch24 is
+        // `completed_tags & wr_tag_mask` — drain-OR-AND
+        // matches that observationally for one-shot reads.
         let mut t = SpuThread::new(0);
         // Empty queue → WouldStall.
         assert_eq!(
             t.channels.read(ch::MFC_RD_TAG_STAT),
             Err(ChannelStatus::WouldStall)
         );
-        // Pre-populate two tag-stat values.
+
+        // Set up the mask the SPU would have written via ch22
+        // BEFORE the ch24 read. Mask covers tags 3 + 5.
+        t.channels.mfc_wr_tag_mask = (1u32 << 3) | (1u32 << 5);
+
+        // Pre-populate two tag-stat values — mirrors what the R7.2
+        // GET callback would push for back-to-back dispatches.
         t.channels.mfc_tag_stat_queue.push_back(1u32 << 3);
         t.channels.mfc_tag_stat_queue.push_back(1u32 << 5);
-        assert_eq!(t.channels.read(ch::MFC_RD_TAG_STAT), Ok(1u32 << 3));
-        assert_eq!(t.channels.read(ch::MFC_RD_TAG_STAT), Ok(1u32 << 5));
-        // Drained → next read stalls again.
+        // Single drain returns the aggregate (= 0x28) intersected
+        // with the mask (also 0x28) = 0x28.
+        assert_eq!(t.channels.read(ch::MFC_RD_TAG_STAT), Ok(0x28));
+        // Queue drained → next read stalls again.
         assert_eq!(
             t.channels.read(ch::MFC_RD_TAG_STAT),
             Err(ChannelStatus::WouldStall)
         );
+
+        // Pre-aggregated single-entry queue (e.g. R6.7 / R8.1
+        // single-DMA, or R6.7 C.3 pre-replay path that pushes
+        // the captured ch24 value verbatim). Drain-OR returns
+        // the single entry; mask-AND with a superset mask is
+        // a no-op.
+        t.channels.mfc_wr_tag_mask = 0x28;
+        t.channels.mfc_tag_stat_queue.push_back(0x28);
+        assert_eq!(t.channels.read(ch::MFC_RD_TAG_STAT), Ok(0x28));
+
+        // Bits outside the mask are filtered. Drain returns 0x28
+        // but mask is just (1<<3) → return 0x8.
+        t.channels.mfc_wr_tag_mask = 1u32 << 3;
+        t.channels.mfc_tag_stat_queue.push_back(1u32 << 3);
+        t.channels.mfc_tag_stat_queue.push_back(1u32 << 5);
+        assert_eq!(t.channels.read(ch::MFC_RD_TAG_STAT), Ok(1u32 << 3));
     }
 
     #[test]
