@@ -1,8 +1,22 @@
-# Project Status — R8.1 LANDED (8th oracle: DMA PUT triple-symmetric)
+# Project Status — R8.2 LANDED (9th oracle: multi-DMA GET triple-symmetric)
 
 **Authoritative current source of truth for the RPCS3 → Rust port.**
 
-Last updated: **2026-05-19 (R8.1 landing)**. R8.1 (MFC PUT runtime
+Last updated: **2026-05-20 (R8.2 landing)**. R8.2 (multi-DMA GET
++ ALL wait + 9th oracle) extends R8.1's GET+PUT triple-symmetric
+DMA bridge with multi-tag in-flight semantics. The new fixture
+`single_spu_dma_get_multi_v1` exercises two queued GETs (tags
+3 + 5, distinct EAs / sizes / LSAs) + `WrTagMask = 0x28` +
+`WrTagUpdate = ALL` + `RdTagStat = 0x28`. **Zero code changes
+landed** — the 8-oracle baseline (parser, state machine, chunk
+loader, executor wiring, runtime bridge callback) already
+supported everything R8.2 exercises. The bridge ON delegation
+log shows `total_steps=1584` (vs 1054 for single-GET, 1049 for
+PUT), confirming both DMAs traversed the Rust executor end to
+end via the same R7.2 callback invoked twice. See "R8.2 phase
+closure (2026-05-20)" below.
+
+Previously: **2026-05-19 (R8.1 landing)**. R8.1 (MFC PUT runtime
 + replay oracle) extends R7's triple-symmetric DMA bridge with the
 inverse direction (LS → EA). The runtime bridge now executes BOTH
 DMA-bound oracles end-to-end through the Rust executor under
@@ -34,6 +48,14 @@ Do NOT treat the archive as current.
 
 ## 1. Executive current status
 
+- **R8.2 is LANDED** (2026-05-20). First multi-DMA replay oracle
+  + 9th oracle. Two queued GETs (tags 3 + 5) + ALL wait + 0x28
+  RdTagStat + canonical status `0xE12DEA4E`. **Zero engine-side
+  code changes**: the 8-oracle baseline (parser, state machine,
+  loader, executor, bridge callbacks) already covered multi-tag
+  in-flight + ALL wait semantics; R8.2 is a pure coverage gain
+  on the existing implementation. Triple-symmetry green via
+  `check_triple_symmetry.py --fixture get_multi`. See § 8.2.
 - **R8.1 is LANDED** (2026-05-19). MFC PUT runtime extension +
   8th replay-validated oracle. The runtime bridge now delegates
   BOTH `single_spu_dma_get_v1.self` (cmd 0x40, R7.2) AND
@@ -50,7 +72,7 @@ Do NOT treat the archive as current.
   persistent handle → R6.5 / R6.5b bridge acceptance → R6.6 game_like
   cross-path → R6.7 design + A.1-A.5 + Phase C — all landed and
   gated green.
-- **Eight replay-validated SPU oracles exist**, all
+- **Nine replay-validated SPU oracles exist**, all
   `diff_snapshots(interp, jit).is_identical()` byte-identical
   across `InterpreterExecutor` and `RecompilerExecutor`.
 - **`single_spu_dma_put_v1` is the 8th oracle** (R8.1 landed
@@ -116,7 +138,7 @@ backed up at `C:\docker-backup\rpcs3-ps3dev-toolchain-local.tar`.
 
 ## 3. Current oracle matrix
 
-All eight oracles below pass cross-backend byte-identical
+All nine oracles below pass cross-backend byte-identical
 (`diff_snapshots(interp, jit).is_identical()`). Each `.jsonl` has a
 companion `.notes.md` documenting provenance, toolchain, capture
 procedure, engine fixes co-landed, and acceptance criteria.
@@ -130,7 +152,8 @@ procedure, engine fixes co-landed, and acceptance criteria.
 | 5 | [`single_spu_mailbox_multi_v1`](../behavior-freeze/fixtures/spu/traces/single_spu_mailbox_multi_v1.jsonl) | R6.4b-replay | 5 | IN_MBOX round 1 + SNR1 round 2 + real park/wake (PPU `sysUsleep(100ms)`) | `0x453` | no | bridge ON validated (R6.4b persistent handle + `pop_wait`) |
 | 6 | [`game_like_mailbox_signal_v1`](../behavior-freeze/fixtures/spu/traces/game_like_mailbox_signal_v1.jsonl) | R6.6 | 5 | IN_MBOX + LS load/store + branch/loop + SNR1 + real park/wake (cross-path sentinel) | `0x051A03C9` | no | bridge ON validated (`total_steps=488 stall_iters=1`) |
 | 7 | [`single_spu_dma_get_v1`](../behavior-freeze/fixtures/spu/traces/single_spu_dma_get_v1.jsonl) | R6.7 A.5 | 15 | MFC GET (ch16-21 wrch + `spu_mfc_cmd` + `mfc_dma_complete` + ch22-23 + rdch ch24) + post-DMA sum + XOR | `0xDEADA12F` | yes (GET 0x40) | bridge ON delegated via R7.2 (`total_steps=1054 stall_iters=0`); triple-symmetric |
-| 8 | **[`single_spu_dma_put_v1`](../behavior-freeze/fixtures/spu/traces/single_spu_dma_put_v1.jsonl)** | **R8.1** | **15** | **MFC PUT (symmetric inverse of GET — LS → EA) + 128-byte LS source pattern → ch16-21 + spu_mfc_cmd cmd=0x20 + mfc_dma_complete + ch22-23 + rdch ch24 + ch28 OUT_MBOX sentinel; PPU reads EA back → `ea_status = 0xCAFEA57E`** | **spu=`0xC0FFEECA`, ea_status=`0xCAFEA57E`** | **yes (PUT 0x20)** | **bridge ON delegated via R8.1 (`total_steps=1049 stall_iters=0`); triple-symmetric** |
+| 8 | [`single_spu_dma_put_v1`](../behavior-freeze/fixtures/spu/traces/single_spu_dma_put_v1.jsonl) | R8.1 | 15 | MFC PUT (symmetric inverse of GET — LS → EA) + 128-byte LS source pattern → ch16-21 + spu_mfc_cmd cmd=0x20 + mfc_dma_complete + ch22-23 + rdch ch24 + ch28 OUT_MBOX sentinel; PPU reads EA back → `ea_status = 0xCAFEA57E` | spu=`0xC0FFEECA`, ea_status=`0xCAFEA57E` | yes (PUT 0x20) | bridge ON delegated via R8.1 (`total_steps=1049 stall_iters=0`); triple-symmetric |
+| 9 | **[`single_spu_dma_get_multi_v1`](../behavior-freeze/fixtures/spu/traces/single_spu_dma_get_multi_v1.jsonl)** | **R8.2** | **23** | **TWO QUEUED MFC GETs (cmd 0x40, tags 3 + 5, distinct EAs / sizes 128 + 64 / LSAs 0x10000 + 0x10100, both in-flight before any wait) + WrTagMask=0x28 + WrTagUpdate=ALL + RdTagStat=0x28 + ch28 OUT_MBOX status; FIRST multi-DMA oracle** | **`0xE12DEA4E`** | **yes (GET 0x40 × 2)** | **bridge ON delegated via R7.2 callback × 2 dispatches (`total_steps=1584 stall_iters=0`); triple-symmetric; ZERO engine-side code changes** |
 
 Notes on the seventh row:
 
@@ -625,6 +648,112 @@ races on shared EA, SPURS production support, in-line state
 machine driven by the executor (would restore the dispatch-time
 PUT assertion contract — currently deferred to post-replay). The
 R6 / R7 hard rules carry forward verbatim to R8.1 and R8.2+.
+
+---
+
+## 8.2 R8.2 closure summary (2026-05-20)
+
+R8.2 landed as the cleanest fixture-only delivery to date. The
+9th oracle `single_spu_dma_get_multi_v1` exercises multi-tag
+in-flight DMA + ALL wait semantics + multi-bit `WrTagMask`, on
+top of the R8.1 baseline. **Zero engine-side code changes** —
+the existing 8-oracle implementation already covered every
+mechanic R8.2 required.
+
+**Scope.** Two queued MFC GETs (tags 3 + 5, distinct EAs,
+distinct sizes 128 + 64, distinct LSAs 0x10000 + 0x10100,
+both in-flight before any wait) + `WrTagMask = 0x28` (=
+`(1 << 3) | (1 << 5)`) + `WrTagUpdate = ALL` + `RdTagStat
+= 0x28` (returned only after both completions fire). The SPU
+computes a combined checksum `status = ((sum1 << 16) | sum2)
+^ 0xFEEDFACE = 0xE12DEA4E` and halts via stop 0x101.
+
+**Why this validates with no code changes.**
+
+| Concern | Coverage |
+|---|---|
+| Parser accepts 2 `spu_mfc_cmd` events with cmd=0x40 | R6.7 A.2 already accepts cmd=0x40 unconditionally; events stream through the per-SPU transformer as pure context |
+| State machine handles 2 tags in flight | R6.7 A.4 unit test `mfc_replay_handles_wr_tag_mask_update_basic` already covered 2-tag ALL mode (tags 3 + 5, same as R8.2) |
+| Chunk loader resolves 2 distinct SHAs | R6.7 A.3 `resolve_dma_chunk_side_file` is content-addressed, indifferent to how many GETs the trace contains |
+| Tag-stat queue with multi-bit value | R6.7 Phase C wired `mfc_tag_stat_queue: VecDeque<u32>`; ALL mode pushes exactly one entry (the mask) regardless of how many GETs preceded it |
+| Bridge ON multi-dispatch | R7.2 callback is invoked per `wrch ch21` automatically; refuse_mfc gate already relaxed once the callback is installed |
+| Executor reads from correct LS regions | `apply_mfc_dma_pre_replay` walks events linearly and copies each chunk into LS at the captured (lsa, size) — distinct lsa per GET means no overwriting |
+
+The empirical "investigar quando acontecer" policy paid off:
+implementing PUT in R8.1 also primed the engine for any multi-DMA
+GET workload that doesn't introduce list / atomic / fence
+semantics.
+
+**Fixture + capture.** `single_spu_dma_get_multi_v1` source
+(PSL1GHT homebrew, CC0): PPU allocates two distinct EA buffers
+(ea_buf1 = 128 B counting pattern `i & 0xFF`, ea_buf2 = 64 B
+constant 0x42), passes EA1 via `thread_args.arg0` and EA2 via
+`arg1`. SPU dispatches both GETs back-to-back, waits via
+`ch22 = 0x28` + `ch23 = ALL` + `ch24` read, sums both LS
+regions, computes combined status, writes OUT_MBOX, halts.
+Built in Docker via `rpcs3-ps3dev-toolchain:local` (image sha
+`ed2167a9ac59…`); `.self` 940 KB sha
+`7eb545af47a2c51e064b4d79090e2930d1cd6058edbd9d29032785d0ad535659`.
+Capture run with `Core: SPU/PPU Decoder: Interpreter (static)`
+(R8.1 gotcha carries forward); trace is 23 events (vs 15 for
+single-DMA fixtures) including 2 `spu_mfc_cmd` + 2
+`mfc_dma_complete` events + 2 distinct `.dmachunk` references.
+
+**Content-addressed `.dmachunk` pool dedup.** Chunk #1
+(`471fb943aa23c511f6f72f8d1652d9c880cfa392ad80503120547703e56a2be5`,
+128 B counting pattern) deduplicates with R6.7 GET v1 + R8.1
+PUT v1 — already in the canonical pool, NOT re-committed. Chunk
+#2 (`c422e7070cb1cb455b5de9afee0d975e303d0239c72030cd7414ab5c382d3ae8`,
+64 B constant 0x42) is new and lands in the pool. The pool now
+holds 2 chunks total.
+
+**Replay oracle.** New `rust/rpcs3-spu-recompiler/tests/
+single_spu_dma_get_multi_v1_replay.rs`:
+- Parses JSONL via `parse_jsonl_trace`.
+- Asserts 2 `spu_mfc_cmd` events (tags 3 + 5, sizes 128 + 64,
+  cmd 0x40, EAs distinct, chunk SHAs distinct).
+- Asserts 2 `mfc_dma_complete` events matching tags + sizes.
+- Asserts `ch22 = 0x28`, `ch23 = 2 (ALL)`, `ch24 rdch = 0x28`,
+  ch28 = `0xE12DEA4E`, stop 0x101.
+- Builds `SpuProgram` from `.spuimg`, seeds r3 = EA1 lane 1 +
+  r4 = EA2 lane 1 (PSL1GHT arg0 + arg1 convention).
+- Calls `apply_mfc_dma_pre_replay` (both chunks land in LS at
+  captured LSAs; pre-application sanity-checks both regions
+  carry the expected patterns).
+- Runs replay × Interpreter + replay × Recompiler;
+  `diff_snapshots.is_identical()`.
+- Post-replay verifies BOTH backends' final LS at both regions
+  matches the captured chunks byte-for-byte (mirrors the R8.1
+  PUT shape).
+
+**Triple-symmetry extension.** `check_triple_symmetry.py`
+`FIXTURES` dict gained `get_multi`. Three fixtures green:
+
+| Path | GET | PUT | GET_MULTI |
+|---|---|---|---|
+| bridge OFF TTY | `0xdeada12f` ✓ | spu=`0xc0ffeeca` ea_status=`0xcafea57e` ✓ | `0xe12dea4e` ✓ |
+| bridge ON delegation | R7.2 total_steps=1054 ✓ | R8.1 total_steps=1049 ✓ | R7.2×2 total_steps=1584 ✓ |
+| replay oracle | get_v1_replay ✓ | put_v1_replay ✓ | get_multi_v1_replay ✓ |
+
+**Patch SHAs at R8.2 landing (`check_patch_separation.py` pin):**
+
+| Patch | sha256 | Δ vs R8.1 |
+|---|---|---|
+| scaffolding | `cda976d7b7bace826b3e8c38475fab5e077c88201bd0b31768541f06635143a1` | unchanged |
+| runtime hooks | `1f598d37c07d30f7e8b43fa0e53018b7c9277f628c2af58ab40bf987ffbd46ff` | unchanged |
+| rust bridge | `0afda1c6943feb5d98329299a57dd68404095efb0a792839779febed13ab8a7e` | unchanged |
+
+**rpcs3.exe at R8.2 landing:** sha256
+`3ef63a825f9820373bb1df175bc975d5063f531b98206860fab36a50a8cd95d2`
+(same binary as R8.1; no rebuild needed).
+
+**Out of R8.2 scope (deferred to R8.3+):** DMA list cmds
+(GETL/PUTL/GETLB/PUTLB), atomic primitives (GETLLAR/PUTLLC/
+PUTLLUC/PUTQLLUC), MFC barriers / fence bits, multi-SPU DMA
+races on shared EA, SPURS production support, ANY wait mode
+(R8.2 covers ALL only; ANY exists in the state machine but
+no oracle exercises it yet), in-line state-machine executor
+wiring. The R6 / R7 / R8.1 hard rules carry forward verbatim.
 
 ---
 

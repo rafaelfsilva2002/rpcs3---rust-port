@@ -998,3 +998,78 @@ R8.2+. The PUT branch specifically adds these:
   (PUTLLC/PUTLLUC/PUTQLLUC), and barrier/fence variants. R8.1
   fixture targets cmd 0x20 ONLY; the parser canary moves to
   cmd 0x44 GETL to keep the rejection surface tight.
+
+---
+
+## 15. R8.2 closure note (2026-05-20) — multi-DMA GET coverage
+
+R8.2 closed on the same day as the first delivery attempt: it is
+a **pure fixture-only delivery** with zero engine-side code
+changes. The 9th oracle `single_spu_dma_get_multi_v1` exercises
+two queued GETs (tags 3 + 5, distinct EAs / sizes / LSAs) plus
+ALL wait mode plus a multi-bit `WrTagMask`. All mechanics were
+already correctly implemented in the 8-oracle baseline; R8.2 is
+a coverage gain that locks them as a regression sentinel.
+
+### 15.1 Why no code changes
+
+The R6.7 A.4 design anticipated multi-tag in-flight: `process_mfc_cmd`
+inserts into an `HashMap<u32, MfcInFlight>` keyed by tag, and
+`process_mfc_dma_complete` removes by tag. Wait modes
+(Immediate / Any / All) compute `observed_now =
+completed_tags & wr_tag_mask` and gate accordingly. The R6.7 A.4
+unit test `mfc_replay_handles_wr_tag_mask_update_basic` already
+exercised exactly the R8.2 mechanic — 2 dispatches (tags 3 + 5,
+mask 0x28, ALL mode) — but on synthetic events. R8.2 promotes
+that synthetic scenario to a real-binary oracle backed by a
+captured trace + `.dmachunk` pool entries.
+
+Bridge ON multi-dispatch works for the same reason: the R7.2
+runtime DMA GET callback is invoked **per `wrch ch21`**, and
+`try_delegate_execution` installs it once per session. Two
+back-to-back wrches → two callback invocations → two
+`vm::_ptr<u8>` copies → two tag-stat queue entries. The R7.2
+documentation already noted "multiple GETs in the same session
+work transparently"; R8.2 is the first empirical confirmation.
+
+### 15.2 R8.2 acceptance state
+
+- ✅ 9 replay-validated oracles green (cross-backend byte-identical)
+- ✅ workspace `--lib --no-fail-fast` green (zero failures across
+  all crates)
+- ✅ `check_trace_fixtures.py` green (9 fixtures listed)
+- ✅ `check_patch_separation.py` green (3 SHA-pinned patches
+  UNCHANGED from R8.1 — no regenerations needed)
+- ✅ `check_triple_symmetry.py --fixture {get,put,get_multi}`
+  all three green
+- ✅ rpcs3.exe unchanged (`3ef63a82…`, same R8.1 binary)
+- ✅ v4 still diagnostic-only (R8.2 lands without promoting
+  any commercial DMA capture)
+- ✅ `single_spu_dma_get_multi_v1` is the project's first
+  multi-DMA replay-validated oracle; status = `0xE12DEA4E`
+  (= ((0x1FC0 << 16) | 0x1080) ^ 0xFEEDFACE) byte-identical
+  across the three execution paths
+
+### 15.3 R8.2 hard rules carried forward to R8.3+
+
+The § 11 + § 13.5 + § 14.3 rules carry verbatim. The multi-DMA
+branch specifically adds these:
+
+- No silent fake-DMA path for either GET in the multi sequence.
+  Each chunk must round-trip via the content-addressed pool
+  (per-trace + canonical resolver, R6.7 A.3).
+- The two GET dispatches MUST be captured as two distinct
+  `spu_mfc_cmd` events in canonical order (wrch ch16-21 →
+  spu_mfc_cmd → mfc_dma_complete). The parser's ordering
+  invariant catches interleaved dispatches.
+- ALL mode in the state machine MUST gate `rdch ch24` until
+  every bit in the mask has fired its complete. Returning the
+  mask prematurely (off-by-one in wait satisfaction) would
+  surface as a Rust-side `MissingMfcDmaComplete` error during
+  pre-replay; the engine never weakens the contract to "make
+  replay pass".
+- Multi-DMA scope explicitly excludes list / atomic / barrier
+  variants. R8.2 covers cmd=0x40 GET only, exactly 2
+  dispatches, distinct tags. Three-or-more dispatches are
+  in-scope mechanically (the data structures generalize) but
+  no fixture exercises that case yet.

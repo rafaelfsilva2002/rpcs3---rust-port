@@ -121,10 +121,35 @@ PUT_FIXTURE = FixtureSpec(
     rust_log_intro="R8.1 DMA PUT",
 )
 
+# R8.2 — multi-DMA GET fixture (9th oracle). Two queued GETs with
+# distinct tags (3 + 5), distinct EAs, distinct sizes (128 + 64),
+# distinct LSAs (0x10000 + 0x10100), WrTagMask=0x28,
+# WrTagUpdate=ALL, RdTagStat=0x28. Status = ((sum1 << 16) | sum2)
+# ^ 0xFEEDFACE = 0xE12DEA4E. Bridge ON exercises two GET callback
+# invocations in a single SPU session; expected to delegate
+# end-to-end with no fallback because R7.2 already supports
+# multiple ch21 dispatches via the same callback. The marker is
+# "DMA GET dispatched" (same as R7.2 single-GET) but appears
+# twice in the bridge log — the script's regex finds the first
+# occurrence which is sufficient evidence of delegation.
+GET_MULTI_FIXTURE = FixtureSpec(
+    name="single_spu_dma_get_multi_v1",
+    rust_test_target="single_spu_dma_get_multi_v1_replay",
+    canonical_tty_substr="[dma_get_multi_v1] OK cause=0x1 status=0xe12dea4e",
+    canonical_status_summary=(
+        "status = ((sum1 << 16) | sum2) ^ 0xFEEDFACE where "
+        "sum1 = 0x1FC0 (counting pattern, 128 B) and "
+        "sum2 = 0x1080 (constant 0x42, 64 B) = 0xE12DEA4E"
+    ),
+    delegation_log_marker="DMA GET dispatched",
+    rust_log_intro="R7.2 DMA GET (multi-dispatch)",
+)
+
 
 FIXTURES = {
     "get": GET_FIXTURE,
     "put": PUT_FIXTURE,
+    "get_multi": GET_MULTI_FIXTURE,
 }
 
 
