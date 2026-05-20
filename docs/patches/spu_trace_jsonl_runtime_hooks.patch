@@ -1,16 +1,55 @@
+diff --git a/rpcs3/Emu/Cell/RawSPUThread.cpp b/rpcs3/Emu/Cell/RawSPUThread.cpp
+index 81bb6fd89..5c05315f6 100644
+--- a/rpcs3/Emu/Cell/RawSPUThread.cpp
++++ b/rpcs3/Emu/Cell/RawSPUThread.cpp
+@@ -4,6 +4,7 @@
+ #include "util/asm.hpp"
+ 
+ #include "SPUThread.h"
++#include "SPUTraceJsonl.h"
+ 
+ inline void try_start(spu_thread& spu)
+ {
+@@ -144,7 +145,25 @@ bool spu_thread::read_reg(const u32 addr, u32& value)
+ 
+ 	case SPU_Out_MBox_offs:
+ 	{
++		// R5.8 A.3 trace hook: capture pre-pop count to distinguish a real
++		// value pop from an empty-mbox pop (which returns 0 by RPCS3 convention).
++		// get_count() is non-destructive (atomic read on count atomic), the
++		// same pattern used in set_ch_value's stall check. No extra pop —
++		// we reuse the existing `value` from the unchanged ch_out_mbox.pop()
++		// call below. Race between get_count and pop is documented and
++		// considered acceptable for first-pass capture (window is tiny and
++		// would only affect the empty-vs-Some discrimination, never the
++		// numeric value reported).
++		const bool trace_had_value_o = ch_out_mbox.get_count() > 0;
+ 		value = ch_out_mbox.pop();
++		{
++			auto& tracer = rpcs3::spu_trace::TraceWriter::instance();
++			if (tracer.enabled())
++			{
++				tracer.record_ppu_pop_outmbox(lv2_id,
++					trace_had_value_o ? std::optional<u32>(value) : std::nullopt);
++			}
++		}
+ 		return true;
+ 	}
+ 
 diff --git a/rpcs3/Emu/Cell/SPUThread.cpp b/rpcs3/Emu/Cell/SPUThread.cpp
-index 855d95a44..c8fb425a8 100644
+index 855d95a44..c50035bc8 100644
 --- a/rpcs3/Emu/Cell/SPUThread.cpp
 +++ b/rpcs3/Emu/Cell/SPUThread.cpp
-@@ -21,6 +21,7 @@
+@@ -21,6 +21,8 @@
  #include "Emu/Cell/SPUAnalyser.h"
  #include "Emu/Cell/SPUThread.h"
  #include "Emu/Cell/SPURecompiler.h"
++#include "Emu/Cell/SPURustBridge.h"
 +#include "Emu/Cell/SPUTraceJsonl.h"
  #include "Emu/Cell/timers.hpp"
  
  #include "Emu/RSX/Core/RSXReservationLock.hpp"
-@@ -1446,6 +1447,54 @@
+@@ -1446,6 +1448,54 @@ void spu_thread::cpu_task()
  #endif
  	start_time = 0;
  
@@ -65,11 +104,10 @@ index 855d95a44..c8fb425a8 100644
  	// Get next PC and SPU Interrupt status
  	pc = status_npc.load().npc;
  
-@@ -1453,6 +1502,20 @@
- 	set_interrupt_status((pc & 1) != 0);
+@@ -1454,6 +1504,20 @@ void spu_thread::cpu_task()
  
  	pc &= 0x3fffc;
-+
+ 
 +	// R5.9e.3 trace hook: emit spu_image once per SPU thread at thread entry,
 +	// AFTER pc &= 0x3fffc strips the status/interrupt bit so entry_pc is the
 +	// raw instruction address. Writer dedupes per target_spu so re-entries
@@ -83,10 +121,47 @@ index 855d95a44..c8fb425a8 100644
 +				/*load_addr=*/0u, /*entry_pc=*/pc);
 +		}
 +	}
- 
++
  	std::fesetround(FE_TOWARDZERO);
  
-@@ -5306,19 +5369,23 @@
+ 	gv_set_zeroing_denormals();
+@@ -1516,6 +1580,35 @@ void spu_thread::cpu_task()
+ 		}
+ 	}
+ 
++	// R6.1 / R6.2 — Rust SPU bridge (opt-in, default OFF).
++	// R6.1: hello-world FFI proof (linkage check, ONCE per spu_thread).
++	// R6.2: first DELEGATED execution path. When the bridge is enabled,
++	// every cpu_task() entry first attempts to delegate to the Rust
++	// executor. On success the SPU has terminated via stop_and_signal()
++	// and we return immediately. On failure we fall back honestly to the
++	// existing C++ executor (jit / interpreter) — RPCS3 state is
++	// preserved unchanged on the fallback path.
++	// The bridge is compile-time gated by RPCS3_HAS_SPU_RUST_BRIDGE
++	// (set by CMake when the staticlib is present) and runtime-gated by
++	// the env var RPCS3_SPU_RUST_BRIDGE=1.
++	if (spu_rust_bridge::is_enabled())
++	{
++		[[maybe_unused]] static thread_local bool s_announced = false;
++		if (!s_announced)
++		{
++			s_announced = true;
++			spu_rust_bridge::hello_world_proof(*this);
++		}
++
++		if (spu_rust_bridge::try_delegate_execution(*this))
++		{
++			// Bridge took over: stop_and_signal() set cpu_flag::stop;
++			// exit cpu_task() so the thread group joins normally.
++			return;
++		}
++		// else: fall through to C++ executor (no state mutated).
++	}
++
+ 	if (jit)
+ 	{
+ 		while (true)
+@@ -5289,19 +5382,23 @@ u32 spu_thread::get_ch_count(u32 ch)
  {
  	if (ch < 128) spu_log.trace("get_ch_count(ch=%s)", spu_ch_name[ch]);
  
@@ -121,25 +196,23 @@ index 855d95a44..c8fb425a8 100644
  
  	// Channels with a constant count of 1:
  	case SPU_WrEventMask:
-@@ -5340,23 +5407,52 @@
+@@ -5323,23 +5420,50 @@ u32 spu_thread::get_ch_count(u32 ch)
  	case MFC_TagID:
  	case MFC_WrTagMask:
  	case MFC_WrListStallAck:
 -		return 1;
 -	default: break;
--	}
--
--	ensure(ch < 128u);
--	spu_log.error("Unknown/illegal channel in RCHCNT (ch=%s)", spu_ch_name[ch]);
--	return 0; // Default count
 +		result = 1;
 +		break;
 +	default:
 +		ensure(ch < 128u);
 +		spu_log.error("Unknown/illegal channel in RCHCNT (ch=%s)", spu_ch_name[ch]);
 +		return 0; // Default count, no trace emit for invalid channels.
-+	}
-+
+ 	}
+ 
+-	ensure(ch < 128u);
+-	spu_log.error("Unknown/illegal channel in RCHCNT (ch=%s)", spu_ch_name[ch]);
+-	return 0; // Default count
 +	{
 +		auto& tracer = rpcs3::spu_trace::TraceWriter::instance();
 +		if (tracer.enabled())
@@ -159,8 +232,6 @@ index 855d95a44..c8fb425a8 100644
 +	// to the read_channel lambda's outer scope so they survive the lambda
 +	// invocation. PC is snapshotted at entry — the channel op is logically
 +	// at the current PC even though pop_wait may unwind state internally.
-+	// R5.9c also snapshots `lv2_id` as `trace_target_spu` so every
-+	// per-SPU recorder call inside the lambda passes the same SPU id.
 +	auto& trace_tracer = rpcs3::spu_trace::TraceWriter::instance();
 +	const u32 trace_pc = pc;
 +	const u32 trace_target_spu = lv2_id;
@@ -169,10 +240,9 @@ index 855d95a44..c8fb425a8 100644
  	auto read_channel = [&](spu_channel& channel) -> s64
  	{
 -		if (channel.get_count() == 0)
--		{
 +		const bool empty_at_entry = channel.get_count() == 0;
 +		if (empty_at_entry)
-+		{
+ 		{
 +			if (trace_tracer.enabled())
 +			{
 +				trace_tracer.record_spu_rdch(trace_target_spu, trace_pc, ch, std::nullopt, /*would_stall=*/true);
@@ -183,12 +253,10 @@ index 855d95a44..c8fb425a8 100644
  			state += cpu_flag::wait + cpu_flag::temp;
  		}
  
-@@ -5373,6 +5469,21 @@
- 		if (state & cpu_flag::wait)
- 		{
+@@ -5358,6 +5482,21 @@ s64 spu_thread::get_ch_value(u32 ch)
  			wakeup_delay();
-+		}
-+
+ 		}
+ 
 +		// After pop_wait returns, if we had stalled we are now resumed.
 +		// Emit wake + rdch (would_stall=false) only when read truly completed.
 +		// pop_wait may return error sentinel via high bits of the s64; for
@@ -202,18 +270,19 @@ index 855d95a44..c8fb425a8 100644
 +			}
 +			trace_tracer.record_spu_rdch(trace_target_spu, trace_pc, ch,
 +				static_cast<u32>(out), /*would_stall=*/false);
- 		}
- 
++		}
++
  		static_cast<void>(test_stopped());
-@@ -5435,6 +5546,20 @@
+ 		return out;
+ 	};
+@@ -5418,6 +5557,19 @@ s64 spu_thread::get_ch_value(u32 ch)
  		if (u32 out; ch_tag_stat.try_read(out))
  		{
  			ch_tag_stat.set_value(0, false);
 +
-+			// R6.7 A.1 trace hook (fast path — no stall). The slow
-+			// path falls through to `read_channel(ch_tag_stat)` whose
-+			// existing R5.8 A.3 hook emits would_stall=true / park /
-+			// wake / would_stall=false in order — covered already.
++			// R6.7 A.1 trace hook (fast path — no stall). Slow path
++			// goes through read_channel(ch_tag_stat) below whose R5.8
++			// hook already covers the stalling case.
 +			{
 +				auto& tracer = rpcs3::spu_trace::TraceWriter::instance();
 +				if (tracer.enabled())
@@ -226,7 +295,7 @@ index 855d95a44..c8fb425a8 100644
  			return out;
  		}
  
-@@ -6184,6 +6309,25 @@
+@@ -6167,6 +6319,25 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
  
  	case SPU_WrOutMbox:
  	{
@@ -252,12 +321,10 @@ index 855d95a44..c8fb425a8 100644
  		if (state & cpu_flag::pending)
  		{
  			do_mfc();
-@@ -6197,6 +6341,26 @@
- 		if (!ch_out_mbox.push_wait(*this, value))
- 		{
+@@ -6182,6 +6353,26 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
  			return false;
-+		}
-+
+ 		}
+ 
 +		// Push committed. Emit wake + wrch(would_stall=false) if we logged a stall.
 +		if (trace_tracer_w.enabled())
 +		{
@@ -276,17 +343,16 @@ index 855d95a44..c8fb425a8 100644
 +			{
 +				trace_tracer_w.record_spu_wrch(trace_target_spu_w, trace_pc_w, ch, value, /*would_stall=*/false);
 +			}
- 		}
- 
++		}
++
  		check_state();
-@@ -6222,6 +6386,18 @@
- 				ch_tag_upd = MFC_TAG_UPDATE_IMMEDIATE;
+ 		return true;
+ 	}
+@@ -6206,6 +6397,15 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
  			}
  		}
-+
-+		// R6.7 A.1 trace hook: emit spu_wrch for MFC_WrTagMask (ch22).
-+		// Side-effects (auto-resolving an outstanding ch_tag_upd) are
-+		// captured by the subsequent rdch ch24 event, not here.
+ 
++		// R6.7 A.1 trace hook
 +		{
 +			auto& tracer = rpcs3::spu_trace::TraceWriter::instance();
 +			if (tracer.enabled())
@@ -298,15 +364,11 @@ index 855d95a44..c8fb425a8 100644
  		return true;
  	}
  
-@@ -6253,43 +6429,175 @@
- 		{
+@@ -6238,43 +6438,165 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
  			ch_tag_upd = value;
  		}
-+
-+		// R6.7 A.1 trace hook: emit spu_wrch for MFC_WrTagUpdate (ch23).
-+		// `value` is one of MFC_TAG_UPDATE_IMMEDIATE / _ANY / _ALL; the
-+		// replay state machine consumes this as the wait-mode for the
-+		// subsequent rdch ch24.
+ 
++		// R6.7 A.1 trace hook
 +		{
 +			auto& tracer = rpcs3::spu_trace::TraceWriter::instance();
 +			if (tracer.enabled())
@@ -322,9 +384,7 @@ index 855d95a44..c8fb425a8 100644
  	{
  		ch_mfc_cmd.lsa = value;
 +
-+		// R6.7 A.1 trace hook: emit spu_wrch for MFC_LSA (ch16). MFC
-+		// param channels never stall — they're store-only into
-+		// `ch_mfc_cmd.<field>`. would_stall=false always.
++		// R6.7 A.1 trace hook
 +		{
 +			auto& tracer = rpcs3::spu_trace::TraceWriter::instance();
 +			if (tracer.enabled())
@@ -405,14 +465,12 @@ index 855d95a44..c8fb425a8 100644
  		ch_mfc_cmd.cmd = MFC(value & 0xff);
 -		return process_mfc_cmd();
 +
-+		// R6.7 A.1 trace hook: emit spu_wrch ch21 first; for plain GET
-+		// (cmd code 0x40, simple non-list, in-bounds size) also snapshot
-+		// EA bytes via vm::_ptr BEFORE process_mfc_cmd() mutates LS,
-+		// emit spu_mfc_cmd carrying the SHA, then dispatch and emit
-+		// mfc_dma_complete. Other cmd codes (PUT, list, atomic,
-+		// barrier/fence-flagged variants) emit only the bare spu_wrch
-+		// — the parser rejects them at parse time with UnsupportedMfcCmd
-+		// per R6.7 design § 4.3.
++		// R6.7 A.1 trace hook (extended R8.1 for PUT): emit
++		// spu_wrch ch21; for plain GET (cmd 0x40) snapshot EA bytes
++		// via vm::_ptr; for plain PUT (cmd 0x20) snapshot LS bytes
++		// from ls+mfc_lsa. Both BEFORE process_mfc_cmd() mutates
++		// LS (GET) or EA (PUT). Emit spu_mfc_cmd carrying the
++		// snapshot, dispatch, emit mfc_dma_complete.
 +		auto& trace_tracer_mfc = rpcs3::spu_trace::TraceWriter::instance();
 +		const u32 trace_pc_mfc = pc;
 +		const u32 trace_target_spu_mfc = lv2_id;
@@ -422,9 +480,14 @@ index 855d95a44..c8fb425a8 100644
 +		const u32 mfc_lsa = ch_mfc_cmd.lsa;
 +		const u32 mfc_eah = ch_mfc_cmd.eah;
 +		const u32 mfc_eal = ch_mfc_cmd.eal;
-+		const bool capture_dma = (cmd_code == MFC_GET_CMD)
-+			&& mfc_size_at_dispatch > 0u
-+			&& mfc_size_at_dispatch <= 0x4000u;
++		const bool size_in_simple_range =
++			mfc_size_at_dispatch > 0u && mfc_size_at_dispatch <= 0x4000u;
++		const bool capture_get = (cmd_code == MFC_GET_CMD) && size_in_simple_range;
++		// R8.1 — PUT also needs the LS bounds check
++		// (lsa + size <= SPU_LS_SIZE == 0x40000) BEFORE we read.
++		const bool capture_put = (cmd_code == MFC_PUT_CMD) && size_in_simple_range
++			&& (static_cast<u64>(mfc_lsa) + mfc_size_at_dispatch <= 0x40000ull);
++		const bool capture_dma = capture_get || capture_put;
 +
 +		if (trace_tracer_mfc.enabled())
 +		{
@@ -432,33 +495,26 @@ index 855d95a44..c8fb425a8 100644
 +
 +			if (capture_dma)
 +			{
-+				// Snapshot EA bytes BEFORE process_mfc_cmd() runs.
-+				// vm::_ptr<u8>(eal) walks PPU vm; on PS3 user-space PSL1GHT
-+				// homebrew eah is always 0. The snapshot copies into a
-+				// local vector so the writer's SHA + side-file write
-+				// both observe a stable view even if a concurrent
-+				// PPU-side mutator touches EA later — single-SPU
-+				// scope per R6.7 design § 9.1.
 +				try
 +				{
-+					const u8* src = vm::_ptr<u8>(mfc_eal);
++					const u8* src = capture_get
++						? vm::_ptr<u8>(mfc_eal)
++						: (this->ls + mfc_lsa);
 +					if (src)
 +					{
-+						std::vector<u8> ea_bytes(src, src + mfc_size_at_dispatch);
++						std::vector<u8> snapshot_bytes(src, src + mfc_size_at_dispatch);
 +						trace_tracer_mfc.record_spu_mfc_cmd(
 +							trace_target_spu_mfc, trace_pc_mfc,
 +							static_cast<u32>(cmd_code), mfc_tag, mfc_size_at_dispatch,
 +							mfc_lsa, mfc_eah, mfc_eal,
-+							ea_bytes.data(), mfc_size_at_dispatch);
++							snapshot_bytes.data(), mfc_size_at_dispatch);
 +					}
 +				}
 +				catch (...)
 +				{
-+					// Defensive: vm::_ptr / EA access may fault on a
-+					// bad pointer. Best-effort capture; on failure
-+					// the trace will simply lack the spu_mfc_cmd
-+					// event for this dispatch and the parser will
-+					// surface MalformedMfcSequence at parse time.
++					// Best-effort snapshot. PUT's LS read is always
++					// host-safe (LS is heap-mapped), so this catch
++					// only triggers for GET's vm::_ptr boundary.
 +				}
 +			}
 +		}
@@ -475,11 +531,10 @@ index 855d95a44..c8fb425a8 100644
  	}
  
  	case MFC_WrListStallAck:
-@@ -6446,6 +6754,15 @@
- bool spu_thread::stop_and_signal(u32 code)
+@@ -6432,6 +6754,15 @@ bool spu_thread::stop_and_signal(u32 code)
  {
  	spu_log.trace("stop_and_signal(code=0x%x)", code);
-+
+ 
 +	// R5.8 A.3 trace hook: emit spu_stop. Best-effort, gated by env var.
 +	{
 +		auto& tracer = rpcs3::spu_trace::TraceWriter::instance();
@@ -488,47 +543,10 @@ index 855d95a44..c8fb425a8 100644
 +			tracer.record_spu_stop(lv2_id, pc, code);
 +		}
 +	}
- 
++
  	auto set_status_npc = [&]()
  	{
-diff --git a/rpcs3/Emu/Cell/RawSPUThread.cpp b/rpcs3/Emu/Cell/RawSPUThread.cpp
-index 81bb6fd89..5c05315f6 100644
---- a/rpcs3/Emu/Cell/RawSPUThread.cpp
-+++ b/rpcs3/Emu/Cell/RawSPUThread.cpp
-@@ -4,6 +4,7 @@
- #include "util/asm.hpp"
- 
- #include "SPUThread.h"
-+#include "SPUTraceJsonl.h"
- 
- inline void try_start(spu_thread& spu)
- {
-@@ -144,7 +145,25 @@ bool spu_thread::read_reg(const u32 addr, u32& value)
- 
- 	case SPU_Out_MBox_offs:
- 	{
-+		// R5.8 A.3 trace hook: capture pre-pop count to distinguish a real
-+		// value pop from an empty-mbox pop (which returns 0 by RPCS3 convention).
-+		// get_count() is non-destructive (atomic read on count atomic), the
-+		// same pattern used in set_ch_value's stall check. No extra pop —
-+		// we reuse the existing `value` from the unchanged ch_out_mbox.pop()
-+		// call below. Race between get_count and pop is documented and
-+		// considered acceptable for first-pass capture (window is tiny and
-+		// would only affect the empty-vs-Some discrimination, never the
-+		// numeric value reported).
-+		const bool trace_had_value_o = ch_out_mbox.get_count() > 0;
- 		value = ch_out_mbox.pop();
-+		{
-+			auto& tracer = rpcs3::spu_trace::TraceWriter::instance();
-+			if (tracer.enabled())
-+			{
-+				tracer.record_ppu_pop_outmbox(lv2_id,
-+					trace_had_value_o ? std::optional<u32>(value) : std::nullopt);
-+			}
-+		}
- 		return true;
- 	}
- 
+ 		status_npc.atomic_op([&](status_npc_sync_var& state)
 diff --git a/rpcs3/Emu/Cell/lv2/sys_spu.cpp b/rpcs3/Emu/Cell/lv2/sys_spu.cpp
 index 263d87120..68cda38eb 100644
 --- a/rpcs3/Emu/Cell/lv2/sys_spu.cpp

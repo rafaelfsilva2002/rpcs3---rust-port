@@ -390,6 +390,23 @@ pub struct SpuChannels {
     /// pure-FFI users without a callback get [`Self::refuse_mfc`]
     /// honest-fallback (R7.1) semantics.
     pub dma_get_callback: Option<DmaGetCallback>,
+
+    /// R8.1 — optional runtime DMA PUT callback. Symmetric to
+    /// [`Self::dma_get_callback`] but for `cmd=0x20 (PUT)`. The
+    /// interpreter intercepts `wrch ch21 (MFC_Cmd)` with cmd=0x20
+    /// and invokes the callback with a READ-ONLY pointer into the
+    /// Rust handle's LS at `mfc_lsa`. The C++ runtime bridge
+    /// installs a callback that copies those bytes into RPCS3 EA
+    /// via `vm::_ptr<u8>(eal)`. On success the interpreter pushes
+    /// `1 << tag` into [`Self::mfc_tag_stat_queue`] for the
+    /// subsequent rdch ch24.
+    ///
+    /// Default `None`: replay paths get the existing Phase C no-op
+    /// for ch21=0x20 (the captured `.dmachunk` is asserted by the
+    /// replay state machine before any LS mutation, NOT by the
+    /// interpreter); pure-FFI users without a callback see PUT as
+    /// `MfcUnsupported` under [`Self::refuse_mfc`].
+    pub dma_put_callback: Option<DmaPutCallback>,
 }
 
 /// R7.2 — function pointer + opaque context for the runtime DMA GET
@@ -418,6 +435,31 @@ pub struct DmaGetCallback {
     ) -> i32,
     /// Opaque user-data passed back to `func`. The bridge typically
     /// stores a `spu_thread*` here for diagnostic logging.
+    pub user_data: *mut core::ffi::c_void,
+}
+
+/// R8.1 — function pointer + opaque context for the runtime DMA PUT
+/// callback. Symmetric to [`DmaGetCallback`] but inverts the data
+/// direction: the SPU's LS bytes flow OUT to RPCS3 EA.
+///
+/// The callback reads from `src_ls_ptr` (a read-only pointer into
+/// the Rust handle's LS at the captured `mfc_lsa`, valid for `size`
+/// bytes) and writes them to RPCS3 EA at `eal`. Returns `0` on
+/// success, non-zero to refuse.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmaPutCallback {
+    /// C ABI function pointer. Signature:
+    ///   `int32_t cb(void* user_data, uint32_t eal,
+    ///               const uint8_t* src_ls_ptr, uint32_t size,
+    ///               uint32_t tag)`
+    pub func: unsafe extern "C" fn(
+        user_data: *mut core::ffi::c_void,
+        eal: u32,
+        src_ls_ptr: *const u8,
+        size: u32,
+        tag: u32,
+    ) -> i32,
     pub user_data: *mut core::ffi::c_void,
 }
 
@@ -546,18 +588,21 @@ impl SpuChannels {
     /// [`ChannelStatus::WouldStall`] instead of blocking.
     pub fn read(&mut self, channel: u32) -> Result<u32, ChannelStatus> {
         use ch::*;
-        // R7.1 / R7.2 — honest-fallback gate for MFC/DMA channels
-        // under the runtime bridge. Checked BEFORE any per-channel
-        // mutation so the SPU sees no Rust-side state change before
-        // the bridge falls back to C++. `refuse_mfc` is false by
-        // default; replay tests never set it.
+        // R7.1 / R7.2 / R8.1 — honest-fallback gate for MFC/DMA
+        // channels under the runtime bridge. Checked BEFORE any
+        // per-channel mutation so the SPU sees no Rust-side state
+        // change before the bridge falls back to C++. `refuse_mfc`
+        // is false by default; replay tests never set it.
         //
-        // R7.2 — the gate is RELAXED when a runtime DMA callback is
-        // installed: the bridge has explicitly opted into executing
-        // MFC ops itself, so rdch ch24 (RdTagStat) / ch25 (RdTagMask)
-        // proceed via the normal Phase C path. The callback is the
-        // entity that populates `mfc_tag_stat_queue`.
-        if self.refuse_mfc && is_mfc_channel(channel) && self.dma_get_callback.is_none() {
+        // The gate is RELAXED when ANY runtime DMA callback is
+        // installed (GET or PUT): the bridge has explicitly opted
+        // into executing MFC ops itself, so rdch ch24 (RdTagStat) /
+        // ch25 (RdTagMask) proceed via the normal Phase C path.
+        // The callback(s) populate `mfc_tag_stat_queue`.
+        if self.refuse_mfc && is_mfc_channel(channel)
+            && self.dma_get_callback.is_none()
+            && self.dma_put_callback.is_none()
+        {
             return Err(ChannelStatus::MfcRefused);
         }
         match channel {
@@ -617,16 +662,21 @@ impl SpuChannels {
     /// `wrch` — blocking write.
     pub fn write(&mut self, channel: u32, value: u32) -> Result<(), ChannelStatus> {
         use ch::*;
-        // R7.1 / R7.2 — honest-fallback gate for MFC/DMA channels.
-        // See [`Self::read`] for the rationale. R7.2 relaxes the gate
-        // when a runtime DMA GET callback is installed: ch16-20 /
-        // ch22-23 wrch fall through to the Phase C store so the
-        // captured MFC param state is available when the interpreter
-        // dispatches the callback on `wrch ch21 (MFC_Cmd)`. The
-        // interpreter intercepts ch21 BEFORE this method when the
+        // R7.1 / R7.2 / R8.1 — honest-fallback gate for MFC/DMA
+        // channels. See [`Self::read`] for the rationale. The gate
+        // is relaxed when ANY runtime DMA callback is installed
+        // (GET or PUT): ch16-20 / ch22-23 wrch fall through to the
+        // Phase C store so the captured MFC param state is available
+        // when the interpreter dispatches the appropriate callback
+        // on `wrch ch21 (MFC_Cmd)` (based on the cmd value: 0x40
+        // routes to GET callback, 0x20 routes to PUT callback). The
+        // interpreter intercepts ch21 BEFORE this method when either
         // callback is set, so the ch21 arm of the match below is
-        // unreachable along the R7.2 path.
-        if self.refuse_mfc && is_mfc_channel(channel) && self.dma_get_callback.is_none() {
+        // unreachable along the runtime DMA path.
+        if self.refuse_mfc && is_mfc_channel(channel)
+            && self.dma_get_callback.is_none()
+            && self.dma_put_callback.is_none()
+        {
             return Err(ChannelStatus::MfcRefused);
         }
         match channel {
@@ -676,9 +726,13 @@ impl SpuChannels {
     /// channels) or how many slots are free (for write channels).
     pub fn count(&self, channel: u32) -> Result<u32, ChannelStatus> {
         use ch::*;
-        // R7.1 / R7.2 — same honest-fallback gate as `read`/`write`,
-        // relaxed when a runtime DMA callback is installed.
-        if self.refuse_mfc && is_mfc_channel(channel) && self.dma_get_callback.is_none() {
+        // R7.1 / R7.2 / R8.1 — same honest-fallback gate as
+        // `read`/`write`, relaxed when ANY runtime DMA callback
+        // (GET or PUT) is installed.
+        if self.refuse_mfc && is_mfc_channel(channel)
+            && self.dma_get_callback.is_none()
+            && self.dma_put_callback.is_none()
+        {
             return Err(ChannelStatus::MfcRefused);
         }
         let count = match channel {

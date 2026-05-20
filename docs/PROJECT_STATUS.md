@@ -1,8 +1,20 @@
-# Project Status — R7 CLOSED (Triple-symmetric DMA bridge)
+# Project Status — R8.1 LANDED (8th oracle: DMA PUT triple-symmetric)
 
 **Authoritative current source of truth for the RPCS3 → Rust port.**
 
-Last updated: **2026-05-18 (R7 closure)**. R7 phases R7.1 (Bridge
+Last updated: **2026-05-19 (R8.1 landing)**. R8.1 (MFC PUT runtime
++ replay oracle) extends R7's triple-symmetric DMA bridge with the
+inverse direction (LS → EA). The runtime bridge now executes BOTH
+DMA-bound oracles end-to-end through the Rust executor under
+`RPCS3_SPU_RUST_BRIDGE=1` with byte-identical canonical outputs:
+GET = `0xdeada12f`, PUT spu sentinel = `0xc0ffeeca` + ea_status =
+`0xcafea57e`. The replay oracle for `single_spu_dma_put_v1` is the
+8th oracle and gates byte-identical Interpreter ↔ Recompiler
+agreement plus a post-replay verification that final LS at the PUT
+region matches the captured `.dmachunk`. See "R8.1 phase closure
+(2026-05-19)" below.
+
+Previously: **2026-05-18 (R7 closure)**. R7 phases R7.1 (Bridge
 Phase B honest fallback) + R7.2 (Bridge Phase D runtime DMA GET) +
 R7.3 (triple-symmetry regression gate) all ACEITO. The runtime
 bridge now executes the first DMA-bound oracle
@@ -22,22 +34,33 @@ Do NOT treat the archive as current.
 
 ## 1. Executive current status
 
+- **R8.1 is LANDED** (2026-05-19). MFC PUT runtime extension +
+  8th replay-validated oracle. The runtime bridge now delegates
+  BOTH `single_spu_dma_get_v1.self` (cmd 0x40, R7.2) AND
+  `single_spu_dma_put_v1.self` (cmd 0x20, R8.1) end-to-end through
+  the Rust executor with byte-identical canonical outputs
+  (`0xdeada12f` / `0xcafea57e`) versus bridge OFF and the replay
+  oracles. See § 8.1 R8.1 closure summary.
 - **R7 is formally CLOSED.** R7.1 (Bridge Phase B honest fallback)
   + R7.2 (Bridge Phase D runtime DMA GET via FFI callback into
   `vm::_ptr<u8>`) + R7.3 (triple-symmetry regression gate) all
-  ACEITO 2026-05-18. The runtime bridge now executes the
-  first DMA-bound oracle `single_spu_dma_get_v1.self` end-to-end
-  through the Rust executor under `RPCS3_SPU_RUST_BRIDGE=1`, with
-  byte-identical canonical status (`0xdeada12f`) vs bridge OFF and
-  vs the replay oracle. See § 8 R7 closure summary.
+  ACEITO 2026-05-18.
 - **R6 is formally CLOSED** (2026-05-03). R6.2 first delegation →
   R6.3a/b/c per-oracle delegation → R6.4a outcome contract → R6.4b
   persistent handle → R6.5 / R6.5b bridge acceptance → R6.6 game_like
   cross-path → R6.7 design + A.1-A.5 + Phase C — all landed and
   gated green.
-- **Seven replay-validated SPU oracles exist**, all
+- **Eight replay-validated SPU oracles exist**, all
   `diff_snapshots(interp, jit).is_identical()` byte-identical
   across `InterpreterExecutor` and `RecompilerExecutor`.
+- **`single_spu_dma_put_v1` is the 8th oracle** (R8.1 landed
+  2026-05-19; runtime-delegated under bridge ON same day).
+  Symmetric inverse of GET: SPU fills LS with `i & 0xFF` counting
+  pattern, dispatches MFC PUT cmd 0x20, waits via ch22/23/24,
+  writes sentinel `0xC0FFEECA` to OUT_MBOX, halts via stop 0x101.
+  PPU reads EA back, computes `ea_status = sum_of_ea ^ 0xCAFEBABE
+  = 0xCAFEA57E` — both invariants land identically across bridge
+  OFF / bridge ON / replay paths.
 - **`single_spu_dma_get_v1` is the first DMA-bound oracle**
   (R6.7 A.5, replay-validated 2026-05-03; runtime-delegated under
   bridge ON 2026-05-18 via R7.2). It exercises the full MFC GET
@@ -45,23 +68,24 @@ Do NOT treat the archive as current.
   ch22-23 wrch + rdch ch24) and lands the canonical post-DMA
   status `0xDEADA12F` in OUT_MBOX across all three execution paths
   (bridge OFF / bridge ON / replay).
-- **DMA / MFC GET-only replay pipeline is complete.** Writer
-  extension (A.1) + parser (A.2) + chunk loader (A.3) + replay
-  state machine (A.4) + executor wiring (Phase C) + first oracle
-  (A.5) — all landed in R6. R7.2 adds the runtime-bridge DMA GET
-  execution path (FFI callback that reads EA bytes via RPCS3
-  `vm::_ptr<u8>` and writes them into the Rust handle's LS).
-- **The C++ ↔ Rust runtime bridge covers all 7 oracles.**
+- **DMA / MFC GET+PUT replay pipeline is complete.** Writer
+  extension (A.1 GET + R8.1 PUT) + parser (A.2 + R8.1 cmd 0x20
+  accept) + chunk loader (A.3) + replay state machine (A.4 +
+  R8.1 `process_mfc_cmd_pre_replay`) + executor wiring (Phase C
+  + R8.1 PUT callback routing) + GET oracle (A.5) + PUT oracle
+  (R8.1) — all landed.
+- **The C++ ↔ Rust runtime bridge covers all 8 oracles.**
   Bridge ON byte-identical to bridge OFF on the 6 non-DMA oracles
-  (per R6.5 / R6.5b / R6.6 acceptance) and on the DMA oracle (per
-  R7.2 acceptance — `DELEGATED EXECUTION OK total_steps=1054`,
-  `R7.2 DMA GET dispatched: cmd=0x40 ... real EA/LS path
-  (vm::_ptr<u8>)`).
-- **Runtime DMA bridge scope: GET-only.** PUT, list cmds, atomic
-  primitives, MFC barriers / fence bits, and multi-SPU DMA races
-  on shared EA remain **out of R7 scope** — they defer to R8+.
-  Non-GET MFC ops still surface `MfcUnsupported` and the bridge
-  falls back honestly to C++ for those.
+  (per R6.5 / R6.5b / R6.6 acceptance) and on both DMA oracles
+  (per R7.2 + R8.1 acceptance — GET: `DELEGATED EXECUTION OK
+  total_steps=1054`; PUT: `DELEGATED EXECUTION OK
+  total_steps=1049`). Bridge logs distinguish the two with
+  `R7.2 DMA GET dispatched` vs `R8.1 DMA PUT dispatched`.
+- **Runtime DMA bridge scope: GET + simple PUT.** List cmds,
+  atomic primitives, MFC barriers / fence bits, and multi-SPU
+  DMA races on shared EA remain **out of R8.1 scope** — they
+  defer to R8.2+. Non-(GET|PUT) MFC ops still surface
+  `MfcUnsupported` and the bridge falls back honestly to C++.
 - **`tests/data/spurs_test_v3_real.jsonl` and
   `tests/data/spurs_test_v4_real.jsonl` remain diagnostic-only.**
   v4 informed the ISA-coverage push (R5.10a..p) but is now retired;
@@ -92,7 +116,7 @@ backed up at `C:\docker-backup\rpcs3-ps3dev-toolchain-local.tar`.
 
 ## 3. Current oracle matrix
 
-All seven oracles below pass cross-backend byte-identical
+All eight oracles below pass cross-backend byte-identical
 (`diff_snapshots(interp, jit).is_identical()`). Each `.jsonl` has a
 companion `.notes.md` documenting provenance, toolchain, capture
 procedure, engine fixes co-landed, and acceptance criteria.
@@ -105,7 +129,8 @@ procedure, engine fixes co-landed, and acceptance criteria.
 | 4 | [`single_spu_loadstore_v1`](../behavior-freeze/fixtures/spu/traces/single_spu_loadstore_v1.jsonl) | R5.11b | 5 | + LS load/store (stqd/lqd + cwd/shufb/rotqby) | `0x129` | no | bridge ON validated |
 | 5 | [`single_spu_mailbox_multi_v1`](../behavior-freeze/fixtures/spu/traces/single_spu_mailbox_multi_v1.jsonl) | R6.4b-replay | 5 | IN_MBOX round 1 + SNR1 round 2 + real park/wake (PPU `sysUsleep(100ms)`) | `0x453` | no | bridge ON validated (R6.4b persistent handle + `pop_wait`) |
 | 6 | [`game_like_mailbox_signal_v1`](../behavior-freeze/fixtures/spu/traces/game_like_mailbox_signal_v1.jsonl) | R6.6 | 5 | IN_MBOX + LS load/store + branch/loop + SNR1 + real park/wake (cross-path sentinel) | `0x051A03C9` | no | bridge ON validated (`total_steps=488 stall_iters=1`) |
-| 7 | **[`single_spu_dma_get_v1`](../behavior-freeze/fixtures/spu/traces/single_spu_dma_get_v1.jsonl)** | **R6.7 A.5** | **15** | **MFC GET (ch16-21 wrch + `spu_mfc_cmd` + `mfc_dma_complete` + ch22-23 + rdch ch24) + post-DMA sum + XOR** | **`0xDEADA12F`** | **yes (GET 0x40)** | **replay-valid only; runtime bridge DMA = R7** |
+| 7 | [`single_spu_dma_get_v1`](../behavior-freeze/fixtures/spu/traces/single_spu_dma_get_v1.jsonl) | R6.7 A.5 | 15 | MFC GET (ch16-21 wrch + `spu_mfc_cmd` + `mfc_dma_complete` + ch22-23 + rdch ch24) + post-DMA sum + XOR | `0xDEADA12F` | yes (GET 0x40) | bridge ON delegated via R7.2 (`total_steps=1054 stall_iters=0`); triple-symmetric |
+| 8 | **[`single_spu_dma_put_v1`](../behavior-freeze/fixtures/spu/traces/single_spu_dma_put_v1.jsonl)** | **R8.1** | **15** | **MFC PUT (symmetric inverse of GET — LS → EA) + 128-byte LS source pattern → ch16-21 + spu_mfc_cmd cmd=0x20 + mfc_dma_complete + ch22-23 + rdch ch24 + ch28 OUT_MBOX sentinel; PPU reads EA back → `ea_status = 0xCAFEA57E`** | **spu=`0xC0FFEECA`, ea_status=`0xCAFEA57E`** | **yes (PUT 0x20)** | **bridge ON delegated via R8.1 (`total_steps=1049 stall_iters=0`); triple-symmetric** |
 
 Notes on the seventh row:
 
@@ -467,11 +492,139 @@ All three pass.
 `81ac5f096b5b9e79d1d466f35f8d986129636c2801093a3a86d30cd65f2a4404`
 (64 MB; built 2026-05-18 03:22 with R7.1 + R7.2 surface).
 
-**Out of R7 scope (deferred to R8+):** MFC PUT, DMA list cmds
+**Out of R7 scope (deferred to R8+):** MFC PUT (now LANDED in
+R8.1, see § 8.1 below), DMA list cmds (GETL/PUTL/GETLB/PUTLB),
+atomic primitives (GETLLAR/PUTLLC/PUTLLUC/PUTQLLUC), MFC barriers
+/ fence bits, multi-SPU DMA races on shared EA, SPURS production
+support. The R6 hard rules above carry forward verbatim to R7 and
+to R8+.
+
+---
+
+## 8.1 R8.1 closure summary (2026-05-19)
+
+R8.1 landed in a single session: Rust core (parser + state machine
++ channels + interpreter routing + FFI) → Docker .self build →
+RPCS3 OFF capture → bridge ON acceptance → 8th replay oracle →
+triple-symmetry gate extended → patches regenerated → docs
+updated.
+
+**Scope.** First MFC PUT-bound oracle + symmetric runtime extension
+on top of R7.2's runtime DMA GET. Mirrors the R6.7 A.5 / R7.2 GET
+delivery but inverts DMA direction (LS → EA). The captured
+`.dmachunk` now carries the SPU's LS-source bytes at dispatch
+time; the runtime bridge writes them to RPCS3 EA via
+`vm::_ptr<u8>`; the replay oracle verifies SPU LS at the PUT
+region matches the chunk post-execution.
+
+**Rust core extensions.**
+- `trace_fmt.rs` parser accepts `spu_mfc_cmd.cmd ∈ {0x40 GET,
+  0x20 PUT}`; the defensive subset-rejection canary moves to
+  `0x44 GETL` (list variants still out of scope).
+- `mfc_replay.rs` adds `MfcReplayError::PutLsBytesMismatch`
+  (load-bearing PUT correctness gate) and a new public method
+  `process_mfc_cmd_pre_replay`. The PRE-replay variant defers
+  the PUT LS-bytes assertion (cannot inspect dispatch-time LS
+  before the SPU runs); the AssertNow `process_mfc_cmd` remains
+  the canonical at-dispatch state machine for future in-line
+  executor wiring.
+- `rpcs3-spu-thread::SpuChannels` adds `dma_put_callback:
+  Option<DmaPutCallback>` symmetric to the GET callback. The
+  `refuse_mfc` gate is RELAXED whenever EITHER callback is
+  installed.
+- `rpcs3-spu-interpreter` wrch ch21 intercept routes by cmd:
+  0x40 → GET callback, 0x20 → PUT callback, other →
+  `MfcUnsupported`. PUT source pointer is read via the SPU
+  thread's LS at the dispatch lsa.
+- `rpcs3-spu-ffi` adds `rust_spu_set_dma_put_callback` +
+  `DmaPutCallbackFn` typedef. The C header is updated. FFI
+  tests serialized via a new `CALLBACK_TEST_MUTEX` (static
+  AtomicU32 observers cross-pollute under cargo's parallel test
+  runner without it).
+
+**C++ side extensions.**
+- `SPUThread.cpp` writer hook (R6.7 A.1 extended): the same
+  `record_spu_mfc_cmd` + `record_mfc_dma_complete` events now
+  fire for cmd=0x20 PUT. For PUT the snapshot bytes come from
+  `this->ls + mfc_lsa` (vs `vm::_ptr<u8>(mfc_eal)` for GET).
+- `SPURustBridge.cpp` bridge: new static
+  `bridge_dma_put_callback` reads `src_ls_ptr` size bytes (the
+  SPU's LS source) and writes to `vm::_ptr<u8>(eal)`. Installed
+  alongside the GET callback on every `rust_spu_new` in
+  `try_delegate_execution()`. Success log: `R8.1 DMA PUT
+  dispatched: cmd=0x20 eal=0x... size=N tag=T on '...'; real
+  LS/EA path (vm::_ptr<u8>); tag-stat 1<<T queued for subsequent
+  rdch ch24`.
+
+**Fixture + capture.** `single_spu_dma_put_v1` source (PSL1GHT
+homebrew, CC0): PPU allocates a 128-byte BSS buffer zero-filled,
+passes EA via `thread_args.arg0`; SPU fills LS at `0x10000` with
+counting pattern `i & 0xFF` (sum = 8128 = 0x1FC0), dispatches MFC
+PUT tag 3 size 128, waits via ch22/23/24, writes sentinel
+`0xC0FFEECA` to OUT_MBOX, halts via stop 0x101. PPU joins, reads
+EA back, sums, XORs with `0xCAFEBABE` to produce `ea_status =
+0xCAFEA57E`. Built in Docker via `rpcs3-ps3dev-toolchain:local`
+(image sha `ed2167a9ac59…`); `.self` 939,475 bytes sha
+`761414892bd3757a1a1d8238d6623f7270e5fee49321620b5c47b466e321f3c5`.
+Capture run with `Core: SPU/PPU Decoder: Interpreter (static)`
+(LLVM JIT bypasses `set_ch_value()` MFC hooks per R6.7 A.5
+gotcha); trace is 15 events including the new `spu_mfc_cmd
+cmd=0x20` event with `ea_chunk_sha256=471fb943…` — the SAME
+content-addressed pool entry as the GET fixture (deduplicated
+naturally because both fixtures use the same source pattern).
+
+**Replay oracle.** New
+`rust/rpcs3-spu-recompiler/tests/single_spu_dma_put_v1_replay.rs`:
+- Parses JSONL via `parse_jsonl_trace`.
+- Asserts cmd=0x20, tag=3, size=128, eah=0, lsa=0x10000,
+  dma_complete_count=1, ch28 carries `0xC0FFEECA`, stop 0x101.
+- Builds `SpuProgram` from `.spuimg`, seeds r3 with the PSL1GHT
+  arg0 EA (SPU calling convention places u64 arg0 high in lane
+  0, low in lane 1 — without this the final-state ExpectGprWord
+  for r3 fails since PUT keeps EA in r3 through exit; GET
+  overwrites r3 with tag_stat so doesn't need the seed).
+- Calls `apply_mfc_dma_pre_replay` (PRE-replay PUT route via
+  `process_mfc_cmd_pre_replay` — chunk SHA validated, LS-bytes
+  assertion deferred).
+- Runs replay × Interpreter + replay × Recompiler;
+  `diff_snapshots.is_identical()`.
+- **Post-replay deferred PUT verification:** loads the captured
+  chunk via `resolve_dma_chunk_side_file` and asserts that BOTH
+  backends' final LS at `[lsa..lsa+size]` matches the chunk
+  byte-for-byte. This restores the dispatch-time contract for
+  the canonical fixture (the SPU does not touch LS after PUT
+  dispatch).
+
+**Triple-symmetry extension.**
+`behavior-freeze/harness/check_triple_symmetry.py` was refactored
+to parametrize by fixture via `--fixture {get,put}` (default
+`get`, R7.3 backwards-compatible). Both fixtures pass green:
+
+| Path | GET | PUT |
+|---|---|---|
+| bridge OFF TTY | `[dma_get_v1] OK cause=0x1 status=0xdeada12f` ✓ | `[dma_put_v1] OK cause=0x1 spu=0xc0ffeeca ea_status=0xcafea57e` ✓ |
+| bridge ON delegation | `R7.2 DMA GET dispatched ... total_steps=1054 stall_iters=0` ✓ | `R8.1 DMA PUT dispatched ... total_steps=1049 stall_iters=0` ✓ |
+| replay oracle | `single_spu_dma_get_v1_replay` ok ✓ | `single_spu_dma_put_v1_replay` ok ✓ |
+
+**Patch SHAs at R8.1 landing (`check_patch_separation.py` pin):**
+
+| Patch | sha256 | Δ vs R7 closure |
+|---|---|---|
+| scaffolding | `cda976d7b7bace826b3e8c38475fab5e077c88201bd0b31768541f06635143a1` | unchanged |
+| runtime hooks | `1f598d37c07d30f7e8b43fa0e53018b7c9277f628c2af58ab40bf987ffbd46ff` | **bumped** (was `95bdcaae…`; PUT-extended writer hook in SPUThread.cpp) |
+| rust bridge | `0afda1c6943feb5d98329299a57dd68404095efb0a792839779febed13ab8a7e` | **bumped** (was `a1e810264d…`; PUT callback + bridge_dma_put_callback added) |
+
+**rpcs3.exe at R8.1 landing:** sha256
+`3ef63a825f9820373bb1df175bc975d5063f531b98206860fab36a50a8cd95d2`
+(64 MB; built 2026-05-19 with R7.1 + R7.2 + R8.1 surface).
+
+**Out of R8.1 scope (deferred to R8.2+):** DMA list cmds
 (GETL/PUTL/GETLB/PUTLB), atomic primitives (GETLLAR/PUTLLC/
 PUTLLUC/PUTQLLUC), MFC barriers / fence bits, multi-SPU DMA
-races on shared EA, SPURS production support. The R6 hard rules
-above carry forward verbatim to R7 and to R8+.
+races on shared EA, SPURS production support, in-line state
+machine driven by the executor (would restore the dispatch-time
+PUT assertion contract — currently deferred to post-replay). The
+R6 / R7 hard rules carry forward verbatim to R8.1 and R8.2+.
 
 ---
 

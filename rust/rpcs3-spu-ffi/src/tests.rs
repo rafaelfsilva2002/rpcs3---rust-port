@@ -796,6 +796,14 @@ fn rust_spu_set_refuse_mfc_null_handle_returns_minus_one() {
 // =====================================================================
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
+
+/// R7.2 / R8.1 — serializes the callback-using FFI tests. The
+/// callback observation atomics below are process-global (extern
+/// "C" fn pointers can't capture env), so concurrent tests would
+/// race on them. Each test that touches these atomics first
+/// acquires this mutex.
+static CALLBACK_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
 static R72_CB_CALLS: AtomicU32 = AtomicU32::new(0);
 static R72_LAST_EAL: AtomicU32 = AtomicU32::new(0);
@@ -830,6 +838,7 @@ const SPU_LS_SIZE_FFI: usize = 256 * 1024;
 /// tag-stat. Whole sequence runs to stop under the runtime-DMA path.
 #[test]
 fn rust_spu_runtime_dma_get_callback_round_trip() {
+    let _g = CALLBACK_TEST_MUTEX.lock().unwrap();
     unsafe {
         R72_CB_CALLS.store(0, Ordering::SeqCst);
 
@@ -919,6 +928,7 @@ fn rust_spu_runtime_dma_get_callback_round_trip() {
 /// even with a callback installed. R7.2 scope is GET-only.
 #[test]
 fn rust_spu_runtime_dma_callback_refuses_non_get() {
+    let _g = CALLBACK_TEST_MUTEX.lock().unwrap();
     unsafe {
         R72_CB_CALLS.store(0, Ordering::SeqCst);
         let h = rust_spu_new();
@@ -966,6 +976,267 @@ fn rust_spu_clear_dma_get_callback() {
         assert_eq!(rust_spu_set_dma_get_callback(h, None, core::ptr::null_mut()), 0);
         assert_eq!(
             rust_spu_set_dma_get_callback(core::ptr::null_mut(), None, core::ptr::null_mut()),
+            -1,
+        );
+        rust_spu_drop(h);
+    }
+}
+
+// =====================================================================
+// R8.1 — Runtime DMA PUT callback FFI acceptance
+// =====================================================================
+
+static R81_CB_CALLS: AtomicU32 = AtomicU32::new(0);
+static R81_LAST_EAL: AtomicU32 = AtomicU32::new(0);
+static R81_LAST_SIZE: AtomicU32 = AtomicU32::new(0);
+static R81_LAST_TAG: AtomicU32 = AtomicU32::new(0);
+static R81_FIRST_BYTE: AtomicU32 = AtomicU32::new(0);
+static R81_BYTE_SUM: AtomicU32 = AtomicU32::new(0);
+
+unsafe extern "C" fn r81_put_callback(
+    user_data: *mut core::ffi::c_void,
+    eal: u32,
+    src: *const u8,
+    size: u32,
+    tag: u32,
+) -> i32 {
+    R81_CB_CALLS.fetch_add(1, Ordering::SeqCst);
+    R81_LAST_EAL.store(eal, Ordering::SeqCst);
+    R81_LAST_SIZE.store(size, Ordering::SeqCst);
+    R81_LAST_TAG.store(tag, Ordering::SeqCst);
+    let _ = user_data;
+    if size > 0 {
+        R81_FIRST_BYTE.store(unsafe { *src } as u32, Ordering::SeqCst);
+        let mut sum: u32 = 0;
+        for i in 0..size {
+            sum = sum.wrapping_add(unsafe { *src.add(i as usize) } as u32);
+        }
+        R81_BYTE_SUM.store(sum, Ordering::SeqCst);
+    }
+    0
+}
+
+/// R8.1 — wrch ch21 (MFC_Cmd=0x20 PUT) with PUT callback installed
+/// invokes the callback exactly once. The callback sees the source
+/// bytes the SPU placed into LS at lsa (here, preloaded via
+/// rust_spu_load_ls). The interpreter then pushes 1<<tag into the
+/// tag-stat queue so the subsequent rdch ch24 succeeds, and the
+/// program runs to stop cleanly.
+#[test]
+fn rust_spu_runtime_dma_put_callback_round_trip() {
+    let _g = CALLBACK_TEST_MUTEX.lock().unwrap();
+    unsafe {
+        R81_CB_CALLS.store(0, Ordering::SeqCst);
+        R81_BYTE_SUM.store(0, Ordering::SeqCst);
+
+        let h = rust_spu_new();
+
+        // Same SPU program shape as the GET test but with cmd=0x20.
+        fn wrch(ch: u32, rt: u32) -> u32 {
+            (0x10D_u32 << 21) | (0u32 << 14) | (ch << 7) | rt
+        }
+        fn rdch(rt: u32, ch: u32) -> u32 {
+            (0x00D_u32 << 21) | (0u32 << 14) | (ch << 7) | rt
+        }
+        let stop_c3: u32 = 0xC3_u32 & 0x3FFF;
+
+        // Code at pc=0..40.
+        let mut bytes: Vec<u8> = Vec::with_capacity(2048);
+        for w in [
+            wrch(16, 1),
+            wrch(17, 2),
+            wrch(18, 3),
+            wrch(19, 4),
+            wrch(20, 5),
+            wrch(21, 6),
+            wrch(22, 7),
+            wrch(23, 8),
+            rdch(9, 24),
+            stop_c3,
+        ] {
+            bytes.extend_from_slice(&w.to_be_bytes());
+        }
+        assert_eq!(bytes.len(), 40);
+
+        // Pad LS with the PUT source data starting at lsa=0x10000.
+        // bytes vector currently holds 40 bytes of code. We extend it
+        // with zero-padding up to lsa=0x10000 and then the 32-byte
+        // PUT source pattern.
+        let lsa: u32 = 0x10000;
+        let size: u32 = 32;
+        bytes.resize(lsa as usize, 0);
+        for i in 0..size {
+            bytes.push((0xA0u32.wrapping_add(i) & 0xFF) as u8);
+        }
+
+        assert_eq!(rust_spu_load_ls(h, bytes.as_ptr(), bytes.len() as u32), 0);
+
+        let preferred = |v: u32| -> [u8; 16] {
+            let mut out = [0u8; 16];
+            out[0..4].copy_from_slice(&v.to_be_bytes());
+            out
+        };
+        let eah: u32 = 0;
+        let eal: u32 = 0xAA00_0000;
+        let tag: u32 = 5;
+        let cmd: u32 = 0x20; // PUT
+        let mask: u32 = 1 << tag;
+        let mode: u32 = 2;
+
+        assert_eq!(rust_spu_set_gpr(h, 1, preferred(lsa).as_ptr()), 0);
+        assert_eq!(rust_spu_set_gpr(h, 2, preferred(eah).as_ptr()), 0);
+        assert_eq!(rust_spu_set_gpr(h, 3, preferred(eal).as_ptr()), 0);
+        assert_eq!(rust_spu_set_gpr(h, 4, preferred(size).as_ptr()), 0);
+        assert_eq!(rust_spu_set_gpr(h, 5, preferred(tag).as_ptr()), 0);
+        assert_eq!(rust_spu_set_gpr(h, 6, preferred(cmd).as_ptr()), 0);
+        assert_eq!(rust_spu_set_gpr(h, 7, preferred(mask).as_ptr()), 0);
+        assert_eq!(rust_spu_set_gpr(h, 8, preferred(mode).as_ptr()), 0);
+        assert_eq!(rust_spu_set_pc(h, 0), 0);
+
+        assert_eq!(
+            rust_spu_set_dma_put_callback(h, Some(r81_put_callback), core::ptr::null_mut()),
+            0,
+        );
+
+        let mut code = 0u32;
+        let mut steps = 0u32;
+        let outcome = rust_spu_run_until_event(h, 100, &mut code, &mut steps);
+        assert_eq!(outcome, RustSpuOutcome::Stop);
+        assert_eq!(code, 0xC3);
+
+        assert_eq!(R81_CB_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(R81_LAST_EAL.load(Ordering::SeqCst), eal);
+        assert_eq!(R81_LAST_SIZE.load(Ordering::SeqCst), size);
+        assert_eq!(R81_LAST_TAG.load(Ordering::SeqCst), tag);
+        // Callback observed: first byte = 0xA0, sum = sum(0xA0..0xA0+31)
+        // = sum(160..191) = 5616.
+        assert_eq!(R81_FIRST_BYTE.load(Ordering::SeqCst), 0xA0);
+        let expected_sum: u32 = (0..size).map(|i| (0xA0u32 + i) & 0xFF).sum();
+        assert_eq!(R81_BYTE_SUM.load(Ordering::SeqCst), expected_sum);
+
+        rust_spu_drop(h);
+    }
+}
+
+/// R8.1 — non-PUT cmd (e.g., a list variant 0x44 GETL) returns
+/// MfcUnsupported even with PUT callback installed (and no GET
+/// callback). R8.1 scope is GET (R7.2) + PUT (R8.1) ONLY.
+#[test]
+fn rust_spu_runtime_dma_put_callback_refuses_non_put() {
+    let _g = CALLBACK_TEST_MUTEX.lock().unwrap();
+    unsafe {
+        R81_CB_CALLS.store(0, Ordering::SeqCst);
+        let h = rust_spu_new();
+
+        let wrch = |ch: u32, rt: u32| -> u32 {
+            (0x10D_u32 << 21) | (0u32 << 14) | (ch << 7) | rt
+        };
+        let stop_c1: u32 = 0xC1_u32 & 0x3FFF;
+
+        let mut bytes: Vec<u8> = Vec::with_capacity(8);
+        for w in [wrch(21, 1), stop_c1] {
+            bytes.extend_from_slice(&w.to_be_bytes());
+        }
+        assert_eq!(rust_spu_load_ls(h, bytes.as_ptr(), bytes.len() as u32), 0);
+
+        // GETL cmd = 0x44 (list variant)
+        let mut getl_bytes = [0u8; 16];
+        getl_bytes[0..4].copy_from_slice(&0x44u32.to_be_bytes());
+        assert_eq!(rust_spu_set_gpr(h, 1, getl_bytes.as_ptr()), 0);
+        assert_eq!(rust_spu_set_pc(h, 0), 0);
+        // ONLY PUT callback installed; no GET callback.
+        assert_eq!(
+            rust_spu_set_dma_put_callback(h, Some(r81_put_callback), core::ptr::null_mut()),
+            0,
+        );
+
+        let mut code = 0u32;
+        let mut steps = 0u32;
+        let outcome = rust_spu_run_until_event(h, 10, &mut code, &mut steps);
+        assert_eq!(outcome, RustSpuOutcome::MfcUnsupported);
+        assert_eq!(code, 21);
+        assert_eq!(R81_CB_CALLS.load(Ordering::SeqCst), 0);
+
+        rust_spu_drop(h);
+    }
+}
+
+/// R8.1 — GET and PUT callbacks coexist independently. With both
+/// installed, the interpreter routes by cmd value: a GET cmd
+/// invokes the GET callback; a PUT cmd invokes the PUT callback.
+#[test]
+fn rust_spu_runtime_dma_get_and_put_callbacks_coexist() {
+    let _g = CALLBACK_TEST_MUTEX.lock().unwrap();
+    unsafe {
+        R72_CB_CALLS.store(0, Ordering::SeqCst);
+        R81_CB_CALLS.store(0, Ordering::SeqCst);
+        let h = rust_spu_new();
+
+        let wrch = |ch: u32, rt: u32| -> u32 {
+            (0x10D_u32 << 21) | (0u32 << 14) | (ch << 7) | rt
+        };
+        let stop_c1: u32 = 0xC1_u32 & 0x3FFF;
+
+        // Single program: wrch ch16 (LSA), ch19 (Size), ch20 (TagID),
+        // ch21 (Cmd) — first PUT, then verify the right callback fired.
+        let mut bytes: Vec<u8> = Vec::with_capacity(20);
+        for w in [wrch(16, 1), wrch(19, 4), wrch(20, 5), wrch(21, 6), stop_c1] {
+            bytes.extend_from_slice(&w.to_be_bytes());
+        }
+        bytes.resize(0x10000, 0);
+        // Source bytes at lsa=0x10000
+        for i in 0..4u32 {
+            bytes.push((0xCC + i) as u8);
+        }
+        assert_eq!(rust_spu_load_ls(h, bytes.as_ptr(), bytes.len() as u32), 0);
+
+        let preferred = |v: u32| -> [u8; 16] {
+            let mut out = [0u8; 16];
+            out[0..4].copy_from_slice(&v.to_be_bytes());
+            out
+        };
+        assert_eq!(rust_spu_set_gpr(h, 1, preferred(0x10000).as_ptr()), 0);
+        assert_eq!(rust_spu_set_gpr(h, 4, preferred(4).as_ptr()), 0);
+        assert_eq!(rust_spu_set_gpr(h, 5, preferred(3).as_ptr()), 0);
+        assert_eq!(rust_spu_set_gpr(h, 6, preferred(0x20).as_ptr()), 0); // PUT
+        assert_eq!(rust_spu_set_pc(h, 0), 0);
+
+        assert_eq!(
+            rust_spu_set_dma_get_callback(h, Some(r72_test_callback), core::ptr::null_mut()),
+            0,
+        );
+        assert_eq!(
+            rust_spu_set_dma_put_callback(h, Some(r81_put_callback), core::ptr::null_mut()),
+            0,
+        );
+
+        let mut code = 0u32;
+        let mut steps = 0u32;
+        let outcome = rust_spu_run_until_event(h, 20, &mut code, &mut steps);
+        assert_eq!(outcome, RustSpuOutcome::Stop);
+        assert_eq!(code, 0xC1);
+
+        // PUT cmd dispatched -> PUT callback fired, GET callback NOT fired.
+        assert_eq!(R81_CB_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(R72_CB_CALLS.load(Ordering::SeqCst), 0);
+
+        rust_spu_drop(h);
+    }
+}
+
+/// R8.1 — clearing the PUT callback (pass None) is independent of
+/// the GET callback. Null-handle invariant.
+#[test]
+fn rust_spu_clear_dma_put_callback() {
+    unsafe {
+        let h = rust_spu_new();
+        assert_eq!(
+            rust_spu_set_dma_put_callback(h, Some(r81_put_callback), core::ptr::null_mut()),
+            0,
+        );
+        assert_eq!(rust_spu_set_dma_put_callback(h, None, core::ptr::null_mut()), 0);
+        assert_eq!(
+            rust_spu_set_dma_put_callback(core::ptr::null_mut(), None, core::ptr::null_mut()),
             -1,
         );
         rust_spu_drop(h);

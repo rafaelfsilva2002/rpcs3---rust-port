@@ -1,3 +1,4 @@
+warning: in the working copy of 'rpcs3/Emu/Cell/SPURustBridge.cpp', LF will be replaced by CRLF the next time Git touches it
 diff --git a/rpcs3/Emu/CMakeLists.txt b/rpcs3/Emu/CMakeLists.txt
 index f863a2b91..d862b2287 100644
 --- a/rpcs3/Emu/CMakeLists.txt
@@ -48,10 +49,10 @@ index f863a2b91..d862b2287 100644
      target_precompile_headers(rpcs3_emu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../stdafx.h")
 diff --git a/rpcs3/Emu/Cell/SPURustBridge.cpp b/rpcs3/Emu/Cell/SPURustBridge.cpp
 new file mode 100644
-index 000000000..07a0f7543
+index 000000000..2f274f8cd
 --- /dev/null
 +++ b/rpcs3/Emu/Cell/SPURustBridge.cpp
-@@ -0,0 +1,908 @@
+@@ -0,0 +1,964 @@
 +#include "stdafx.h"
 +#include "SPURustBridge.h"
 +
@@ -207,6 +208,44 @@ index 000000000..07a0f7543
 +		spu_rust_bridge_log.success(
 +			"[Rust SPU bridge] R7.2 DMA GET dispatched: cmd=0x40 eal=0x%x size=%u "
 +			"tag=%u on '%s'; real EA/LS path (vm::_ptr<u8>); tag-stat 0x%x queued "
++			"for subsequent rdch ch24",
++			eal, size, tag, spu ? spu->get_name().c_str() : "<unknown>",
++			1u << tag);
++		return 0;
++	}
++
++	// R8.1 — runtime DMA PUT callback. Symmetric to GET but inverts
++	// the data direction: reads `size` bytes from `src_ls_ptr` (a
++	// read-only pointer into the Rust SPU handle's LS at the
++	// captured `mfc_lsa`) and writes them to RPCS3 EA `eal` via
++	// `vm::_ptr<u8>` (matches the C++ executor's PUT branch in
++	// `process_mfc_cmd()`). The Rust interpreter has already
++	// validated cmd=0x20, eah=0, tag<32, size, lsa+size<=256 KiB
++	// before calling here.
++	//
++	// Returns 0 on success, -1 if the EA does not map to host
++	// memory (bridge surfaces MfcUnsupported, falls back to C++).
++	static int32_t bridge_dma_put_callback(
++		void* user_data,
++		uint32_t eal,
++		const uint8_t* src_ls_ptr,
++		uint32_t size,
++		uint32_t tag)
++	{
++		spu_thread* spu = static_cast<spu_thread*>(user_data);
++		u8* dst = vm::_ptr<u8>(eal);
++		if (!dst)
++		{
++			spu_rust_bridge_log.warning(
++				"[Rust SPU bridge] bridge_dma_put_callback: vm::_ptr<u8>(0x%x) "
++				"returned null on '%s'; refusing PUT, bridge will fall back to C++",
++				eal, spu ? spu->get_name().c_str() : "<unknown>");
++			return -1;
++		}
++		std::memcpy(dst, src_ls_ptr, size);
++		spu_rust_bridge_log.success(
++			"[Rust SPU bridge] R8.1 DMA PUT dispatched: cmd=0x20 eal=0x%x size=%u "
++			"tag=%u on '%s'; real LS/EA path (vm::_ptr<u8>); tag-stat 0x%x queued "
 +			"for subsequent rdch ch24",
 +			eal, size, tag, spu ? spu->get_name().c_str() : "<unknown>",
 +			1u << tag);
@@ -414,15 +453,33 @@ index 000000000..07a0f7543
 +		// Size / TagID via the prior ch16-20 wrch's. The callback
 +		// reads the EA bytes via RPCS3 `vm::_ptr<u8>` and copies them
 +		// into the Rust handle's LS — the SPU continues end-to-end
-+		// without any C++ fallback. Non-GET cmds (PUT, list, atomic,
-+		// etc.) and validation failures still produce MfcUnsupported,
-+		// so the bridge falls back honestly for those.
++		// without any C++ fallback. Non-GET cmds and validation
++		// failures still produce MfcUnsupported, so the bridge falls
++		// back honestly for those.
 +		if (rust_spu_set_dma_get_callback(h, &bridge_dma_get_callback, &spu) != 0)
 +		{
 +			spu_rust_bridge_log.warning(
 +				"[Rust SPU bridge] try_delegate: rust_spu_set_dma_get_callback failed "
 +				"on '%s'; falling back to C++ executor (R7.1 honest-fallback path will "
 +				"still trigger, but R7.2 runtime DMA path is unavailable).", spu.get_name());
++			rust_spu_drop(h);
++			return false;
++		}
++
++		// R8.1 — install the runtime DMA PUT callback. Symmetric to
++		// R7.2 GET but inverts the direction: SPU produces LS bytes
++		// during prior interpreter steps; callback memcpys them to
++		// RPCS3 EA via vm::_ptr<u8>. Both GET and PUT callbacks are
++		// installed so any single wrch ch21 dispatches to the right
++		// one based on the cmd value (0x40 GET / 0x20 PUT). List
++		// cmds, atomics, barriers, etc. surface MfcUnsupported and
++		// fall back to C++.
++		if (rust_spu_set_dma_put_callback(h, &bridge_dma_put_callback, &spu) != 0)
++		{
++			spu_rust_bridge_log.warning(
++				"[Rust SPU bridge] try_delegate: rust_spu_set_dma_put_callback failed "
++				"on '%s'; falling back to C++ executor (R8.1 PUT path unavailable).",
++				spu.get_name());
 +			rust_spu_drop(h);
 +			return false;
 +		}
@@ -840,7 +897,8 @@ index 000000000..07a0f7543
 +		// OUT_MBOX, sync PC + GPRs, then invoke stop_and_signal(code)
 +		// so the rest of RPCS3 (group join, status_npc, exit_status)
 +		// terminates exactly as the C++ executor would.
-+		// =========================================================
++		//warning: in the working copy of 'rpcs3/Emu/Cell/SPURustBridge.h', LF will be replaced by CRLF the next time Git touches it
+ =========================================================
 +
 +		// Drain RPCS3's IN_MBOX: the Rust SPU consumed `in_count`
 +		// values during run from our initial peek. Note the loop body

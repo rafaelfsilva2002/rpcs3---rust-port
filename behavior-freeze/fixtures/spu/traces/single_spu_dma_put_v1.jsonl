@@ -1,0 +1,15 @@
+{"seq":0,"side":"spu","kind":"spu_image","target_spu":256,"image_sha256":"331edfe55389b65179d4ee7088595f1b21b4b9dfbf9260f635edc9101e71ea65","load_addr":0,"size":262144,"entry_pc":0}
+{"seq":1,"side":"spu","kind":"spu_wrch","target_spu":256,"pc":56,"channel":16,"value":65536,"would_stall":false}
+{"seq":2,"side":"spu","kind":"spu_wrch","target_spu":256,"pc":64,"channel":17,"value":0,"would_stall":false}
+{"seq":3,"side":"spu","kind":"spu_wrch","target_spu":256,"pc":68,"channel":18,"value":268505472,"would_stall":false}
+{"seq":4,"side":"spu","kind":"spu_wrch","target_spu":256,"pc":76,"channel":19,"value":128,"would_stall":false}
+{"seq":5,"side":"spu","kind":"spu_wrch","target_spu":256,"pc":84,"channel":20,"value":3,"would_stall":false}
+{"seq":6,"side":"spu","kind":"spu_wrch","target_spu":256,"pc":92,"channel":21,"value":32,"would_stall":false}
+{"seq":7,"side":"spu","kind":"spu_mfc_cmd","target_spu":256,"pc":92,"cmd":32,"tag":3,"size":128,"lsa":65536,"eah":0,"eal":268505472,"ea_chunk_sha256":"471fb943aa23c511f6f72f8d1652d9c880cfa392ad80503120547703e56a2be5"}
+{"seq":8,"side":"spu","kind":"mfc_dma_complete","target_spu":256,"tag":3,"transferred_bytes":128}
+{"seq":9,"side":"spu","kind":"spu_wrch","target_spu":256,"pc":100,"channel":22,"value":8,"would_stall":false}
+{"seq":10,"side":"spu","kind":"spu_wrch","target_spu":256,"pc":108,"channel":23,"value":2,"would_stall":false}
+{"seq":11,"side":"spu","kind":"spu_rdch","target_spu":256,"pc":112,"channel":24,"value":8,"would_stall":false}
+{"seq":12,"side":"spu","kind":"spu_wrch","target_spu":256,"pc":124,"channel":28,"value":3237998282,"would_stall":false}
+{"seq":13,"side":"spu","kind":"spu_stop","target_spu":256,"pc":128,"stop_code":257}
+{"seq":14,"side":"spu","kind":"final_state","target_spu":256,"gpr_lane_zero":[{"reg":1,"value":262128},{"reg":2,"value":8},{"reg":3,"value":268505472},{"reg":4,"value":1886483059},{"reg":5,"value":269554195},{"reg":6,"value":65664},{"reg":7,"value":1886483059},{"reg":8,"value":4294967295},{"reg":9,"value":65536},{"reg":11,"value":128},{"reg":12,"value":3},{"reg":13,"value":32},{"reg":14,"value":8},{"reg":15,"value":2},{"reg":16,"value":3237998282}],"channels":{"in_mbox":null,"out_mbox":null,"out_intr_mbox":null,"snr1":0,"snr2":0}}

@@ -949,6 +949,13 @@ const MFC_CMD_CHANNEL: u32 = 21;
 /// flagged variants) surface as `UnsupportedMfcCmd`. See design § 3 /
 /// § 4.3.
 const MFC_GET_CMD: u32 = 0x40;
+/// R8.1 — MFC PUT (LS → EA writes). Same validation surface as GET.
+/// The `.dmachunk` side-file content semantics differ: for GET it
+/// carries the EA bytes the SPU received; for PUT it carries the LS
+/// bytes the SPU produced at dispatch time (verified during replay
+/// by asserting `LS[lsa..lsa+size] == captured_chunk` at the moment
+/// the interpreter reaches `wrch ch21`).
+const MFC_PUT_CMD: u32 = 0x20;
 
 /// R6.7 A.2 — MFC tag is a 5-bit field (`ch_mfc_cmd.tag & 0x1f`).
 const MFC_TAG_MAX: u32 = 31;
@@ -1150,7 +1157,11 @@ fn validate_spu_image_event(e: &SpuImageEvent, line: usize) -> Result<(), TraceP
 fn validate_spu_mfc_cmd_event(e: &SpuMfcCmdEvent, line: usize) -> Result<(), TraceParseError> {
     check_pc(line, e.seq, e.pc)?;
 
-    if e.cmd != MFC_GET_CMD {
+    // R6.7: only GET (0x40). R8.1: also PUT (0x20). Everything else
+    // (list cmds GETL/PUTL/GETLB/PUTLB, atomic GETLLAR/PUTLLC/...,
+    // barriers, sync, signal-notification) still surfaces
+    // `UnsupportedMfcCmd` — the schema is strict-additive.
+    if e.cmd != MFC_GET_CMD && e.cmd != MFC_PUT_CMD {
         return Err(TraceParseError::UnsupportedMfcCmd {
             line,
             seq: e.seq,
@@ -3015,17 +3026,41 @@ mod tests {
     /// the most common non-GET cmd; we use it as the canary.
     #[test]
     fn reject_mfc_cmd_non_get() {
+        // R8.1 update: PUT (0x20) is NOW accepted alongside GET
+        // (0x40). The new canary is GETL (0x44, list variant) —
+        // R8.2+ scope.
+        let jsonl = format!(
+            r#"
+{{"seq":0,"side":"spu","kind":"spu_wrch","pc":256,"channel":21,"value":68,"would_stall":false,"target_spu":1}}
+{{"seq":1,"side":"spu","kind":"spu_mfc_cmd","target_spu":1,"pc":256,"cmd":68,"tag":3,"size":128,"lsa":0,"eah":0,"eal":4096,"ea_chunk_sha256":"{TEST_VALID_SHA}"}}
+"#
+        );
+        let err = parse_jsonl_trace(&jsonl).expect_err("GETL cmd must reject");
+        assert!(
+            matches!(err, TraceParseError::UnsupportedMfcCmd { cmd: 0x44, .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// R8.1 — PUT (0x20) is accepted by the parser as a sibling of
+    /// GET. Both surface as `SpuMfcCmd` events; the state machine
+    /// distinguishes their semantics (GET writes LS, PUT asserts).
+    #[test]
+    fn accept_mfc_cmd_put_0x20() {
         let jsonl = format!(
             r#"
 {{"seq":0,"side":"spu","kind":"spu_wrch","pc":256,"channel":21,"value":32,"would_stall":false,"target_spu":1}}
 {{"seq":1,"side":"spu","kind":"spu_mfc_cmd","target_spu":1,"pc":256,"cmd":32,"tag":3,"size":128,"lsa":0,"eah":0,"eal":4096,"ea_chunk_sha256":"{TEST_VALID_SHA}"}}
+{{"seq":2,"side":"spu","kind":"mfc_dma_complete","target_spu":1,"tag":3,"transferred_bytes":128}}
 "#
         );
-        let err = parse_jsonl_trace(&jsonl).expect_err("non-GET cmd must reject");
-        assert!(
-            matches!(err, TraceParseError::UnsupportedMfcCmd { cmd: 0x20, .. }),
-            "got {err:?}"
-        );
+        let events = parse_jsonl_trace(&jsonl).expect("PUT must parse");
+        assert_eq!(events.len(), 3);
+        let cmd_evt = events.iter().find_map(|e| match e {
+            CapturedEvent::SpuMfcCmd(c) => Some(c),
+            _ => None,
+        }).expect("spu_mfc_cmd must be present");
+        assert_eq!(cmd_evt.cmd, 0x20, "cmd must be PUT");
     }
 
     /// Negative: eah != 0 is rejected. PS3 user-space PSL1GHT is

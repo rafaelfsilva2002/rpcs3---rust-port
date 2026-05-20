@@ -406,6 +406,54 @@ pub unsafe extern "C" fn rust_spu_set_dma_get_callback(
     )
 }
 
+/// R8.1 — runtime DMA PUT callback type, mirrors
+/// [`rpcs3_spu_thread::DmaPutCallback::func`]. Inverts the data
+/// direction vs the GET callback: the SPU's LS bytes are passed
+/// READ-ONLY (`*const u8`) and the bridge copies them to RPCS3 EA.
+///
+/// Returns 0 on success, non-zero to refuse (the interpreter then
+/// surfaces `MfcUnsupported`, the bridge falls back to C++).
+pub type DmaPutCallbackFn = unsafe extern "C" fn(
+    user_data: *mut core::ffi::c_void,
+    eal: u32,
+    src_ls_ptr: *const u8,
+    size: u32,
+    tag: u32,
+) -> i32;
+
+/// R8.1 — install (or clear) the runtime DMA PUT callback on the
+/// handle. Pass `func = NULL` to clear an existing callback. The
+/// PUT callback is independent of the GET callback: both can be
+/// installed simultaneously, and the interpreter routes
+/// `wrch ch21 (MFC_Cmd)` by cmd value (0x40 → GET callback,
+/// 0x20 → PUT callback).
+///
+/// Returns 0 on success, -1 if `h` is null.
+///
+/// # Safety
+///
+/// Same contract as [`rust_spu_set_dma_get_callback`]: the
+/// (`func`, `user_data`) pair must outlive every
+/// `rust_spu_run_until_event` call on this handle.
+#[no_mangle]
+pub unsafe extern "C" fn rust_spu_set_dma_put_callback(
+    h: *mut RustSpu,
+    func: Option<DmaPutCallbackFn>,
+    user_data: *mut core::ffi::c_void,
+) -> i32 {
+    guard(
+        || {
+            let Some(h) = handle_mut(h) else { return -1 };
+            h.spu.channels.dma_put_callback = func.map(|f| rpcs3_spu_thread::DmaPutCallback {
+                func: f,
+                user_data,
+            });
+            0
+        },
+        -100,
+    )
+}
+
 // =====================================================================
 // Run / step
 // =====================================================================

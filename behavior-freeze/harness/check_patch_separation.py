@@ -66,31 +66,35 @@ RUNTIME_HOOKS = PATCH_DIR / "spu_trace_jsonl_runtime_hooks.patch"
 # if the file is absent, the gate stays green (R6.0 / pre-R6.1
 # states are valid).
 RUST_BRIDGE = PATCH_DIR / "spu_rust_bridge.patch"
-# R7.2 (2026-05-18) — superseded R7.1 sha
-# eeb57616830f424c1fb2fecf30349914b028acc70067ba2fe130b64b563ee64a
-# Adds runtime DMA GET dispatch on top of R7.1's honest-fallback path:
-#   - bridge_dma_get_callback() — reads RPCS3 EA bytes via
-#     vm::_ptr<u8>(eal) and memcpys into the Rust handle's LS at
-#     the captured mfc_lsa (same path the C++ executor's
-#     process_mfc_cmd() simple-GET branch uses).
-#   - rust_spu_set_dma_get_callback(handle, &bridge_dma_get_callback,
-#     &spu) installed in try_delegate_execution() alongside
-#     rust_spu_set_refuse_mfc(handle, 1). The refuse gate is
-#     RELAXED by the Rust interpreter when a callback is installed,
-#     so ch16-20 / ch22-23 wrch and ch24/25 rdch fall through to
-#     Phase C and wrch ch21 (MFC_Cmd) invokes the callback.
-#   - SUCCESS log on every GET dispatch: "R7.2 DMA GET dispatched:
-#     cmd=0x40 eal=0x... size=N tag=T ... real EA/LS path
+# R8.1 (2026-05-19) — superseded R7.2 sha
+# a1e810264d8d9474018c279606111b543eb3f6b6c5845839382e4a657e220e70
+# Extends R7.2's runtime DMA GET dispatch with symmetric PUT
+# dispatch (LS → EA, the inverse direction):
+#   - bridge_dma_put_callback() — reads `src_ls_ptr` bytes (already
+#     populated by the SPU at dispatch time) and writes them to
+#     `vm::_ptr<u8>(eal)`. Mirror of bridge_dma_get_callback's
+#     read-path but data flows the opposite way; uses the same
+#     captured-tag-stat queueing on success.
+#   - rust_spu_set_dma_put_callback(handle, &bridge_dma_put_callback,
+#     &spu) installed alongside the GET callback on every
+#     rust_spu_new in try_delegate_execution(). The refuse_mfc gate
+#     is RELAXED whenever EITHER callback is installed (R7.2
+#     unchanged); the Rust interpreter routes wrch ch21 by cmd
+#     value (0x40 → GET callback, 0x20 → PUT callback, other →
+#     MfcUnsupported).
+#   - SUCCESS log on every PUT dispatch: "R8.1 DMA PUT dispatched:
+#     cmd=0x20 eal=0x... size=N tag=T ... real LS/EA path
 #     (vm::_ptr<u8>); tag-stat 1<<T queued for subsequent rdch ch24".
-#   - Non-GET cmds, validation failures, and a NULL EA still surface
-#     MfcUnsupported via the R7.1 outcome arm — bridge falls back
-#     honestly for any path R7.2 does not handle.
-# R7.1 + R7.2 acceptance verified on single_spu_dma_get_v1.self:
-# bridge OFF and bridge ON both produce canonical TTY
-# 0xdeada12f; bridge ON with R7.2 delegates end-to-end (total_steps
-# >1000, stall_iters=0, NO MfcUnsupported fallback).
+#   - List / atomic / lock-line variants still surface MfcUnsupported
+#     via the R7.1 outcome arm — bridge falls back honestly for any
+#     path R8.1 does not handle (PUT extension is GET-shape only).
+# R8.1 acceptance verified on single_spu_dma_put_v1.self via
+# check_triple_symmetry.py --fixture put: bridge OFF and bridge ON
+# both produce canonical TTY 0xc0ffeeca / 0xcafea57e; bridge ON
+# delegates end-to-end (total_steps >1000, NO MfcUnsupported
+# fallback); replay oracle byte-identical (8th oracle).
 RUST_BRIDGE_PINNED_SHA256 = (
-    "a1e810264d8d9474018c279606111b543eb3f6b6c5845839382e4a657e220e70"
+    "0afda1c6943feb5d98329299a57dd68404095efb0a792839779febed13ab8a7e"
 )
 
 # Hot-path source files that runtime hooks edit; scaffolding MUST NOT

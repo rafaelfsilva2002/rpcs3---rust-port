@@ -178,6 +178,40 @@ int32_t rust_spu_set_dma_get_callback(rust_spu_t *h,
                                       void *user_data);
 
 /**
+ * R8.1 — runtime DMA PUT callback signature.
+ *
+ * Called from the SPU interpreter on `wrch ch21 (MFC_Cmd)` with
+ * cmd=0x20 (plain PUT) after the SPU has populated MFC_LSA / EAH /
+ * EAL / Size / TagID via prior ch16-20 wrch's AND written the
+ * source bytes into LS at `mfc_lsa` as part of prior interpreter
+ * steps. The callback reads `size` bytes from `src_ls_ptr` (a
+ * read-only pointer into the Rust SPU handle's LS at the captured
+ * `mfc_lsa` offset, valid for `size` bytes) and writes them to
+ * RPCS3 EA at `eal`.
+ *
+ * Returns 0 on success, non-zero to refuse (the interpreter then
+ * surfaces `MfcUnsupported`, the bridge falls back honestly).
+ */
+typedef int32_t (*rust_spu_dma_put_cb_t)(void *user_data,
+                                         uint32_t eal,
+                                         const uint8_t *src_ls_ptr,
+                                         uint32_t size,
+                                         uint32_t tag);
+
+/**
+ * R8.1 — install (or clear) the runtime DMA PUT callback. Pass
+ * `func = NULL` to clear an existing callback. The PUT callback is
+ * independent of the GET callback: both can be installed
+ * simultaneously, and the interpreter routes `wrch ch21 (MFC_Cmd)`
+ * by cmd value (0x40 → GET callback, 0x20 → PUT callback).
+ *
+ * Returns 0 on success, -1 if `h` is null.
+ */
+int32_t rust_spu_set_dma_put_callback(rust_spu_t *h,
+                                      rust_spu_dma_put_cb_t func,
+                                      void *user_data);
+
+/**
  * Run up to `max_steps` instructions. Returns the outcome that
  * caused the run to halt:
  *

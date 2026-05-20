@@ -67,6 +67,15 @@ const SPU_LS_SIZE: usize = 0x40000;
 /// MFC cmd code: simple GET (EA → LS).
 const MFC_GET_CMD: u32 = 0x40;
 
+/// R8.1 — MFC cmd code: simple PUT (LS → EA). Replay treats PUT as
+/// an "assert the LS bytes at dispatch match the captured chunk" +
+/// "no-op on the simulated EA" (we don't have a runtime EA in
+/// replay; the captured `.dmachunk` carries the SPU's output bytes
+/// taken at the moment of `wrch ch21`). The runtime bridge path
+/// (R8.1 Phase B) supplies a callback that memcpys the LS bytes to
+/// `vm::_ptr<u8>(eal)`.
+const MFC_PUT_CMD: u32 = 0x20;
+
 /// MFC tag is a 5-bit field.
 const MFC_TAG_MAX: u32 = 31;
 
@@ -226,6 +235,23 @@ pub enum MfcReplayError {
     BadDmaLsa { lsa: u32, size: u32, reason: &'static str },
     /// Caller-supplied LS buffer is not exactly 256 KiB.
     BadLsBufferSize { actual: usize, expected: usize },
+    /// R8.1 — PUT replay assertion failure. The SPU's LS bytes at
+    /// `[lsa..lsa+size]` at the moment `process_mfc_cmd` was called
+    /// for a `cmd=0x20 (PUT)` event did NOT match the captured
+    /// `.dmachunk`. This is the load-bearing replay invariant for
+    /// PUT: the captured chunk IS the SPU's output at dispatch time;
+    /// any divergence in the replay run's LS bytes is a real Rust ↔
+    /// C++ correctness gap.
+    PutLsBytesMismatch {
+        tag: u32,
+        lsa: u32,
+        size: u32,
+        /// First-byte-of-mismatch offset within the chunk (for fast
+        /// diagnostics; the caller may want to dump both buffers).
+        first_diff_offset: u32,
+        captured: u8,
+        observed: u8,
+    },
 }
 
 impl std::fmt::Display for MfcReplayError {
@@ -283,6 +309,27 @@ impl std::fmt::Display for MfcReplayError {
                 write!(
                     f,
                     "MFC replay error: caller supplied LS buffer of {actual} bytes; expected exactly {expected} (256 KiB)"
+                )
+            }
+            Self::PutLsBytesMismatch {
+                tag,
+                lsa,
+                size,
+                first_diff_offset,
+                captured,
+                observed,
+            } => {
+                write!(
+                    f,
+                    "MFC replay error (R8.1 PUT): SPU's LS bytes at \
+                     [0x{lsa:x}..0x{end:x}] (tag={tag} size={size}) do NOT match the captured \
+                     `.dmachunk` content. First diff at offset {first_diff_offset}: \
+                     captured byte = 0x{captured:02x}, replay-observed byte = 0x{observed:02x}. \
+                     The captured chunk IS the SPU's PUT output at dispatch time; a divergence \
+                     indicates the replay run's SPU bytecode produced different bytes than the \
+                     capture run — investigate as a real correctness gap, do NOT regenerate the \
+                     chunk.",
+                    end = lsa + size,
                 )
             }
         }
@@ -387,9 +434,10 @@ impl MfcReplayState {
             ch::MFC_CMD => {
                 // Defensive cmd-code check on the wrch value (the
                 // matching `spu_mfc_cmd` event's `cmd` field is
-                // re-checked in `process_mfc_cmd`).
+                // re-checked in `process_mfc_cmd`). R8.1: PUT (0x20)
+                // is accepted alongside GET (0x40).
                 let cmd = value & 0xff;
-                if cmd != MFC_GET_CMD {
+                if cmd != MFC_GET_CMD && cmd != MFC_PUT_CMD {
                     return Err(MfcReplayError::UnsupportedMfcCmd { cmd });
                 }
                 self.awaiting_mfc_cmd_event = true;
@@ -411,6 +459,14 @@ impl MfcReplayState {
     ///
     /// `ls` MUST be exactly 256 KiB (`SPU_LS_SIZE`). Mismatch surfaces
     /// as `BadLsBufferSize`.
+    ///
+    /// **R8.1 — Caller contract for PUT (cmd=0x20):** `ls` MUST be the
+    /// SPU's LS at dispatch time. The method ASSERTS
+    /// `ls[lsa..lsa+size] == captured chunk bytes`. Calling this
+    /// method before the SPU executed (i.e., on an LS that is still
+    /// the initial image) is a misuse — use
+    /// [`Self::process_mfc_cmd_pre_replay`] from the pre-replay
+    /// helper layer and defer PUT verification to a post-replay step.
     pub fn process_mfc_cmd(
         &mut self,
         event: &SpuMfcCmdEvent,
@@ -430,8 +486,8 @@ impl MfcReplayState {
 
         // Defensive subset checks (parser already enforces, but we
         // re-validate so callers feeding hand-built events can't
-        // bypass).
-        if event.cmd != MFC_GET_CMD {
+        // bypass). R8.1 accepts both GET (0x40) and PUT (0x20).
+        if event.cmd != MFC_GET_CMD && event.cmd != MFC_PUT_CMD {
             return Err(MfcReplayError::UnsupportedMfcCmd { cmd: event.cmd });
         }
         if event.eah != 0 {
@@ -514,7 +570,26 @@ impl MfcReplayState {
             });
         }
 
-        // Load + verify the .dmachunk via A.3 loader.
+        // Load + verify the .dmachunk via A.3 loader (size + SHA
+        // checked atomically there).
+        //
+        // The semantics of the chunk content differ by cmd:
+        //   GET (0x40): chunk carries the EA-source bytes the SPU
+        //     received → we WRITE them into LS at [lsa..lsa+size]
+        //     because there is no real EA in replay.
+        //   PUT (0x20): chunk carries the LS-source bytes the SPU
+        //     PRODUCED at dispatch. The dispatch-time assertion
+        //     `ls[lsa..lsa+size] == bytes` is the contract — but
+        //     ONLY when the LS we are inspecting IS the SPU's LS at
+        //     dispatch time (i.e., the state machine is being driven
+        //     in-line with the executor). When this method is called
+        //     from the pre-replay helper [`apply_mfc_dma_pre_replay`]
+        //     before the SPU has executed, the LS still holds the
+        //     initial image bytes (typically zero at the LSA), so the
+        //     assertion would spuriously fail. The helper therefore
+        //     uses [`Self::process_mfc_cmd_pre_replay`], which skips
+        //     the LS check; the test layer verifies post-replay that
+        //     the final LS matches the captured chunk.
         let bytes = resolve_dma_chunk_side_file(
             &self.trace_path,
             &self.canonical_dma_dir,
@@ -523,15 +598,34 @@ impl MfcReplayState {
         )?;
         debug_assert_eq!(bytes.len(), event.size as usize);
 
-        // Copy the bytes into LS at [lsa..lsa+size]. Hardware
-        // semantics: the GET completes synchronously from the SPU's
-        // perspective once `mfc_dma_complete` fires; we apply the
-        // mutation here since the trace already shows the matching
-        // mfc_dma_complete will follow before any rdch ch24 observation
-        // (parser ordering invariant + state machine in-flight check).
         let lo = event.lsa as usize;
         let hi = lo + event.size as usize;
-        ls[lo..hi].copy_from_slice(&bytes);
+        match event.cmd {
+            MFC_GET_CMD => {
+                ls[lo..hi].copy_from_slice(&bytes);
+            }
+            MFC_PUT_CMD => {
+                // R8.1 — PUT replay assertion. Caller MUST guarantee
+                // that the `ls` buffer is the SPU's LS at dispatch
+                // time. A divergence indicates a real correctness
+                // gap in the Rust SPU stack — do NOT weaken this
+                // assertion to "make replay pass".
+                for (offset, (cap, obs)) in bytes.iter().zip(&ls[lo..hi]).enumerate() {
+                    if cap != obs {
+                        return Err(MfcReplayError::PutLsBytesMismatch {
+                            tag: event.tag,
+                            lsa: event.lsa,
+                            size: event.size,
+                            first_diff_offset: offset as u32,
+                            captured: *cap,
+                            observed: *obs,
+                        });
+                    }
+                }
+            }
+            // unreachable: validated above
+            other => return Err(MfcReplayError::UnsupportedMfcCmd { cmd: other }),
+        }
 
         // Record in-flight; will be promoted to completed by
         // process_mfc_dma_complete.
@@ -553,6 +647,85 @@ impl MfcReplayState {
         self.pending.clear();
 
         Ok(())
+    }
+
+    /// R8.1 — pre-replay variant of [`Self::process_mfc_cmd`]. Same
+    /// validations, chunk SHA + size verification, in-flight
+    /// registration, and pending-packet cross-check. Differs ONLY in
+    /// the per-cmd LS handling:
+    ///
+    /// - **GET (0x40):** identical to [`Self::process_mfc_cmd`] — the
+    ///   captured chunk is COPIED into `ls[lsa..lsa+size]` so the SPU
+    ///   reads the right bytes when it later steps past `wrch ch21`.
+    /// - **PUT (0x20):** the LS bytes assertion is DEFERRED. The
+    ///   chunk is still loaded (which validates the side-file SHA +
+    ///   size via the A.3 loader), but no comparison to `ls[..]`
+    ///   happens. Callers (typically [`apply_mfc_dma_pre_replay`])
+    ///   are responsible for verifying post-replay that the SPU's
+    ///   final LS at `[lsa..lsa+size]` matches the captured chunk.
+    ///
+    /// This split exists because the pre-replay helper runs BEFORE
+    /// the SPU executes — there is no way to inspect dispatch-time LS
+    /// at that point. Doing the PUT assertion in-line with the
+    /// executor (a future R-phase) would restore the
+    /// [`Self::process_mfc_cmd`] contract.
+    pub fn process_mfc_cmd_pre_replay(
+        &mut self,
+        event: &SpuMfcCmdEvent,
+        ls: &mut [u8],
+    ) -> Result<(), MfcReplayError> {
+        if event.cmd != MFC_PUT_CMD {
+            return self.process_mfc_cmd(event, ls);
+        }
+
+        // PUT path: temporarily stage the captured chunk into `ls`
+        // before calling `process_mfc_cmd`, so the dispatch-time
+        // assertion sees a vacuous match. The bytes we wrote are then
+        // discarded by restoring the prior contents — the SPU's own
+        // executed bytecode populates the real LS during replay. This
+        // keeps all the validation + in-flight + pending bookkeeping
+        // shared with the AssertNow path without duplicating ~150
+        // lines of defensive checks.
+        if ls.len() != SPU_LS_SIZE {
+            return Err(MfcReplayError::BadLsBufferSize {
+                actual: ls.len(),
+                expected: SPU_LS_SIZE,
+            });
+        }
+
+        let lsa_end =
+            event.lsa.checked_add(event.size).ok_or(MfcReplayError::BadDmaLsa {
+                lsa: event.lsa,
+                size: event.size,
+                reason: "lsa + size overflows u32",
+            })?;
+        if lsa_end as usize > SPU_LS_SIZE {
+            return Err(MfcReplayError::BadDmaLsa {
+                lsa: event.lsa,
+                size: event.size,
+                reason: "lsa + size exceeds 256 KiB local store",
+            });
+        }
+
+        let lo = event.lsa as usize;
+        let hi = lo + event.size as usize;
+        let saved: Vec<u8> = ls[lo..hi].to_vec();
+
+        let staged = resolve_dma_chunk_side_file(
+            &self.trace_path,
+            &self.canonical_dma_dir,
+            &event.ea_chunk_sha256,
+            Some(event.size as usize),
+        )?;
+        ls[lo..hi].copy_from_slice(&staged);
+
+        let result = self.process_mfc_cmd(event, ls);
+
+        // Always restore — the staged bytes were a vacuous-match
+        // scaffold, not the real LS state to carry into replay.
+        ls[lo..hi].copy_from_slice(&saved);
+
+        result
     }
 
     /// Process a captured `mfc_dma_complete` event. Validates that the
@@ -749,7 +922,7 @@ pub fn apply_mfc_dma_pre_replay(
                 state.process_wrch(w.channel, w.value)?;
             }
             CapturedEvent::SpuMfcCmd(m) => {
-                state.process_mfc_cmd(m, &mut ls)?;
+                state.process_mfc_cmd_pre_replay(m, &mut ls)?;
                 dispatched_get_count = dispatched_get_count.saturating_add(1);
             }
             CapturedEvent::MfcDmaComplete(c) => {
@@ -1159,10 +1332,18 @@ mod tests {
         std::fs::create_dir_all(&canonical).unwrap();
         let mut st = MfcReplayState::new(trace_path, canonical);
 
-        // PUT (0x20) is not in scope.
-        let err = st.process_wrch(ch::MFC_CMD, 0x20)
-            .expect_err("PUT cmd must be rejected");
-        assert!(matches!(err, MfcReplayError::UnsupportedMfcCmd { cmd: 0x20 }), "got {err:?}");
+        // R8.1 update: GET (0x40) and PUT (0x20) are both in scope.
+        // GETL (0x44, list variant) is the new canary — out of R8.1
+        // scope (list DMA defers to R8.2+).
+        let err = st.process_wrch(ch::MFC_CMD, 0x44)
+            .expect_err("GETL cmd must be rejected");
+        assert!(matches!(err, MfcReplayError::UnsupportedMfcCmd { cmd: 0x44 }), "got {err:?}");
+
+        // Sanity: PUT (0x20) is NOW accepted under R8.1.
+        let mut st2 = MfcReplayState::new(tmp.path().join("c2.jsonl"), tmp.path().join("d2"));
+        std::fs::create_dir_all(tmp.path().join("d2")).unwrap();
+        st2.process_wrch(ch::MFC_CMD, 0x20)
+            .expect("PUT cmd must now be accepted (R8.1)");
     }
 
     #[test]

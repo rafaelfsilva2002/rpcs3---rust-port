@@ -926,3 +926,75 @@ fake `.dmachunk` content.
 - ✅ v4 still diagnostic-only
 - ✅ `single_spu_dma_get_v1` is the project's first DMA-bound
   replay-validated oracle; OUT_MBOX = `0xDEADA12F` canonical
+
+---
+
+## 14. R8.1 closure note (2026-05-19) — PUT direction
+
+R8.1 extends the design with the symmetric inverse of GET. The
+state machine, writer, parser, executor wiring, FFI, and bridge
+all gain a PUT branch that mirrors GET semantics with the data
+direction reversed (LS → EA) and one new load-bearing invariant:
+**the captured `.dmachunk` for a PUT MUST byte-match the SPU's
+LS at the dispatch lsa**. The state machine surfaces a
+divergence as `MfcReplayError::PutLsBytesMismatch` — never
+silently coerced.
+
+### 14.1 Architectural deviation from § 9.7
+
+§ 9.7 (PUT discussion) predicted PUT would require in-line state
+machine wiring with the executor because the SPU writes LS bytes
+BEFORE dispatch and the assertion must fire AT dispatch time.
+R8.1 ships PUT support without that wiring change by introducing
+two state-machine entry points:
+
+- `process_mfc_cmd` (existing) — AssertNow semantics. Caller
+  guarantees `ls` is the SPU's LS at dispatch time. Suitable for
+  future in-line executor integration.
+- `process_mfc_cmd_pre_replay` (NEW) — PUT route defers the LS
+  assertion to a post-replay step in the test layer. The chunk
+  is still loaded (validates side-file SHA + size), the pending
+  packet cross-check runs, the in-flight tag is registered. The
+  deferred assertion is performed by the replay test against
+  both backends' final LS — for the canonical fixture this is
+  equivalent to dispatch-time assertion because the SPU doesn't
+  touch LS post-PUT. A future R-phase driving the state machine
+  in-line with the executor would restore the dispatch-time
+  contract automatically.
+
+### 14.2 R8.1 acceptance state
+
+- ✅ 8 replay-validated oracles green (cross-backend byte-identical)
+- ✅ workspace `--lib --no-fail-fast` green (all crates pass)
+- ✅ `check_trace_fixtures.py` green (8 fixtures listed)
+- ✅ `check_patch_separation.py` green (3 SHA-pinned patches:
+  rust bridge bumped to `0afda1c6…`, runtime hooks bumped to
+  `1f598d37…`, scaffolding unchanged `cda976d7…`)
+- ✅ `check_triple_symmetry.py --fixture get` green (R7.3 carry)
+- ✅ `check_triple_symmetry.py --fixture put` green (R8.1 new)
+- ✅ rpcs3.exe `3ef63a825f9820373bb1df175bc975d5063f531b98206860fab36a50a8cd95d2`
+- ✅ v4 still diagnostic-only (PUT path landed without promoting
+  any commercial DMA capture)
+- ✅ `single_spu_dma_put_v1` is the project's first PUT-bound
+  replay-validated oracle; spu sentinel = `0xC0FFEECA`,
+  ea_status = `0xCAFEA57E` (both canonical, both byte-identical
+  across the three execution paths)
+
+### 14.3 R8.1 hard rules carried forward to R8.2+
+
+The § 11 rules ("Explicit refusal of fake DMA") plus § 13.5
+("Hard rules carried forward to R7") continue verbatim into
+R8.2+. The PUT branch specifically adds these:
+
+- No silent fake-PUT path. If the SPU's LS bytes diverge from
+  the captured chunk, the state machine reports
+  `PutLsBytesMismatch` with `{tag, lsa, size, first_diff_offset,
+  captured, observed}` — never coerced to make replay pass.
+- No manual `.dmachunk` editing. The PUT chunk is captured at
+  runtime from `this->ls + mfc_lsa` and content-addressed by
+  SHA-256; hand-editing the file breaks the SHA pin in the
+  `spu_mfc_cmd` event.
+- PUT scope explicitly excludes list (PUTL/PUTLB), atomic
+  (PUTLLC/PUTLLUC/PUTQLLUC), and barrier/fence variants. R8.1
+  fixture targets cmd 0x20 ONLY; the parser canary moves to
+  cmd 0x44 GETL to keep the rejection surface tight.

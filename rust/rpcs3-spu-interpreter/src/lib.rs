@@ -870,61 +870,81 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
         0x10D => {
             let channel = ra(inst) as u32 & 0x7F;
             let value = split_lanes(spu.gpr[rt(inst)])[0];
-            // R7.2 — runtime DMA GET callback path for ch21 (MFC_Cmd).
-            // When the C++ bridge has installed a `dma_get_callback`,
-            // we intercept the wrch BEFORE delegating to
-            // `SpuChannels::write` so the callback can execute the
-            // real EA→LS DMA via RPCS3 vm:: memory. Pre-conditions:
-            // ch16-20 wrch already populated mfc_lsa / eah / eal /
-            // size / tag_id; the captured MFC param state is read
-            // straight from `spu.channels`. Validation mirrors the
-            // R6.7 design § 3 supported subset (cmd=0x40, eah=0,
-            // tag<32, size in {1,2,4,8} ∪ {16k | k>0, 16k<=16384},
-            // lsa+size<=256 KiB). Any failure surfaces as
-            // `MfcUnsupported` so the bridge falls back honestly.
-            if channel == 21 /* MFC_CMD */ {
-                if let Some(cb) = spu.channels.dma_get_callback {
-                    let cmd = value & 0xff;
-                    if cmd != 0x40 {
-                        // Non-GET cmd (PUT, list, atomic, etc.) — out of R7.2 scope.
-                        return Ok(StepOutcome::MfcUnsupported {
-                            channel,
-                            is_write: true,
-                            is_count: false,
-                        });
-                    }
-                    let lsa = spu.channels.mfc_lsa as usize;
-                    let eah = spu.channels.mfc_eah;
-                    let eal = spu.channels.mfc_eal;
-                    let size = spu.channels.mfc_size as usize;
-                    let tag = spu.channels.mfc_tag_id;
-                    let size_ok = size > 0
-                        && size <= 0x4000
-                        && (matches!(size, 1 | 2 | 4 | 8) || size.is_multiple_of(16));
-                    let lsa_ok = lsa.checked_add(size).map_or(false, |end| end <= SPU_LS_SIZE);
-                    if eah == 0 && tag < 32 && size_ok && lsa_ok {
-                        // Pointer into Rust's LS at `lsa`, valid for
-                        // `size` bytes. The callback writes EA bytes
-                        // here via memcpy; ownership stays with the
-                        // SPU thread for the duration of the call.
-                        let dst_ptr = unsafe { spu.ls_mut_ptr_unchecked(lsa as u32) };
-                        let rc = unsafe { (cb.func)(cb.user_data, eal, dst_ptr, size as u32, tag) };
-                        if rc == 0 {
-                            spu.channels.mfc_tag_stat_queue.push_back(1u32 << tag);
-                            spu.pc = pc.wrapping_add(4);
-                            return Ok(StepOutcome::Continue);
+            // R7.2 / R8.1 — runtime DMA callback path for ch21
+            // (MFC_Cmd). When the C++ bridge has installed a GET or
+            // PUT callback, we intercept the wrch BEFORE delegating
+            // to `SpuChannels::write` so the appropriate callback
+            // can execute the real DMA via RPCS3 vm:: memory.
+            // Pre-conditions: ch16-20 wrch already populated mfc_lsa
+            // / eah / eal / size / tag_id; the captured MFC param
+            // state is read straight from `spu.channels`. Validation
+            // mirrors the R6.7 design § 3 supported subset (cmd ∈
+            // {0x40, 0x20}, eah=0, tag<32, size in {1,2,4,8} ∪
+            // {16k | k>0, 16k<=16384}, lsa+size<=256 KiB). Any
+            // validation failure surfaces as `MfcUnsupported` so the
+            // bridge falls back honestly.
+            if channel == 21 /* MFC_CMD */
+                && (spu.channels.dma_get_callback.is_some()
+                    || spu.channels.dma_put_callback.is_some())
+            {
+                let cmd = value & 0xff;
+                let lsa = spu.channels.mfc_lsa as usize;
+                let eah = spu.channels.mfc_eah;
+                let eal = spu.channels.mfc_eal;
+                let size = spu.channels.mfc_size as usize;
+                let tag = spu.channels.mfc_tag_id;
+                let size_ok = size > 0
+                    && size <= 0x4000
+                    && (matches!(size, 1 | 2 | 4 | 8) || size.is_multiple_of(16));
+                let lsa_ok = lsa.checked_add(size).map_or(false, |end| end <= SPU_LS_SIZE);
+                let validated = eah == 0 && tag < 32 && size_ok && lsa_ok;
+                if validated {
+                    if cmd == 0x40 {
+                        if let Some(cb) = spu.channels.dma_get_callback {
+                            // R7.2 GET: callback writes into LS.
+                            let dst_ptr = unsafe { spu.ls_mut_ptr_unchecked(lsa as u32) };
+                            let rc = unsafe {
+                                (cb.func)(cb.user_data, eal, dst_ptr, size as u32, tag)
+                            };
+                            if rc == 0 {
+                                spu.channels.mfc_tag_stat_queue.push_back(1u32 << tag);
+                                spu.pc = pc.wrapping_add(4);
+                                return Ok(StepOutcome::Continue);
+                            }
+                        }
+                    } else if cmd == 0x20 {
+                        if let Some(cb) = spu.channels.dma_put_callback {
+                            // R8.1 PUT: callback reads from LS as
+                            // read-only source. We take a `*const u8`
+                            // by reborrowing the LS slice.
+                            let src_ptr = unsafe {
+                                spu.ls_mut_ptr_unchecked(lsa as u32) as *const u8
+                            };
+                            let rc = unsafe {
+                                (cb.func)(cb.user_data, eal, src_ptr, size as u32, tag)
+                            };
+                            if rc == 0 {
+                                spu.channels.mfc_tag_stat_queue.push_back(1u32 << tag);
+                                spu.pc = pc.wrapping_add(4);
+                                return Ok(StepOutcome::Continue);
+                            }
                         }
                     }
-                    // Validation failure OR callback refused — honest fallback.
-                    return Ok(StepOutcome::MfcUnsupported {
-                        channel,
-                        is_write: true,
-                        is_count: false,
-                    });
+                    // cmd not in {0x40, 0x20} OR callback missing for
+                    // this cmd direction OR callback returned non-zero
+                    // — fall through to MfcUnsupported.
                 }
-                // No callback installed: fall through to SpuChannels::write
-                // (which applies the R7.1 refuse_mfc gate or, in replay
-                // mode with refuse_mfc=false, the Phase C no-op).
+                return Ok(StepOutcome::MfcUnsupported {
+                    channel,
+                    is_write: true,
+                    is_count: false,
+                });
+            }
+            if channel == 21 {
+                // No callback installed: fall through to
+                // SpuChannels::write (which applies the R7.1 refuse
+                // gate or, in replay mode with refuse_mfc=false, the
+                // Phase C no-op).
             }
             match spu.channels.write(channel, value) {
                 Ok(()) => {
