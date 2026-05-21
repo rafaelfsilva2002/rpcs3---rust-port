@@ -1,12 +1,21 @@
 # single_spu_dma_getl_v1.notes.md
 
-R8.4b — first MFC GETL (list-DMA EA→LS) capture. **NOT YET A
-REPLAY-VALIDATED ORACLE.** R8.4b scope is writer extension +
-real capture + parser deserialization only; the replay state
-machine + transformer still REJECT this trace with
-`UnsupportedMfcListCmd` (R8.4a canary preserved). The
-oracle promotion lands in R8.4c (replay state machine for
-list cmds) and R8.4d (runtime bridge + 13th oracle).
+R8.4b — first MFC GETL (list-DMA EA→LS) capture. **R8.4c
+PROMOTED TO 13TH REPLAY-VALIDATED ORACLE** (2026-05-21).
+
+Update history:
+- R8.4b (2026-05-21): writer extension + real capture only.
+  Replay state machine rejected via R8.4a canary.
+- R8.4c (2026-05-21): replay state machine landed
+  (`MfcReplayState::process_mfc_list_cmd`), R8.4a canary
+  lifted for cmd 0x44 only, side-file resolver
+  `resolve_dma_listdesc_side_file` added, **promoted to
+  13th replay-validated oracle**. Cross-backend
+  byte-identical via `diff_snapshots(interp, jit)
+  .is_identical()` confirmed.
+- R8.4d (pending): runtime bridge GETL callback +
+  triple-symmetry expansion. Until then, bridge ON falls
+  back to C++ at the GETL dispatch.
 
 Captured 2026-05-21 from RPCS3 against a CC0 PSL1GHT
 homebrew authored for this purpose.
@@ -126,32 +135,35 @@ element_chunks, element_sizes, element_eals).
   `UnsupportedMfcListCmd { cmd: 0x44, .. }` (R8.4a canary
   preserved — replay/transform still rejects per design)        ✓
 
-## NOT YET IMPLEMENTED (R8.4c+ scope)
+## R8.4c — IMPLEMENTED
 
-- `MfcReplayState::process_mfc_list_cmd` (R8.4c) — walks
-  descriptor, OR-loads element chunks into LS at cumulative
-  offsets.
-- New side-file resolver for `.dmalistdesc` (R8.4c).
-- `apply_mfc_dma_pre_replay` extension to handle list cmds
-  (R8.4c).
-- Runtime bridge `rust_spu_set_dma_getl_callback` (R8.4d).
-- 13th oracle promotion: replay test that loads this trace
-  and proves cross-backend byte-identical (R8.4d).
+- `MfcReplayState::process_mfc_list_cmd` ✓ landed: walks
+  descriptor (8-byte BE slots: sb / pad / u16 ts / u32 ea),
+  validates per-element (sb stall-and-notify bit MUST be 0,
+  ts in (0, 0x4000], descriptor ts/ea must match trace
+  event's `element_sizes` / `element_eals`), loads each
+  element chunk via existing `.dmachunk` resolver, copies
+  bytes into LS at cumulative offset (`lsa_base + sum of
+  prior ts`), registers in-flight tag with the size = sum
+  of ts.
+- `resolve_dma_listdesc_side_file` ✓ added to
+  `dma_chunk.rs` (mirror of `resolve_dma_chunk_side_file`
+  with `.dmalistdesc` extension + 0x800 size cap).
+- `apply_mfc_dma_pre_replay` ✓ dispatches cmd=0x44 to the
+  new path via `process_mfc_cmd_pre_replay`.
+- R8.4a canary `UnsupportedMfcListCmd` ✓ lifted for cmd=
+  0x44 ONLY (PUTL/PUTLB/PUTLF/GETLB/GETLF still rejected;
+  canary unit test updated to iterate only the 5
+  unsupported codes).
 
-The `single_spu_dma_getl_v1.jsonl` trace is committed here as
-a regression sentinel against the writer extension AND as the
-input that R8.4c/d will consume. It is NOT YET a replay-
-validated oracle.
+## R8.4d (still pending)
 
-## Why GETL captured but not yet replayed
-
-R8.4b is the minimum delivery to land the writer changes
-without simultaneously landing replay execution. This isolates
-diagnostic surfaces: if a future capture run produces a
-malformed descriptor or wrong element bytes, the bug is
-clearly in the writer/capture path, not in the state machine.
-R8.4c will lift the canary AND add the state machine in one
-coherent delivery, with this JSONL as its first input.
+- Runtime bridge `rust_spu_set_dma_getl_callback` FFI.
+- C++ bridge handler in `SPURustBridge.cpp` (read
+  descriptor from SPU's LS, walk elements, copy each from
+  `vm::_ptr<u8>(ea)` to LS at cumulative offset).
+- rpcs3.exe rebuild + bridge patch SHA bump.
+- Triple-symmetry expansion for `--fixture get_list`.
 
 ## Stability
 

@@ -1019,29 +1019,28 @@ const MFC_GET_CMD: u32 = 0x40;
 /// the interpreter reaches `wrch ch21`).
 const MFC_PUT_CMD: u32 = 0x20;
 
-/// R8.4a — MFC list-DMA command codes. Currently rejected with the
-/// granular [`TraceParseError::UnsupportedMfcListCmd`] (vs the generic
-/// [`TraceParseError::UnsupportedMfcCmd`]) so downstream tooling can
-/// distinguish "in roadmap" from "out of scope".
+/// R8.4a — MFC list-DMA command codes (full set). Codes not yet
+/// implemented surface the granular [`TraceParseError::UnsupportedMfcListCmd`]
+/// (vs the generic [`TraceParseError::UnsupportedMfcCmd`]).
 ///
 /// Codes per `rpcs3-upstream-clean/rpcs3/Emu/Cell/MFC.h:7-15`:
 ///
-/// | Code | Mnemonic | Direction | Modifiers          |
-/// |------|----------|-----------|--------------------|
-/// | 0x24 | PUTL     | LS → EA   | list               |
-/// | 0x25 | PUTLB    | LS → EA   | list + barrier     |
-/// | 0x26 | PUTLF    | LS → EA   | list + fence       |
-/// | 0x44 | GETL     | EA → LS   | list               |
-/// | 0x45 | GETLB    | EA → LS   | list + barrier     |
-/// | 0x46 | GETLF    | EA → LS   | list + fence       |
+/// | Code | Mnemonic | Direction | Modifiers          | Phase             |
+/// |------|----------|-----------|--------------------|-------------------|
+/// | 0x24 | PUTL     | LS → EA   | list               | R8.4e+ deferred   |
+/// | 0x25 | PUTLB    | LS → EA   | list + barrier     | R8.4e+ deferred   |
+/// | 0x26 | PUTLF    | LS → EA   | list + fence       | R8.4e+ deferred   |
+/// | 0x44 | GETL     | EA → LS   | list               | **R8.4c accepts** |
+/// | 0x45 | GETLB    | EA → LS   | list + barrier     | R8.4f deferred    |
+/// | 0x46 | GETLF    | EA → LS   | list + fence       | R8.4f deferred    |
 ///
-/// R8.4b/c/d will progressively implement GETL replay + runtime.
-/// PUTL is deferred to R8.5+ (LS-source side has the same shape but
-/// inverts data direction; the list descriptor walk is identical).
-const MFC_LIST_CMDS: &[u32] = &[0x24, 0x25, 0x26, 0x44, 0x45, 0x46];
+/// R8.4c lifts the canary for 0x44 GETL only. The other five codes
+/// continue to reject with `UnsupportedMfcListCmd`.
+const MFC_GETL_CMD: u32 = 0x44;
+const MFC_LIST_CMDS_UNSUPPORTED: &[u32] = &[0x24, 0x25, 0x26, 0x45, 0x46];
 
-fn is_mfc_list_cmd(cmd: u32) -> bool {
-    MFC_LIST_CMDS.contains(&cmd)
+fn is_mfc_list_cmd_unsupported(cmd: u32) -> bool {
+    MFC_LIST_CMDS_UNSUPPORTED.contains(&cmd)
 }
 
 /// R6.7 A.2 — MFC tag is a 5-bit field (`ch_mfc_cmd.tag & 0x1f`).
@@ -1244,16 +1243,16 @@ fn validate_spu_image_event(e: &SpuImageEvent, line: usize) -> Result<(), TraceP
 fn validate_spu_mfc_cmd_event(e: &SpuMfcCmdEvent, line: usize) -> Result<(), TraceParseError> {
     check_pc(line, e.seq, e.pc)?;
 
-    // R6.7: only GET (0x40). R8.1: also PUT (0x20). R8.4a:
-    // list-DMA codes (PUTL/PUTLB/PUTLF = 0x24-0x26,
-    // GETL/GETLB/GETLF = 0x44-0x46) surface as the more granular
-    // `UnsupportedMfcListCmd` so downstream tooling can
-    // distinguish "in roadmap" from "out of scope". Everything
-    // else (atomic GETLLAR/PUTLLC/..., barriers, sync,
-    // signal-notification) still surfaces the generic
-    // `UnsupportedMfcCmd` — schema remains strict-additive.
-    if e.cmd != MFC_GET_CMD && e.cmd != MFC_PUT_CMD {
-        if is_mfc_list_cmd(e.cmd) {
+    // R6.7: only GET (0x40). R8.1: also PUT (0x20). R8.4c: GETL
+    // (0x44) also accepted, BUT with stricter additive-fields
+    // validation (descriptor_sha256, descriptor_size,
+    // element_chunks, element_sizes, element_eals must all be
+    // present and internally consistent). Other list-DMA codes
+    // (PUTL/PUTLB/PUTLF/GETLB/GETLF) still surface
+    // `UnsupportedMfcListCmd`. Everything else (atomic, barrier,
+    // sync, sndsig) still surfaces the generic `UnsupportedMfcCmd`.
+    if e.cmd != MFC_GET_CMD && e.cmd != MFC_PUT_CMD && e.cmd != MFC_GETL_CMD {
+        if is_mfc_list_cmd_unsupported(e.cmd) {
             return Err(TraceParseError::UnsupportedMfcListCmd {
                 line,
                 seq: e.seq,
@@ -1267,6 +1266,41 @@ fn validate_spu_mfc_cmd_event(e: &SpuMfcCmdEvent, line: usize) -> Result<(), Tra
             target_spu: e.target_spu,
             cmd: e.cmd,
         });
+    }
+
+    // R8.4c — GETL additive-fields validation. For cmd=0x44, all
+    // five list fields MUST be present AND internally consistent:
+    //   - descriptor_sha256 = 64 lower-hex
+    //   - descriptor_size = e.size, multiple of 8, > 0, <= 0x800
+    //   - element_chunks.len() == element_sizes.len()
+    //     == element_eals.len() == descriptor_size / 8
+    //   - each element_chunks entry = 64 lower-hex
+    //   - each element_sizes entry > 0, <= 0x4000 (R6.7 simple-cmd cap)
+    //   - each element_eals.eah = 0 (mirrors simple-cmd validation
+    //     which enforces eah=0 on the parent event)
+    //
+    // For GET/PUT (0x40 / 0x20), the additive fields MUST be
+    // absent (writer convention — schema additive).
+    if e.cmd == MFC_GETL_CMD {
+        validate_getl_additive_fields(e, line)?;
+    } else {
+        // R8.4c — for non-list cmds, the additive list fields
+        // MUST be absent. Reject defensively if the writer ever
+        // populates them on a simple GET/PUT (would indicate a
+        // writer bug).
+        if e.descriptor_sha256.is_some()
+            || e.descriptor_size.is_some()
+            || e.element_chunks.is_some()
+            || e.element_sizes.is_some()
+            || e.element_eals.is_some()
+        {
+            return Err(TraceParseError::UnsupportedMfcCmd {
+                line,
+                seq: e.seq,
+                target_spu: e.target_spu,
+                cmd: e.cmd,
+            });
+        }
     }
 
     if e.eah != 0 {
@@ -1285,6 +1319,23 @@ fn validate_spu_mfc_cmd_event(e: &SpuMfcCmdEvent, line: usize) -> Result<(), Tra
             target_spu: e.target_spu,
             tag: e.tag,
         });
+    }
+
+    // R8.4c — GETL: size/lsa validation is GETL-specific
+    // (size = descriptor bytes, multiple of 8; lsa = dest base,
+    // independent of descriptor size). The simple-cmd checks
+    // below would reject valid GETL events (e.g. size=24 with
+    // 3 elements isn't a multiple of 16). The additive-fields
+    // validation called above (`validate_getl_additive_fields`)
+    // already enforced size constraints + per-element sanity;
+    // ea_chunk_sha256 was validated as a 64-hex string by the
+    // writer's overload convention.
+    if e.cmd == MFC_GETL_CMD {
+        // Validate ea_chunk_sha256 shape (writer overloads it to
+        // the descriptor SHA for GETL; we still require valid
+        // 64-hex lowercase).
+        validate_sha_hex_field(e, line, &e.ea_chunk_sha256, "ea_chunk_sha256")?;
+        return Ok(());
     }
 
     // Size: 1, 2, 4, 8 OR multiple of 16 in [16, 16384].
@@ -1368,6 +1419,169 @@ fn validate_spu_mfc_cmd_event(e: &SpuMfcCmdEvent, line: usize) -> Result<(), Tra
             target_spu: e.target_spu,
             reason: "ea_chunk_sha256 must be lowercase [0-9a-f] only (no uppercase, no non-hex)",
         });
+    }
+
+    Ok(())
+}
+
+/// R8.4c — validate a 64-char lowercase hex SHA string field on
+/// an MFC cmd event. Used for `ea_chunk_sha256` (GETL overload)
+/// and `descriptor_sha256` + each `element_chunks[i]`. Mirrors
+/// the existing inline ea_chunk_sha256 validation in
+/// `validate_spu_mfc_cmd_event`.
+fn validate_sha_hex_field(
+    e: &SpuMfcCmdEvent,
+    line: usize,
+    sha: &str,
+    field_name: &'static str,
+) -> Result<(), TraceParseError> {
+    if sha.len() != 64 {
+        // Reuse `BadDmaSha` — the operational meaning ("bad SHA
+        // string in MFC event") transfers exactly; the `reason`
+        // string carries the field-specific context.
+        return Err(TraceParseError::BadDmaSha {
+            line,
+            seq: e.seq,
+            target_spu: e.target_spu,
+            reason: match field_name {
+                "ea_chunk_sha256" => "ea_chunk_sha256 must be exactly 64 hex chars",
+                "descriptor_sha256" => "descriptor_sha256 must be exactly 64 hex chars",
+                "element_chunks[i]" => "element_chunks[i] must be exactly 64 hex chars",
+                _ => "sha256 field must be exactly 64 hex chars",
+            },
+        });
+    }
+    if !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(TraceParseError::BadDmaSha {
+            line,
+            seq: e.seq,
+            target_spu: e.target_spu,
+            reason: match field_name {
+                "ea_chunk_sha256" => {
+                    "ea_chunk_sha256 must be lowercase [0-9a-f] only (no uppercase, no non-hex)"
+                }
+                "descriptor_sha256" => {
+                    "descriptor_sha256 must be lowercase [0-9a-f] only (no uppercase, no non-hex)"
+                }
+                "element_chunks[i]" => {
+                    "element_chunks[i] must be lowercase [0-9a-f] only (no uppercase, no non-hex)"
+                }
+                _ => "sha256 field must be lowercase [0-9a-f] only",
+            },
+        });
+    }
+    Ok(())
+}
+
+/// R8.4c — validate the five additive list-DMA fields on a GETL
+/// `spu_mfc_cmd` event. All must be present; descriptor_size
+/// must match `e.size`; element counts must match
+/// `descriptor_size / 8`; per-element constraints (size > 0,
+/// size <= 0x4000, sha shape valid). The structural rejection
+/// of `sb` stall-and-notify bit + descriptor parsing per-element
+/// (8-byte BE layout) happens later in the state machine
+/// (`MfcReplayState::process_mfc_list_cmd`) — the parser only
+/// validates the JSONL schema shape.
+fn validate_getl_additive_fields(
+    e: &SpuMfcCmdEvent,
+    line: usize,
+) -> Result<(), TraceParseError> {
+    // All five fields MUST be Some.
+    let desc_sha = e.descriptor_sha256.as_ref().ok_or(
+        TraceParseError::UnsupportedMfcCmd {
+            line,
+            seq: e.seq,
+            target_spu: e.target_spu,
+            cmd: e.cmd,
+        },
+    )?;
+    let desc_size = e.descriptor_size.ok_or(
+        TraceParseError::UnsupportedMfcCmd {
+            line,
+            seq: e.seq,
+            target_spu: e.target_spu,
+            cmd: e.cmd,
+        },
+    )?;
+    let elements = e.element_chunks.as_ref().ok_or(
+        TraceParseError::UnsupportedMfcCmd {
+            line,
+            seq: e.seq,
+            target_spu: e.target_spu,
+            cmd: e.cmd,
+        },
+    )?;
+    let sizes = e.element_sizes.as_ref().ok_or(
+        TraceParseError::UnsupportedMfcCmd {
+            line,
+            seq: e.seq,
+            target_spu: e.target_spu,
+            cmd: e.cmd,
+        },
+    )?;
+    let eals = e.element_eals.as_ref().ok_or(
+        TraceParseError::UnsupportedMfcCmd {
+            line,
+            seq: e.seq,
+            target_spu: e.target_spu,
+            cmd: e.cmd,
+        },
+    )?;
+
+    // descriptor_sha256 = 64-hex
+    validate_sha_hex_field(e, line, desc_sha, "descriptor_sha256")?;
+
+    // descriptor_size = e.size, multiple of 8, > 0, <= 0x800.
+    if desc_size != e.size {
+        return Err(TraceParseError::BadDmaSize {
+            line,
+            seq: e.seq,
+            target_spu: e.target_spu,
+            size: desc_size,
+            reason: "descriptor_size must equal spu_mfc_cmd.size",
+        });
+    }
+    if desc_size == 0 || desc_size > 0x800 || desc_size & 0x7 != 0 {
+        return Err(TraceParseError::BadDmaSize {
+            line,
+            seq: e.seq,
+            target_spu: e.target_spu,
+            size: desc_size,
+            reason: "GETL descriptor_size must be in (0, 0x800] and multiple of 8",
+        });
+    }
+
+    // Element-count consistency.
+    let element_count = (desc_size / 8) as usize;
+    if elements.len() != element_count
+        || sizes.len() != element_count
+        || eals.len() != element_count
+    {
+        return Err(TraceParseError::MalformedMfcSequence {
+            target_spu: e.target_spu,
+            wrch_event_index: line,
+            reason: "GETL element_chunks / element_sizes / element_eals length must equal descriptor_size / 8",
+        });
+    }
+
+    // Per-element validation.
+    for (i, chunk_sha) in elements.iter().enumerate() {
+        validate_sha_hex_field(e, line, chunk_sha, "element_chunks[i]")?;
+        let ts = sizes[i];
+        if ts == 0 || ts > MFC_DMA_SIZE_MAX {
+            return Err(TraceParseError::BadDmaSize {
+                line,
+                seq: e.seq,
+                target_spu: e.target_spu,
+                size: ts,
+                reason: "GETL element_sizes[i] must be in (0, 0x4000] (R6.7 simple-cmd per-element cap)",
+            });
+        }
+        // EAL = data EA for element i. No constraint beyond u32
+        // (eah=0 enforced on the parent event; per-element eah
+        // is implicitly 0). Index into `eals` here is just for
+        // length consistency — value range is unconstrained.
+        let _eal = eals[i];
     }
 
     Ok(())
@@ -3146,15 +3360,17 @@ mod tests {
         );
     }
 
-    /// R8.4a — all six list-DMA codes (PUTL/PUTLB/PUTLF =
-    /// 0x24/0x25/0x26, GETL/GETLB/GETLF = 0x44/0x45/0x46) surface
-    /// the granular `UnsupportedMfcListCmd` variant. This lets
-    /// downstream tooling distinguish "list-DMA, in R8.4 roadmap"
-    /// from "out of scope entirely" (atomic / barrier / sync,
-    /// covered by the generic `UnsupportedMfcCmd`).
+    /// R8.4a + R8.4c — list-DMA codes NOT YET supported
+    /// (PUTL/PUTLB/PUTLF = 0x24/0x25/0x26, GETLB/GETLF =
+    /// 0x45/0x46) surface the granular `UnsupportedMfcListCmd`
+    /// variant. R8.4c LIFTED the canary for GETL (0x44) only —
+    /// covered separately by `r8_4c_getl_parses_and_validates`.
     #[test]
     fn reject_mfc_list_cmds_with_granular_canary() {
-        let list_cmds: &[u32] = &[0x24, 0x25, 0x26, 0x44, 0x45, 0x46];
+        // R8.4c update: 0x44 GETL removed from this iterator
+        // (now accepted by the parser; covered by
+        // `r8_4c_getl_parses_and_validates`).
+        let list_cmds: &[u32] = &[0x24, 0x25, 0x26, 0x45, 0x46];
         for &cmd in list_cmds {
             let jsonl = format!(
                 r#"
@@ -3175,21 +3391,14 @@ mod tests {
         }
     }
 
-    /// R8.4b — when the writer emits a real GETL `spu_mfc_cmd`
+    /// R8.4c — when the writer emits a real GETL `spu_mfc_cmd`
     /// event (with all the additive descriptor / element fields),
-    /// the parser MUST:
-    ///   1. Successfully deserialize the event (the additive
-    ///      fields populate the `Option<>` slots on
-    ///      `SpuMfcCmdEvent`).
-    ///   2. STILL reject with `UnsupportedMfcListCmd` (R8.4a
-    ///      canary preserved; R8.4c lifts).
-    /// This test consumes a GETL JSONL slice patterned after the
-    /// real `single_spu_dma_getl_v1.jsonl` capture.
+    /// the parser MUST now ACCEPT it (R8.4a canary lifted for
+    /// 0x44 only). The replay state machine consumes the
+    /// additive fields; the transformer treats it as DMA
+    /// context (same path as simple GET/PUT post-R6.7 C.5).
     #[test]
-    fn r8_4b_getl_parses_additive_fields_but_still_rejects() {
-        // Two 64-hex SHAs (placeholder values; the parser
-        // validates length + lower-hex but doesn't resolve the
-        // side-files here).
+    fn r8_4c_getl_parses_and_validates() {
         let desc_sha = "11".repeat(32);
         let elem1_sha = "22".repeat(32);
         let elem2_sha = "33".repeat(32);
@@ -3199,48 +3408,84 @@ mod tests {
 {{"seq":1,"side":"spu","kind":"spu_mfc_cmd","target_spu":1,"pc":256,"cmd":68,"tag":3,"size":16,"lsa":65536,"eah":0,"eal":384,"ea_chunk_sha256":"{desc_sha}","descriptor_sha256":"{desc_sha}","descriptor_size":16,"element_chunks":["{elem1_sha}","{elem2_sha}"],"element_sizes":[128,64],"element_eals":[268505472,268505600]}}
 "#
         );
-        let err = parse_jsonl_trace(&jsonl)
-            .expect_err("GETL cmd must still reject at validate");
-        match err {
-            TraceParseError::UnsupportedMfcListCmd { cmd: 0x44, .. } => {}
-            other => panic!(
-                "R8.4b: GETL should reject with UnsupportedMfcListCmd, got {other:?}"
-            ),
-        }
-        // The line WAS deserialized successfully before the
-        // validate step — proof via a parallel raw-deserialize:
-        // strip the wrch line and deserialize the mfc_cmd line
-        // directly to confirm all additive fields parsed.
-        let raw_mfc_line = format!(
-            r#"{{"seq":1,"side":"spu","kind":"spu_mfc_cmd","target_spu":1,"pc":256,"cmd":68,"tag":3,"size":16,"lsa":65536,"eah":0,"eal":384,"ea_chunk_sha256":"{desc_sha}","descriptor_sha256":"{desc_sha}","descriptor_size":16,"element_chunks":["{elem1_sha}","{elem2_sha}"],"element_sizes":[128,64],"element_eals":[268505472,268505600]}}"#
-        );
-        let parsed: CapturedEvent = serde_json::from_str(&raw_mfc_line)
-            .expect("R8.4b: GETL spu_mfc_cmd event must deserialize");
-        match parsed {
-            CapturedEvent::SpuMfcCmd(m) => {
-                assert_eq!(m.cmd, 0x44);
-                assert_eq!(m.size, 16);
-                assert_eq!(m.eal, 384);
-                assert_eq!(m.descriptor_sha256.as_deref(), Some(desc_sha.as_str()));
-                assert_eq!(m.descriptor_size, Some(16));
-                assert_eq!(
-                    m.element_chunks.as_deref(),
-                    Some(&[elem1_sha.clone(), elem2_sha.clone()][..]),
-                    "element_chunks must round-trip"
-                );
-                assert_eq!(
-                    m.element_sizes.as_deref(),
-                    Some(&[128u32, 64u32][..]),
-                    "element_sizes must round-trip"
-                );
-                assert_eq!(
-                    m.element_eals.as_deref(),
-                    Some(&[268505472u32, 268505600u32][..]),
-                    "element_eals must round-trip"
-                );
-            }
+        let events = parse_jsonl_trace(&jsonl)
+            .expect("R8.4c: GETL with valid additive fields must parse");
+        // Should be 2 events (wrch + spu_mfc_cmd).
+        assert_eq!(events.len(), 2);
+        let mfc = match &events[1] {
+            CapturedEvent::SpuMfcCmd(m) => m,
             other => panic!("expected SpuMfcCmd, got {other:?}"),
-        }
+        };
+        assert_eq!(mfc.cmd, 0x44);
+        assert_eq!(mfc.descriptor_size, Some(16));
+        assert_eq!(mfc.element_chunks.as_ref().unwrap().len(), 2);
+        assert_eq!(mfc.element_sizes.as_deref(), Some(&[128u32, 64u32][..]));
+    }
+
+    /// R8.4c — GETL with missing additive fields must reject.
+    #[test]
+    fn r8_4c_getl_rejects_missing_descriptor_fields() {
+        let desc_sha = "11".repeat(32);
+        // descriptor_sha256 present but descriptor_size missing
+        // → must reject.
+        let jsonl_missing_size = format!(
+            r#"
+{{"seq":0,"side":"spu","kind":"spu_wrch","pc":256,"channel":21,"value":68,"would_stall":false,"target_spu":1}}
+{{"seq":1,"side":"spu","kind":"spu_mfc_cmd","target_spu":1,"pc":256,"cmd":68,"tag":3,"size":16,"lsa":65536,"eah":0,"eal":384,"ea_chunk_sha256":"{desc_sha}","descriptor_sha256":"{desc_sha}"}}
+"#
+        );
+        let err = parse_jsonl_trace(&jsonl_missing_size)
+            .expect_err("GETL with missing descriptor_size must reject");
+        assert!(matches!(err, TraceParseError::UnsupportedMfcCmd { cmd: 0x44, .. }), "got {err:?}");
+    }
+
+    /// R8.4c — GETL with descriptor_size != e.size must reject.
+    #[test]
+    fn r8_4c_getl_rejects_inconsistent_descriptor_size() {
+        let desc_sha = "11".repeat(32);
+        let elem_sha = "22".repeat(32);
+        // size=16 but descriptor_size=24 → inconsistent.
+        let jsonl = format!(
+            r#"
+{{"seq":0,"side":"spu","kind":"spu_wrch","pc":256,"channel":21,"value":68,"would_stall":false,"target_spu":1}}
+{{"seq":1,"side":"spu","kind":"spu_mfc_cmd","target_spu":1,"pc":256,"cmd":68,"tag":3,"size":16,"lsa":65536,"eah":0,"eal":384,"ea_chunk_sha256":"{desc_sha}","descriptor_sha256":"{desc_sha}","descriptor_size":24,"element_chunks":["{elem_sha}","{elem_sha}","{elem_sha}"],"element_sizes":[8,8,8],"element_eals":[4096,8192,12288]}}
+"#
+        );
+        let err = parse_jsonl_trace(&jsonl)
+            .expect_err("GETL with inconsistent descriptor_size must reject");
+        assert!(matches!(err, TraceParseError::BadDmaSize { size: 24, .. }), "got {err:?}");
+    }
+
+    /// R8.4c — GETL with element count mismatch must reject.
+    #[test]
+    fn r8_4c_getl_rejects_element_count_mismatch() {
+        let desc_sha = "11".repeat(32);
+        let elem_sha = "22".repeat(32);
+        // size=16 → expect 2 elements, but only 1 in element_chunks
+        let jsonl = format!(
+            r#"
+{{"seq":0,"side":"spu","kind":"spu_wrch","pc":256,"channel":21,"value":68,"would_stall":false,"target_spu":1}}
+{{"seq":1,"side":"spu","kind":"spu_mfc_cmd","target_spu":1,"pc":256,"cmd":68,"tag":3,"size":16,"lsa":65536,"eah":0,"eal":384,"ea_chunk_sha256":"{desc_sha}","descriptor_sha256":"{desc_sha}","descriptor_size":16,"element_chunks":["{elem_sha}"],"element_sizes":[128],"element_eals":[4096]}}
+"#
+        );
+        let err = parse_jsonl_trace(&jsonl)
+            .expect_err("GETL with element count mismatch must reject");
+        assert!(matches!(err, TraceParseError::MalformedMfcSequence { .. }), "got {err:?}");
+    }
+
+    /// R8.4c — non-list cmds (GET/PUT) with stray list fields
+    /// MUST reject (writer-bug defense).
+    #[test]
+    fn r8_4c_simple_get_with_stray_list_fields_rejects() {
+        let sha = TEST_VALID_SHA.to_string();
+        let jsonl = format!(
+            r#"
+{{"seq":0,"side":"spu","kind":"spu_wrch","pc":256,"channel":21,"value":64,"would_stall":false,"target_spu":1}}
+{{"seq":1,"side":"spu","kind":"spu_mfc_cmd","target_spu":1,"pc":256,"cmd":64,"tag":3,"size":128,"lsa":0,"eah":0,"eal":4096,"ea_chunk_sha256":"{sha}","descriptor_sha256":"{sha}","descriptor_size":16}}
+"#
+        );
+        let err = parse_jsonl_trace(&jsonl).expect_err("GET with stray list fields must reject");
+        assert!(matches!(err, TraceParseError::UnsupportedMfcCmd { cmd: 0x40, .. }), "got {err:?}");
     }
 
     /// R8.4b — existing GET/PUT events (without the new

@@ -286,6 +286,124 @@ pub fn canonical_dma_chunk_path(canonical_dma_dir: &Path, sha256: &str) -> PathB
     canonical_dma_dir.join(format!("{sha256}.{DMA_CHUNK_EXTENSION}"))
 }
 
+/// R8.4b — `.dmalistdesc` (MFC list-DMA descriptor array) filename
+/// extension. Same content-addressed dedup convention as
+/// [`DMA_CHUNK_EXTENSION`]; the writer drops the file alongside the
+/// trace + canonical pool, and R8.4c's resolver below loads it the
+/// same way.
+pub const DMA_LISTDESC_EXTENSION: &str = "dmalistdesc";
+
+/// R8.4c — maximum descriptor array size in bytes. The writer caps
+/// at 2 KiB (= 256 elements × 8 bytes); the loader re-enforces.
+/// Anything larger surfaces as
+/// [`DmaChunkLoadError::DmaChunkTooLarge`] (variant reused — the
+/// "list descriptor too big" error has the same operational shape
+/// as "data chunk too big").
+pub const DMA_LISTDESC_SIZE_MAX: usize = 0x800;
+
+/// R8.4c — resolve a `.dmalistdesc` side-file by content-address
+/// SHA-256. Mirrors [`resolve_dma_chunk_side_file`] but reads from
+/// `<sha>.dmalistdesc` instead of `<sha>.dmachunk` and applies
+/// [`DMA_LISTDESC_SIZE_MAX`] instead of the per-element data cap.
+///
+/// **Steps** (identical contract to the chunk loader):
+/// 1. Defensive `sha256` shape check.
+/// 2. Path resolution: per-trace `<jsonl>.dma/<sha>.dmalistdesc`
+///    first, canonical `behavior-freeze/fixtures/spu/dma/<sha>.dmalistdesc`
+///    fallback.
+/// 3. I/O read.
+/// 4. Empty-file check (the writer never emits 0-byte descriptors).
+/// 5. Hard cap (`size <= 0x800`).
+/// 6. `expected_size` match (if `Some`).
+/// 7. SHA-256 of bytes matches `sha256`.
+///
+/// Returns the descriptor bytes verbatim — the caller
+/// ([`crate::mfc_replay::MfcReplayState::process_mfc_list_cmd`])
+/// parses each 8-byte slot as `{ u8 sb; u8 pad; be_t<u16> ts;
+/// be_t<u32> ea; }` and walks the list.
+///
+/// Errors reuse the [`DmaChunkLoadError`] variants — the failure
+/// modes are structurally identical and the operational meaning
+/// transfers exactly (a missing list descriptor is the same
+/// "regenerate-the-side-file-or-fix-the-trace" problem as a
+/// missing data chunk).
+pub fn resolve_dma_listdesc_side_file(
+    trace_path: &Path,
+    canonical_dma_dir: &Path,
+    sha256: &str,
+    expected_size: Option<usize>,
+) -> Result<Vec<u8>, DmaChunkLoadError> {
+    validate_sha_string(sha256)?;
+
+    let per_trace_path = per_trace_dma_listdesc_path(trace_path, sha256);
+    let canonical_path = canonical_dma_listdesc_path(canonical_dma_dir, sha256);
+    let resolved = if per_trace_path.is_file() {
+        per_trace_path.clone()
+    } else if canonical_path.is_file() {
+        canonical_path.clone()
+    } else {
+        return Err(DmaChunkLoadError::MissingDmaChunk {
+            sha: sha256.to_owned(),
+            per_trace_path,
+            canonical_path,
+        });
+    };
+
+    let bytes = fs::read(&resolved).map_err(|e| DmaChunkLoadError::DmaChunkReadFailed {
+        path: resolved.clone(),
+        message: e.to_string(),
+    })?;
+
+    if bytes.is_empty() {
+        return Err(DmaChunkLoadError::DmaChunkEmpty { path: resolved });
+    }
+
+    if bytes.len() > DMA_LISTDESC_SIZE_MAX {
+        return Err(DmaChunkLoadError::DmaChunkTooLarge {
+            path: resolved,
+            size: bytes.len(),
+        });
+    }
+
+    if let Some(n) = expected_size {
+        if bytes.len() != n {
+            return Err(DmaChunkLoadError::DmaChunkSizeMismatch {
+                path: resolved,
+                expected: n,
+                actual: bytes.len(),
+            });
+        }
+    }
+
+    let actual_hex = sha256_hex_of(&bytes);
+    if actual_hex != sha256 {
+        return Err(DmaChunkLoadError::DmaChunkShaMismatch {
+            path: resolved,
+            expected: sha256.to_owned(),
+            actual: actual_hex,
+        });
+    }
+
+    Ok(bytes)
+}
+
+/// Compute `<trace_path>.dma/<sha>.dmalistdesc`. Public for the same
+/// reason as [`per_trace_dma_chunk_path`]: pre-flight checks.
+#[must_use]
+pub fn per_trace_dma_listdesc_path(trace_path: &Path, sha256: &str) -> PathBuf {
+    let mut dir = trace_path.as_os_str().to_owned();
+    dir.push(".dma");
+    let mut p = PathBuf::from(dir);
+    p.push(format!("{sha256}.{DMA_LISTDESC_EXTENSION}"));
+    p
+}
+
+/// Compute `<canonical_dma_dir>/<sha>.dmalistdesc`.
+#[must_use]
+pub fn canonical_dma_listdesc_path(canonical_dma_dir: &Path, sha256: &str) -> PathBuf {
+    canonical_dma_dir.join(format!("{sha256}.{DMA_LISTDESC_EXTENSION}"))
+}
+
 /// Defensive SHA-256-string shape check. Returns Ok iff `sha` is
 /// exactly 64 ASCII lowercase-hex chars (`[0-9a-f]{64}`). Anything
 /// else (length, casing, non-hex) → `BadDmaSha`.
@@ -612,6 +730,150 @@ mod tests {
         assert_eq!(
             cn,
             PathBuf::from("/repo/behavior-freeze/fixtures/spu/dma").join(format!("{sha}.dmachunk"))
+        );
+    }
+
+    // R8.4c — `.dmalistdesc` resolver tests. Same shape as the
+    // chunk loader tests but with the new extension + cap.
+
+    fn synthetic_listdesc(n_elements: usize) -> (Vec<u8>, String) {
+        // n_elements × 8 bytes. Pattern: sb=0, pad=0, ts=BE(64*i+128),
+        // ea=BE(0x10010000 + 64*i). Realistic but synthetic.
+        let mut bytes = Vec::with_capacity(n_elements * 8);
+        for i in 0..n_elements {
+            let ts: u16 = (64u16) + (i as u16 * 8);
+            let ea: u32 = 0x10010000u32 + (i as u32 * 64);
+            bytes.push(0u8); // sb
+            bytes.push(0u8); // pad
+            bytes.extend_from_slice(&ts.to_be_bytes());
+            bytes.extend_from_slice(&ea.to_be_bytes());
+        }
+        let hex = sha256_hex_of(&bytes);
+        (bytes, hex)
+    }
+
+    fn write_listdesc(dir: &Path, sha: &str, bytes: &[u8]) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("create listdesc dir");
+        let path = dir.join(format!("{sha}.dmalistdesc"));
+        let mut f = std::fs::File::create(&path).expect("create .dmalistdesc");
+        f.write_all(bytes).expect("write .dmalistdesc");
+        f.flush().expect("flush .dmalistdesc");
+        path
+    }
+
+    #[test]
+    fn listdesc_loader_resolves_per_trace_first() {
+        let tmp = TempDir::new().unwrap();
+        let trace_path = tmp.path().join("capture.jsonl");
+        let canonical = tmp.path().join("canonical");
+        std::fs::create_dir_all(&canonical).unwrap();
+
+        let (bytes, sha) = synthetic_listdesc(2);
+        let per_trace_dir = ensure_per_trace_dma_dir(&trace_path);
+        write_listdesc(&per_trace_dir, &sha, &bytes);
+
+        let loaded = resolve_dma_listdesc_side_file(
+            &trace_path, &canonical, &sha, Some(16),
+        ).expect("per-trace listdesc must resolve");
+        assert_eq!(loaded, bytes);
+    }
+
+    #[test]
+    fn listdesc_loader_falls_back_to_canonical() {
+        let tmp = TempDir::new().unwrap();
+        let trace_path = tmp.path().join("capture.jsonl");
+        let canonical = tmp.path().join("canonical");
+        std::fs::create_dir_all(&canonical).unwrap();
+
+        let (bytes, sha) = synthetic_listdesc(3);
+        write_listdesc(&canonical, &sha, &bytes);
+
+        let loaded = resolve_dma_listdesc_side_file(
+            &trace_path, &canonical, &sha, Some(24),
+        ).expect("canonical listdesc must resolve");
+        assert_eq!(loaded, bytes);
+    }
+
+    #[test]
+    fn listdesc_loader_size_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let trace_path = tmp.path().join("capture.jsonl");
+        let canonical = tmp.path().join("canonical");
+        std::fs::create_dir_all(&canonical).unwrap();
+
+        let (bytes, sha) = synthetic_listdesc(2);
+        let per_trace_dir = ensure_per_trace_dma_dir(&trace_path);
+        write_listdesc(&per_trace_dir, &sha, &bytes);
+
+        // expected 24 but actual 16 → mismatch
+        let err = resolve_dma_listdesc_side_file(
+            &trace_path, &canonical, &sha, Some(24),
+        ).expect_err("size mismatch must error");
+        assert!(
+            matches!(err, DmaChunkLoadError::DmaChunkSizeMismatch { expected: 24, actual: 16, .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn listdesc_loader_sha_mismatch_on_corrupted_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let trace_path = tmp.path().join("capture.jsonl");
+        let canonical = tmp.path().join("canonical");
+        std::fs::create_dir_all(&canonical).unwrap();
+
+        let (bytes, sha) = synthetic_listdesc(2);
+        let mut corrupted = bytes.clone();
+        corrupted[0] = 0xFF; // flip first byte
+        let per_trace_dir = ensure_per_trace_dma_dir(&trace_path);
+        write_listdesc(&per_trace_dir, &sha, &corrupted);
+
+        let err = resolve_dma_listdesc_side_file(
+            &trace_path, &canonical, &sha, None,
+        ).expect_err("sha mismatch must error");
+        assert!(
+            matches!(err, DmaChunkLoadError::DmaChunkShaMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn listdesc_loader_rejects_too_large() {
+        let tmp = TempDir::new().unwrap();
+        let trace_path = tmp.path().join("capture.jsonl");
+        let canonical = tmp.path().join("canonical");
+        std::fs::create_dir_all(&canonical).unwrap();
+
+        // 257 elements × 8 = 2056 bytes > 0x800 cap.
+        let (bytes, sha) = synthetic_listdesc(257);
+        let per_trace_dir = ensure_per_trace_dma_dir(&trace_path);
+        write_listdesc(&per_trace_dir, &sha, &bytes);
+
+        let err = resolve_dma_listdesc_side_file(
+            &trace_path, &canonical, &sha, None,
+        ).expect_err("oversize listdesc must reject");
+        assert!(
+            matches!(err, DmaChunkLoadError::DmaChunkTooLarge { size: 2056, .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn listdesc_path_helpers_match_writer_layout() {
+        let trace = Path::new("/tmp/some/capture.jsonl");
+        let canonical = Path::new("/repo/behavior-freeze/fixtures/spu/dma");
+        let (_, sha) = synthetic_listdesc(1);
+
+        let pt = per_trace_dma_listdesc_path(trace, &sha);
+        assert_eq!(
+            pt,
+            PathBuf::from("/tmp/some/capture.jsonl.dma").join(format!("{sha}.dmalistdesc"))
+        );
+
+        let cn = canonical_dma_listdesc_path(canonical, &sha);
+        assert_eq!(
+            cn,
+            PathBuf::from("/repo/behavior-freeze/fixtures/spu/dma").join(format!("{sha}.dmalistdesc"))
         );
     }
 }

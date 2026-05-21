@@ -53,7 +53,9 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 
-use crate::dma_chunk::{resolve_dma_chunk_side_file, DmaChunkLoadError};
+use crate::dma_chunk::{
+    resolve_dma_chunk_side_file, resolve_dma_listdesc_side_file, DmaChunkLoadError,
+};
 use crate::trace_fmt::{CapturedEvent, MfcDmaCompleteEvent, SpuMfcCmdEvent};
 use crate::SpuProgram;
 
@@ -252,6 +254,36 @@ pub enum MfcReplayError {
         captured: u8,
         observed: u8,
     },
+    /// R8.4c — GETL `spu_mfc_cmd` arrived without the additive
+    /// list fields populated. Parser-side validation already
+    /// enforces presence (`validate_getl_additive_fields`); this
+    /// is defense-in-depth for hand-built events that bypass the
+    /// parser.
+    MissingGetlListFields,
+    /// R8.4c — GETL descriptor parsed from the captured
+    /// `.dmalistdesc` has a per-element field that violates the
+    /// R8.4c constraint set (sb stall-and-notify bit set, ts=0
+    /// or > 0x4000, or descriptor ts/ea disagrees with the
+    /// trace event's `element_sizes[i]` / `element_eals[i]`).
+    GetlDescriptorElementInvalid {
+        index: u32,
+        reason: &'static str,
+    },
+    /// R8.4c — GETL `mfc_dma_complete.transferred_bytes` doesn't
+    /// equal `sum(ts)` over the descriptor. Per the Cell BE
+    /// list-DMA contract, the tag completes atomically with the
+    /// total bytes transferred.
+    GetlTransferredBytesMismatch {
+        expected_sum: u32,
+        observed: u32,
+    },
+    /// R8.4c — accumulated GETL destination LS offset would
+    /// exceed 256 KiB. Each element advances the dest LS by
+    /// its `ts`; the sum must fit.
+    GetlDestinationOutOfRange {
+        lsa_base: u32,
+        cumulative_size: u32,
+    },
 }
 
 impl std::fmt::Display for MfcReplayError {
@@ -331,6 +363,18 @@ impl std::fmt::Display for MfcReplayError {
                      chunk.",
                     end = lsa + size,
                 )
+            }
+            Self::MissingGetlListFields => {
+                write!(f, "MFC replay error (R8.4c GETL): spu_mfc_cmd is cmd=0x44 but missing one or more of: descriptor_sha256, descriptor_size, element_chunks, element_sizes, element_eals")
+            }
+            Self::GetlDescriptorElementInvalid { index, reason } => {
+                write!(f, "MFC replay error (R8.4c GETL): descriptor element {index} invalid: {reason}")
+            }
+            Self::GetlTransferredBytesMismatch { expected_sum, observed } => {
+                write!(f, "MFC replay error (R8.4c GETL): mfc_dma_complete.transferred_bytes = {observed} ≠ sum of element ts = {expected_sum}")
+            }
+            Self::GetlDestinationOutOfRange { lsa_base, cumulative_size } => {
+                write!(f, "MFC replay error (R8.4c GETL): cumulative destination lsa_base=0x{lsa_base:x} + sum(ts)={cumulative_size} exceeds 256 KiB local store")
             }
         }
     }
@@ -434,10 +478,12 @@ impl MfcReplayState {
             ch::MFC_CMD => {
                 // Defensive cmd-code check on the wrch value (the
                 // matching `spu_mfc_cmd` event's `cmd` field is
-                // re-checked in `process_mfc_cmd`). R8.1: PUT (0x20)
-                // is accepted alongside GET (0x40).
+                // re-checked in `process_mfc_cmd`). R8.1 added
+                // PUT (0x20) alongside GET (0x40). R8.4c added
+                // GETL (0x44). Other list / atomic / barrier codes
+                // remain rejected.
                 let cmd = value & 0xff;
-                if cmd != MFC_GET_CMD && cmd != MFC_PUT_CMD {
+                if cmd != MFC_GET_CMD && cmd != MFC_PUT_CMD && cmd != 0x44 {
                     return Err(MfcReplayError::UnsupportedMfcCmd { cmd });
                 }
                 self.awaiting_mfc_cmd_event = true;
@@ -674,6 +720,13 @@ impl MfcReplayState {
         event: &SpuMfcCmdEvent,
         ls: &mut [u8],
     ) -> Result<(), MfcReplayError> {
+        // R8.4c — GETL (0x44) dispatches to its dedicated list
+        // path. PUT (0x20) takes the vacuous-staging trick
+        // below. GET (0x40) falls through to the AssertNow
+        // `process_mfc_cmd`.
+        if event.cmd == 0x44 {
+            return self.process_mfc_list_cmd(event, ls);
+        }
         if event.cmd != MFC_PUT_CMD {
             return self.process_mfc_cmd(event, ls);
         }
@@ -726,6 +779,252 @@ impl MfcReplayState {
         ls[lo..hi].copy_from_slice(&saved);
 
         result
+    }
+
+    /// R8.4c — process a captured GETL `spu_mfc_cmd` event.
+    /// Loads the descriptor via [`resolve_dma_listdesc_side_file`],
+    /// parses each 8-byte slot (BE on wire), validates against
+    /// the trace event's per-element fields, loads each element
+    /// chunk via the existing [`resolve_dma_chunk_side_file`], and
+    /// copies bytes into `ls` at the cumulative destination
+    /// offset (`lsa + sum of prior element ts`).
+    ///
+    /// Per Cell BE list-DMA, the entire list completes atomically
+    /// as a single tag. The state machine registers the in-flight
+    /// tag here; the subsequent `mfc_dma_complete` event promotes
+    /// it (with `transferred_bytes == sum(ts)`).
+    ///
+    /// Caller MUST ensure:
+    /// - `event.cmd == 0x44 GETL`
+    /// - All five list fields (descriptor_sha256, descriptor_size,
+    ///   element_chunks, element_sizes, element_eals) are present
+    ///   and internally consistent (parser-validated; re-checked
+    ///   defensively here).
+    /// - `ls` is exactly [`SPU_LS_SIZE`] bytes.
+    pub fn process_mfc_list_cmd(
+        &mut self,
+        event: &SpuMfcCmdEvent,
+        ls: &mut [u8],
+    ) -> Result<(), MfcReplayError> {
+        if ls.len() != SPU_LS_SIZE {
+            return Err(MfcReplayError::BadLsBufferSize {
+                actual: ls.len(),
+                expected: SPU_LS_SIZE,
+            });
+        }
+
+        if !self.awaiting_mfc_cmd_event {
+            return Err(MfcReplayError::MissingMfcCmdEvent);
+        }
+        self.awaiting_mfc_cmd_event = false;
+
+        // Defensive: cmd must be GETL.
+        if event.cmd != 0x44 {
+            return Err(MfcReplayError::UnsupportedMfcCmd { cmd: event.cmd });
+        }
+        if event.eah != 0 {
+            return Err(MfcReplayError::UnsupportedMfcEah { eah: event.eah });
+        }
+        if event.tag > MFC_TAG_MAX {
+            return Err(MfcReplayError::BadMfcTag { tag: event.tag });
+        }
+
+        // Defensive: pending-packet cross-check (ch16-20 wrches
+        // must match the captured event). Same shape as
+        // process_mfc_cmd. GETL's eal field is the descriptor LSA
+        // (not data EA); ch18 wrch carried this same value.
+        let (p_lsa, p_eah, p_eal, p_size, p_tag) = self.pending.require_complete()?;
+        if event.lsa != p_lsa {
+            return Err(MfcReplayError::MfcCmdMismatch {
+                field: "lsa",
+                pending: p_lsa,
+                observed: event.lsa,
+            });
+        }
+        if event.eah != p_eah {
+            return Err(MfcReplayError::MfcCmdMismatch {
+                field: "eah",
+                pending: p_eah,
+                observed: event.eah,
+            });
+        }
+        if event.eal != p_eal {
+            return Err(MfcReplayError::MfcCmdMismatch {
+                field: "eal",
+                pending: p_eal,
+                observed: event.eal,
+            });
+        }
+        if event.size != p_size {
+            return Err(MfcReplayError::MfcCmdMismatch {
+                field: "size",
+                pending: p_size,
+                observed: event.size,
+            });
+        }
+        if event.tag != p_tag {
+            return Err(MfcReplayError::MfcCmdMismatch {
+                field: "tag",
+                pending: p_tag,
+                observed: event.tag,
+            });
+        }
+
+        // Defensive: list fields must be present.
+        let desc_sha = event
+            .descriptor_sha256
+            .as_deref()
+            .ok_or(MfcReplayError::MissingGetlListFields)?;
+        let desc_size = event
+            .descriptor_size
+            .ok_or(MfcReplayError::MissingGetlListFields)?;
+        let elements = event
+            .element_chunks
+            .as_deref()
+            .ok_or(MfcReplayError::MissingGetlListFields)?;
+        let sizes = event
+            .element_sizes
+            .as_deref()
+            .ok_or(MfcReplayError::MissingGetlListFields)?;
+        let eals = event
+            .element_eals
+            .as_deref()
+            .ok_or(MfcReplayError::MissingGetlListFields)?;
+
+        // Load the descriptor side-file. Size verified to match
+        // both `event.size` (parser) AND the loader's caller-side
+        // `expected_size` arg.
+        let desc_bytes = resolve_dma_listdesc_side_file(
+            &self.trace_path,
+            &self.canonical_dma_dir,
+            desc_sha,
+            Some(desc_size as usize),
+        )
+        .map_err(MfcReplayError::DmaChunkLoad)?;
+        debug_assert_eq!(desc_bytes.len(), desc_size as usize);
+
+        // Parse each 8-byte slot and cross-check against the
+        // trace event's per-element fields. Each element:
+        //   [0]: sb (bit 0x80 = stall-and-notify; R8.5+ scope)
+        //   [1]: pad
+        //   [2..3]: BE u16 ts
+        //   [4..7]: BE u32 ea
+        let element_count = (desc_size / 8) as usize;
+        let mut cumulative_lsa: u32 = event.lsa;
+        let mut cumulative_sum: u32 = 0;
+
+        // Defensive: list-field array lengths must match (parser
+        // also enforces this).
+        if elements.len() != element_count
+            || sizes.len() != element_count
+            || eals.len() != element_count
+        {
+            return Err(MfcReplayError::GetlDescriptorElementInvalid {
+                index: 0,
+                reason: "element_chunks/sizes/eals length != descriptor_size / 8",
+            });
+        }
+
+        for i in 0..element_count {
+            let base = i * 8;
+            let sb = desc_bytes[base];
+            let ts_be = u16::from_be_bytes([desc_bytes[base + 2], desc_bytes[base + 3]]);
+            let ea_be = u32::from_be_bytes([
+                desc_bytes[base + 4],
+                desc_bytes[base + 5],
+                desc_bytes[base + 6],
+                desc_bytes[base + 7],
+            ]);
+
+            if sb & 0x80 != 0 {
+                return Err(MfcReplayError::GetlDescriptorElementInvalid {
+                    index: i as u32,
+                    reason: "stall-and-notify bit (sb & 0x80) set — R8.5+ scope, out of R8.4c",
+                });
+            }
+            if ts_be == 0 || ts_be as u32 > MFC_DMA_SIZE_MAX {
+                return Err(MfcReplayError::GetlDescriptorElementInvalid {
+                    index: i as u32,
+                    reason: "element ts out of (0, 0x4000]",
+                });
+            }
+            // Cross-check descriptor ts/ea against trace event's
+            // element_sizes[i] / element_eals[i]. Any divergence
+            // means writer captured one source and the descriptor
+            // says another — refuse.
+            if ts_be as u32 != sizes[i] {
+                return Err(MfcReplayError::GetlDescriptorElementInvalid {
+                    index: i as u32,
+                    reason: "descriptor ts disagrees with trace event element_sizes",
+                });
+            }
+            if ea_be != eals[i] {
+                return Err(MfcReplayError::GetlDescriptorElementInvalid {
+                    index: i as u32,
+                    reason: "descriptor ea disagrees with trace event element_eals",
+                });
+            }
+
+            // Bounds check on cumulative destination LS.
+            let lsa_end = cumulative_lsa
+                .checked_add(ts_be as u32)
+                .ok_or(MfcReplayError::GetlDestinationOutOfRange {
+                    lsa_base: event.lsa,
+                    cumulative_size: cumulative_sum.saturating_add(ts_be as u32),
+                })?;
+            if lsa_end as usize > SPU_LS_SIZE {
+                return Err(MfcReplayError::GetlDestinationOutOfRange {
+                    lsa_base: event.lsa,
+                    cumulative_size: cumulative_sum + ts_be as u32,
+                });
+            }
+
+            // Load the element chunk via the existing
+            // .dmachunk loader (REUSE — content-addressed dedup
+            // means R8.2/R8.3 chunk files apply directly).
+            let chunk_bytes = resolve_dma_chunk_side_file(
+                &self.trace_path,
+                &self.canonical_dma_dir,
+                &elements[i],
+                Some(ts_be as usize),
+            )
+            .map_err(MfcReplayError::DmaChunkLoad)?;
+            debug_assert_eq!(chunk_bytes.len(), ts_be as usize);
+
+            let lo = cumulative_lsa as usize;
+            let hi = lsa_end as usize;
+            ls[lo..hi].copy_from_slice(&chunk_bytes);
+
+            // Per Cell BE list-DMA: next element lands at
+            // base + sum(ts), without padding alignment (per
+            // RPCS3 reference, the cumulative offset is just
+            // raw ts sum — fixture R8.4b confirms LS[0x10000..
+            // 0x10080] gets element 0 = 128 B, then LS[0x10080..
+            // 0x100C0] gets element 1 = 64 B).
+            cumulative_lsa = lsa_end;
+            cumulative_sum = cumulative_sum.saturating_add(ts_be as u32);
+        }
+
+        // Register in-flight; the matching `mfc_dma_complete`
+        // event promotes it. The `size` field stored here is the
+        // SUM of all element ts (not the descriptor bytes), so
+        // the dma_complete event's `transferred_bytes == size`
+        // check matches the Cell BE atomic-list-completion
+        // contract.
+        let ea = ((event.eah as u64) << 32) | (event.eal as u64);
+        self.in_flight.insert(
+            event.tag,
+            MfcInFlight {
+                cmd: event.cmd,
+                size: cumulative_sum,
+                lsa: event.lsa,
+                ea,
+                chunk_sha256: desc_sha.to_owned(),
+            },
+        );
+
+        self.pending.clear();
+        Ok(())
     }
 
     /// Process a captured `mfc_dma_complete` event. Validates that the
@@ -1359,18 +1658,23 @@ mod tests {
         std::fs::create_dir_all(&canonical).unwrap();
         let mut st = MfcReplayState::new(trace_path, canonical);
 
-        // R8.1 update: GET (0x40) and PUT (0x20) are both in scope.
-        // GETL (0x44, list variant) is the new canary — out of R8.1
-        // scope (list DMA defers to R8.2+).
-        let err = st.process_wrch(ch::MFC_CMD, 0x44)
-            .expect_err("GETL cmd must be rejected");
-        assert!(matches!(err, MfcReplayError::UnsupportedMfcCmd { cmd: 0x44 }), "got {err:?}");
+        // R8.4c update: GET (0x40), PUT (0x20), AND GETL (0x44)
+        // all accepted. New canary is GETLB (0x45) — list +
+        // barrier, still out of scope.
+        let err = st.process_wrch(ch::MFC_CMD, 0x45)
+            .expect_err("GETLB cmd must be rejected");
+        assert!(matches!(err, MfcReplayError::UnsupportedMfcCmd { cmd: 0x45 }), "got {err:?}");
 
-        // Sanity: PUT (0x20) is NOW accepted under R8.1.
+        // Sanity: PUT (0x20) and GETL (0x44) are NOW accepted.
         let mut st2 = MfcReplayState::new(tmp.path().join("c2.jsonl"), tmp.path().join("d2"));
         std::fs::create_dir_all(tmp.path().join("d2")).unwrap();
         st2.process_wrch(ch::MFC_CMD, 0x20)
-            .expect("PUT cmd must now be accepted (R8.1)");
+            .expect("PUT cmd must be accepted (R8.1)");
+
+        let mut st3 = MfcReplayState::new(tmp.path().join("c3.jsonl"), tmp.path().join("d3"));
+        std::fs::create_dir_all(tmp.path().join("d3")).unwrap();
+        st3.process_wrch(ch::MFC_CMD, 0x44)
+            .expect("GETL cmd must be accepted (R8.4c)");
     }
 
     #[test]

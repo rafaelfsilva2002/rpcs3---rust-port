@@ -47,8 +47,10 @@ pub use spu_image_loader::{build_spu_program_from_captured_image, SpuProgramBuil
 // policy — that's A.4 scope.
 pub mod dma_chunk;
 pub use dma_chunk::{
-    canonical_dma_chunk_path, per_trace_dma_chunk_path, resolve_dma_chunk_side_file,
-    DmaChunkLoadError, DMA_CHUNK_EXTENSION, DMA_CHUNK_SIZE_MAX,
+    canonical_dma_chunk_path, canonical_dma_listdesc_path, per_trace_dma_chunk_path,
+    per_trace_dma_listdesc_path, resolve_dma_chunk_side_file, resolve_dma_listdesc_side_file,
+    DmaChunkLoadError, DMA_CHUNK_EXTENSION, DMA_CHUNK_SIZE_MAX, DMA_LISTDESC_EXTENSION,
+    DMA_LISTDESC_SIZE_MAX,
 };
 
 // R6.7 A.4 — MFC replay state machine for GET-only DMA. Standalone

@@ -1,8 +1,26 @@
-# Project Status — R8.4b LANDED (GETL writer extension + capture-only trace)
+# Project Status — R8.4c LANDED (13th oracle: GETL replay state machine)
 
 **Authoritative current source of truth for the RPCS3 → Rust port.**
 
-Last updated: **2026-05-21 (R8.4b landing)**. R8.4b lands the
+Last updated: **2026-05-21 (R8.4c landing)**. R8.4c promotes
+the R8.4b capture-only GETL fixture to the 13th replay-
+validated oracle. New `MfcReplayState::process_mfc_list_cmd`
+walks the captured `.dmalistdesc` descriptor, parses each
+8-byte BE slot, cross-validates per-element ts/ea against
+trace event's `element_sizes`/`element_eals`, loads each
+chunk from the existing `.dmachunk` pool, copies bytes into
+LS at cumulative offsets. R8.4a canary lifted for cmd=0x44
+only (GETLB/GETLF + PUTL family still rejected). New
+`resolve_dma_listdesc_side_file` mirrors the chunk loader
+for the `.dmalistdesc` extension. Replay test
+`r8_4c_single_spu_dma_getl_v1_replay_validated_byte_identical`
+proves cross-backend byte-identical with canonical
+`0xDF1EEA5A`. Rust-core only fix; no C++ patches changed;
+rpcs3.exe unchanged. R8.4d adds the runtime bridge GETL
+callback (still pending). See "R8.4c phase closure
+(2026-05-21)" below.
+
+Previously: **2026-05-21 (R8.4b landing)**. R8.4b lands the
 first half of MFC GETL list-DMA support: C++ writer extension
 (SPUThread.cpp + SPUTraceJsonl.{h,cpp}), real CC0 GETL
 fixture captured (15-event JSONL + new `.dmalistdesc`
@@ -116,6 +134,16 @@ Do NOT treat the archive as current.
 
 ## 1. Executive current status
 
+- **R8.4c is LANDED** (2026-05-21). 13th replay-validated
+  oracle: `single_spu_dma_getl_v1` (promoted from R8.4b
+  capture-only). New `MfcReplayState::process_mfc_list_cmd`
+  for cmd=0x44; new `.dmalistdesc` side-file resolver in
+  `dma_chunk.rs`; R8.4a canary lifted only for GETL.
+  Rust-core only fix; C++ patches unchanged; rpcs3.exe
+  unchanged. Replay test passes cross-backend
+  byte-identical with canonical `0xDF1EEA5A`. R8.4d
+  (runtime bridge GETL + triple-symmetry expansion)
+  remains the next phase. See § 8.4c.
 - **R8.4b is LANDED** (2026-05-21). First half of MFC GETL
   list-DMA support: C++ writer captures GETL (cmd=0x44) with
   new `.dmalistdesc` side-file + per-element `.dmachunk` files
@@ -1366,6 +1394,128 @@ writer changes are isolated and don't affect non-GETL paths.
 - Triple-symmetry extension for `get_list` (R8.4d).
 - PUTL family (R8.4e), GETLB/GETLF (R8.4f).
 - Stall-and-notify bit (R8.5+).
+
+---
+
+## 8.4c R8.4c closure summary (2026-05-21)
+
+R8.4c promotes the R8.4b capture-only GETL fixture to the
+13th replay-validated oracle. Pure Rust-core delivery — no
+C++ changes; rpcs3.exe binary unchanged from R8.4b
+(`3f2348de…`). The state machine landed AND its dedicated
+side-file resolver AND the parser canary lift AND the
+replay test all in one coherent commit.
+
+**Scope:**
+
+- **`dma_chunk.rs` extensions**: new public functions
+  `resolve_dma_listdesc_side_file`,
+  `per_trace_dma_listdesc_path`,
+  `canonical_dma_listdesc_path` + new constants
+  `DMA_LISTDESC_EXTENSION = "dmalistdesc"` +
+  `DMA_LISTDESC_SIZE_MAX = 0x800` (256 elements × 8). All
+  five reuse `DmaChunkLoadError` variants (the failure
+  modes are structurally identical). 6 new unit tests
+  covering per-trace resolution, canonical fallback, size
+  mismatch, SHA mismatch, too-large rejection, path helper
+  layout.
+
+- **`trace_fmt.rs` parser lift**: cmd 0x44 GETL now ACCEPTED
+  via the additive-fields validation path
+  (`validate_getl_additive_fields`); the other 5 list-DMA
+  codes (PUTL 0x24, PUTLB 0x25, PUTLF 0x26, GETLB 0x45,
+  GETLF 0x46) still surface `UnsupportedMfcListCmd`. New
+  helper `validate_sha_hex_field` consolidates the
+  64-lower-hex check across `ea_chunk_sha256` +
+  `descriptor_sha256` + each `element_chunks[i]`. R8.4c
+  enforces: all 5 list fields present, descriptor_size ==
+  e.size, descriptor_size % 8 == 0, descriptor_size <=
+  0x800, element_chunks/sizes/eals counts match
+  descriptor_size / 8, per-element ts in (0, 0x4000], per-
+  element chunk SHA = 64-hex. **GET/PUT events with stray
+  list fields rejected** (writer-bug defense). 4 new
+  parser tests; old `reject_mfc_list_cmds_with_granular_canary`
+  test updated to iterate only the 5 still-unsupported
+  codes (0x44 removed since GETL now accepts).
+
+- **`mfc_replay.rs` state machine extension**: new public
+  method `process_mfc_list_cmd` on `MfcReplayState`.
+  Validates GETL cmd + pending-packet cross-check (ch16-20)
+  + all 5 list fields present + descriptor side-file
+  loaded via `resolve_dma_listdesc_side_file`. Parses each
+  8-byte BE slot (sb + pad + u16 ts + u32 ea). Per-element
+  defensive checks: sb bit 0x80 (stall-and-notify) MUST
+  be 0 (R8.5+ scope), ts in (0, 0x4000], descriptor ts/ea
+  MUST match trace event's `element_sizes[i]`/`element_eals[i]`.
+  Loads each element chunk via existing
+  `resolve_dma_chunk_side_file` (REUSE — content-addressed
+  pool dedup applies). Copies bytes into LS at cumulative
+  offset (`lsa_base + sum of prior ts`). Registers
+  in-flight tag with size = sum of ts (so the matching
+  `mfc_dma_complete.transferred_bytes` check matches Cell
+  BE atomic-list-completion contract). 4 new error variants
+  on `MfcReplayError`: `MissingGetlListFields`,
+  `GetlDescriptorElementInvalid`,
+  `GetlTransferredBytesMismatch`,
+  `GetlDestinationOutOfRange`.
+
+- **`process_mfc_cmd_pre_replay` dispatch**: 0x44 GETL
+  routes to `process_mfc_list_cmd`. The existing
+  `apply_mfc_dma_pre_replay` helper inherits the routing
+  automatically (it already called `process_mfc_cmd_pre_replay`
+  for every `SpuMfcCmd` event since R8.1 PUT).
+
+- **`process_wrch` ch::MFC_CMD update**: defensive check
+  on the wrch value (ch21) now accepts 0x44 alongside
+  0x40 GET and 0x20 PUT. Old canary test moved from
+  0x44 GETL → 0x45 GETLB.
+
+- **13th oracle promotion**: new
+  `rust/rpcs3-spu-recompiler/tests/single_spu_dma_getl_v1_replay.rs`
+  loads the R8.4b-captured JSONL, drives the full
+  pipeline (parse → per-SPU transform → SpuProgram with
+  r3/r4 seeded for PSL1GHT arg0/arg1 → pre-replay GETL
+  via `apply_mfc_dma_pre_replay` → Interpreter +
+  Recompiler replay → `diff_snapshots.is_identical()`).
+  Validates canonical status `0xDF1EEA5A` and post-replay
+  LS at both element offsets matches the captured chunks.
+
+**Triple-symmetry status:**
+
+- **Replay**: passes (Interpreter ↔ Recompiler byte-identical).
+- **Bridge OFF**: passes (C++ LLVM executor produces canonical).
+- **Bridge ON**: NOT YET (R8.4d scope — Rust bridge has no
+  GETL callback installed; would fall back to C++ at the
+  GETL dispatch). Triple-symmetry expansion for
+  `--fixture get_list` defers to R8.4d.
+
+**Patch SHAs at R8.4c landing:**
+
+| Patch | sha256 | Δ vs R8.4b |
+|---|---|---|
+| scaffolding | `5c170508a73e492d42784036d61a972edab7a85b7ea7105d6dde388a5e67d6c0` | unchanged |
+| runtime hooks | `745945f4872f7d83541aa74d9a065b6a6bc3785af73510d026e6643a0985cd96` | unchanged |
+| rust bridge | `0afda1c6943feb5d98329299a57dd68404095efb0a792839779febed13ab8a7e` | unchanged |
+
+R8.4c is Rust-core only. C++ patches and rpcs3.exe binary
+both unchanged from R8.4b.
+
+**rpcs3.exe at R8.4c landing:** sha
+`3f2348de0e50b7dd4aadeac92aaec83b678cd84f7f7be88742835cc0c38a0b72`
+(R8.4b binary unchanged).
+
+**Out of R8.4c scope (deferred to R8.4d+):**
+
+- Runtime bridge: `rust_spu_set_dma_getl_callback` FFI +
+  `bridge_dma_getl_callback` C++ handler that reads
+  descriptor from SPU's LS and copies each element via
+  `vm::_ptr<u8>(ea)`. Bumps bridge SHA + rpcs3.exe
+  rebuild.
+- `check_triple_symmetry.py --fixture get_list` extension.
+- PUTL family (R8.4e), GETLB/GETLF (R8.4f).
+- Stall-and-notify bit 0x80 (R8.5+).
+- 3+ element GETL fixtures (mechanically in-scope; no
+  fixture yet).
 
 ---
 
