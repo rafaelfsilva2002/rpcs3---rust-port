@@ -193,12 +193,35 @@ GET_TAG_POLL_FIXTURE = FixtureSpec(
 )
 
 
+# R8.3c — IMMEDIATE-wait-mode + clearing-semantics probe oracle
+# (12th oracle). Two queued GETs + TWO ch24 reads with
+# WrTagUpdate=IMMEDIATE (= 0) and distinct masks (0x08, 0x28).
+# `ts2 == 0x28` (full mask) proves IMMEDIATE does NOT clear
+# completed_tags — Cell BE persistent semantic confirmed.
+# Canonical status 0xDD164A9E.
+GET_TAG_IMMEDIATE_FIXTURE = FixtureSpec(
+    name="single_spu_dma_tag_immediate_v1",
+    rust_test_target="single_spu_dma_tag_immediate_v1_replay",
+    canonical_tty_substr="[dma_tag_immediate_v1] OK cause=0x1 status=0xdd164a9e",
+    canonical_status_summary=(
+        "status = ((sum1 << 16) | sum2) ^ "
+        "((ts1 << 24) | (ts2 << 16)) ^ 0xCAFE5A1E "
+        "where sum1 = 0x1FC0, sum2 = 0x1080, ts1 = 0x08 "
+        "(IMMEDIATE read #1 mask 0x08), ts2 = 0x28 (IMMEDIATE "
+        "read #2 mask 0x28, completed_tags persistent) = 0xDD164A9E"
+    ),
+    delegation_log_marker="DMA GET dispatched",
+    rust_log_intro="R7.2 DMA GET (multi-dispatch, IMMEDIATE probe)",
+)
+
+
 FIXTURES = {
     "get": GET_FIXTURE,
     "put": PUT_FIXTURE,
     "get_multi": GET_MULTI_FIXTURE,
     "get_any": GET_ANY_FIXTURE,
     "get_tag_poll": GET_TAG_POLL_FIXTURE,
+    "get_tag_immediate": GET_TAG_IMMEDIATE_FIXTURE,
 }
 
 

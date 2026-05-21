@@ -811,8 +811,23 @@ impl MfcReplayState {
             });
         }
 
-        // Clear the observed bits — they're consumed by this rdch.
-        self.completed_tags &= !observed_now;
+        // R8.3c — DO NOT clear `completed_tags` after read. Cell BE
+        // semantics retain the register across reads; the matching
+        // `SpuChannels::read(MFC_RD_TAG_STAT)` in `rpcs3-spu-thread`
+        // (R8.3b persistent semantic) returns
+        // `completed_tags & wr_tag_mask` without clearing, so the
+        // pre-replay state machine MUST match. Without this, a
+        // fixture whose ch24 reads have overlapping masks (R8.3c:
+        // first mask 0x08 ⊂ second mask 0x28) trips
+        // `TagStatMismatch` because the bit shared between masks
+        // would be cleared after the first read and missing from
+        // the second oracle.
+        //
+        // The previous clear was a legacy from R6.7 A.4 when no
+        // oracle exercised repeated reads. R8.3b (separate ANY-mode
+        // masks, no overlap) didn't surface the issue because each
+        // read cleared only bits unique to its mask. R8.3c forces
+        // the alignment.
         Ok(observed_now)
     }
 }
@@ -1095,8 +1110,13 @@ mod tests {
         // the mask exactly. Captured value must match.
         let stat = st.process_rdch_tagstat(1u32 << 3).expect("tag stat must match oracle");
         assert_eq!(stat, 1u32 << 3);
-        // After observation, the bit is cleared.
-        assert_eq!(st.completed_tags(), 0);
+        // R8.3c: completed_tags is NOT cleared on read — Cell BE
+        // persistent register semantic. The bit stays set so
+        // subsequent reads with the same mask return the same value.
+        assert_eq!(st.completed_tags(), 1u32 << 3);
+        let stat2 = st.process_rdch_tagstat(1u32 << 3).expect("re-read returns same value");
+        assert_eq!(stat2, 1u32 << 3);
+        assert_eq!(st.completed_tags(), 1u32 << 3);
     }
 
     #[test]

@@ -1304,3 +1304,85 @@ them, per the empirical-scoping policy.
   Rust-core-only fixes that need to relink rpcs3.exe,
   `touch` a source file in the dependency graph before
   `cargo build` to force a fresh `.lib`.
+
+---
+
+## 18. R8.3c closure note (2026-05-20) — IMMEDIATE + replay clear-on-read alignment
+
+R8.3c closed the loop on R8.3b: the runtime
+(`SpuChannels::read`) was already persistent post-R8.3b, but
+the replay state machine (`MfcReplayState::process_rdch_tagstat`)
+still had a legacy clear-on-read from R6.7 A.4. R8.3c surfaced
+the divergence via overlapping masks (first 0x08 ⊂ second
+0x28); the second oracle expected the persistent tag-3 bit
+but found it cleared. Fix: drop the clear in
+`process_rdch_tagstat`.
+
+### 18.1 Why R8.3a/b didn't surface this
+
+The replay state machine's clear was harmless when:
+- Single ch24 read per session (R6.7, R8.1) — nothing to
+  observe afterwards.
+- Multiple reads with non-overlapping masks (R8.3b: 0x08
+  then 0x20) — each read cleared only bits unique to its
+  mask, so subsequent oracles still matched captured.
+
+R8.3c uses OVERLAPPING masks (0x08 then 0x28), so the
+tag-3 bit shared between them gets cleared by the first
+read and missing from the second oracle.
+
+### 18.2 The fix
+
+Single line removed in `mfc_replay.rs`:
+
+```rust
+// REMOVED — replaced with the no-clear semantic.
+// self.completed_tags &= !observed_now;
+```
+
+Now matches Cell BE / R8.3b runtime semantic: `completed_tags`
+persists across reads. Re-reads with the same mask return the
+same value.
+
+### 18.3 R8.3c acceptance state
+
+- ✅ 12 replay-validated oracles green
+- ✅ workspace `--lib --no-fail-fast` green
+- ✅ `check_trace_fixtures.py` green (12 fixtures listed)
+- ✅ `check_patch_separation.py` green (3 SHA-pinned patches
+  UNCHANGED from R8.1 — replay-layer fix doesn't touch C++)
+- ✅ `check_triple_symmetry.py --fixture {get,put,get_multi,
+  get_any,get_tag_poll,get_tag_immediate}` all six green
+- ✅ rpcs3.exe binary UNCHANGED (`34ec50d7…`, R8.3b artifact —
+  fix is in `rpcs3-spu-differential`, not in `rpcs3_spu_ffi.lib`)
+- ✅ `single_spu_dma_tag_immediate_v1` is the project's first
+  IMMEDIATE wait-mode oracle; status `0xDD164A9E`.
+
+### 18.4 Confirmed Cell BE semantic snapshot
+
+After R8.3c, the project's understanding of MFC tag-stat
+semantics is:
+
+| Aspect | Semantic |
+|---|---|
+| `completed_tags` register | Persistent across ch24 reads, accumulates bits as DMA completes fire |
+| `WrTagUpdate = IMMEDIATE` (0) | No wait, just return `completed_tags & wr_tag_mask` snapshot. No clear. |
+| `WrTagUpdate = ANY` (1) | Wait until at least one tag in mask completes; return `completed_tags & wr_tag_mask`. No clear. |
+| `WrTagUpdate = ALL` (2) | Wait until every tag in mask completes; return `wr_tag_mask` exactly. No clear. |
+| ch24 read | Returns `completed_tags & wr_tag_mask`; NEVER clears `completed_tags`. |
+| Explicit clear | Via `WrTagUpdate` write in some Cell BE implementations — deferred to R8.4+. |
+
+### 18.5 R8.3c hard rules carried forward to R8.4+
+
+- The replay state machine and the runtime executor MUST
+  share read semantics. Any future divergence between them
+  (e.g. one clears, the other doesn't) is the same bug class
+  R8.3c surfaced.
+- Overlapping-mask fixtures are valuable canaries — design
+  future oracles with intentional overlaps when probing new
+  ch24/tag-stat semantics.
+- The "three R8.3 in a row co-fix" pattern doesn't generalize
+  forever — each new ch22/ch23/ch24 semantic that ships will
+  eventually be fully covered, and future fixtures will move
+  to coverage-only (R8.2 style) rather than co-fix
+  (R8.3a/b/c style).
