@@ -608,11 +608,28 @@ pub enum TraceParseError {
         wrch_event_index: usize,
         reason: &'static str,
     },
-    /// R6.7 A.2 — `spu_mfc_cmd.cmd` is not in the supported subset.
-    /// Initial scope: only `0x40` (GET, EA → LS) is accepted. PUT,
-    /// list, atomic, barrier-flagged variants surface here. See
-    /// `docs/SPU_DMA_MFC_R6_7_DESIGN.md` § 3 / § 4.3.
+    /// R6.7 A.2 + R8.1 — `spu_mfc_cmd.cmd` is not in the
+    /// supported subset. Currently accepted: `0x40` GET (R6.7 A.2)
+    /// and `0x20` PUT (R8.1). PUT-list / GET-list variants surface
+    /// as the more specific [`Self::UnsupportedMfcListCmd`]
+    /// (R8.4a). Atomic / barrier / fence-flagged variants and
+    /// any other code land here.
     UnsupportedMfcCmd {
+        line: usize,
+        seq: u64,
+        target_spu: u32,
+        cmd: u32,
+    },
+    /// R8.4a — `spu_mfc_cmd.cmd` is a recognized MFC list-DMA
+    /// command (PUTL/PUTLB/PUTLF = 0x24-0x26, GETL/GETLB/GETLF
+    /// = 0x44-0x46) but list-DMA is not yet supported by the
+    /// replay/runtime stack. Granular variant (vs the generic
+    /// [`Self::UnsupportedMfcCmd`]) so downstream tooling can
+    /// distinguish "out of scope for now" from "never seen
+    /// before". R8.4b/c/d will progressively implement the
+    /// GETL subset of these codes (PUTL list-form deferred).
+    /// See `docs/SPU_DMA_MFC_R6_7_DESIGN.md` § 19.
+    UnsupportedMfcListCmd {
         line: usize,
         seq: u64,
         target_spu: u32,
@@ -744,7 +761,19 @@ impl std::fmt::Display for TraceParseError {
                 write!(f, "trace parse error: malformed MFC sequence at event index {wrch_event_index} for target_spu {target_spu} ({reason})")
             }
             Self::UnsupportedMfcCmd { line, seq, target_spu, cmd } => {
-                write!(f, "trace parse error at line {line} (seq {seq}, target_spu {target_spu}): unsupported MFC cmd code 0x{cmd:x} (R6.7 A.2 only accepts 0x40 GET; PUT/list/atomic out of scope)")
+                write!(f, "trace parse error at line {line} (seq {seq}, target_spu {target_spu}): unsupported MFC cmd code 0x{cmd:x} (parser accepts 0x40 GET and 0x20 PUT; list/atomic/barrier-flagged variants surface as more specific errors when known)")
+            }
+            Self::UnsupportedMfcListCmd { line, seq, target_spu, cmd } => {
+                let mnemonic = match *cmd {
+                    0x24 => "PUTL",
+                    0x25 => "PUTLB",
+                    0x26 => "PUTLF",
+                    0x44 => "GETL",
+                    0x45 => "GETLB",
+                    0x46 => "GETLF",
+                    _ => "list",
+                };
+                write!(f, "trace parse error at line {line} (seq {seq}, target_spu {target_spu}): MFC list-DMA cmd 0x{cmd:x} ({mnemonic}) not yet supported (R8.4a parser canary; R8.4b/c/d will implement GETL replay/runtime; PUTL deferred to R8.5+); see docs/SPU_DMA_MFC_R6_7_DESIGN.md § 19")
             }
             Self::UnsupportedMfcEah { line, seq, target_spu, eah } => {
                 write!(f, "trace parse error at line {line} (seq {seq}, target_spu {target_spu}): MFC eah 0x{eah:x} != 0 (R6.7 A.2 PS3 user-space PSL1GHT scope only — eah must be 0)")
@@ -957,6 +986,31 @@ const MFC_GET_CMD: u32 = 0x40;
 /// the interpreter reaches `wrch ch21`).
 const MFC_PUT_CMD: u32 = 0x20;
 
+/// R8.4a — MFC list-DMA command codes. Currently rejected with the
+/// granular [`TraceParseError::UnsupportedMfcListCmd`] (vs the generic
+/// [`TraceParseError::UnsupportedMfcCmd`]) so downstream tooling can
+/// distinguish "in roadmap" from "out of scope".
+///
+/// Codes per `rpcs3-upstream-clean/rpcs3/Emu/Cell/MFC.h:7-15`:
+///
+/// | Code | Mnemonic | Direction | Modifiers          |
+/// |------|----------|-----------|--------------------|
+/// | 0x24 | PUTL     | LS → EA   | list               |
+/// | 0x25 | PUTLB    | LS → EA   | list + barrier     |
+/// | 0x26 | PUTLF    | LS → EA   | list + fence       |
+/// | 0x44 | GETL     | EA → LS   | list               |
+/// | 0x45 | GETLB    | EA → LS   | list + barrier     |
+/// | 0x46 | GETLF    | EA → LS   | list + fence       |
+///
+/// R8.4b/c/d will progressively implement GETL replay + runtime.
+/// PUTL is deferred to R8.5+ (LS-source side has the same shape but
+/// inverts data direction; the list descriptor walk is identical).
+const MFC_LIST_CMDS: &[u32] = &[0x24, 0x25, 0x26, 0x44, 0x45, 0x46];
+
+fn is_mfc_list_cmd(cmd: u32) -> bool {
+    MFC_LIST_CMDS.contains(&cmd)
+}
+
 /// R6.7 A.2 — MFC tag is a 5-bit field (`ch_mfc_cmd.tag & 0x1f`).
 const MFC_TAG_MAX: u32 = 31;
 
@@ -1157,11 +1211,23 @@ fn validate_spu_image_event(e: &SpuImageEvent, line: usize) -> Result<(), TraceP
 fn validate_spu_mfc_cmd_event(e: &SpuMfcCmdEvent, line: usize) -> Result<(), TraceParseError> {
     check_pc(line, e.seq, e.pc)?;
 
-    // R6.7: only GET (0x40). R8.1: also PUT (0x20). Everything else
-    // (list cmds GETL/PUTL/GETLB/PUTLB, atomic GETLLAR/PUTLLC/...,
-    // barriers, sync, signal-notification) still surfaces
-    // `UnsupportedMfcCmd` — the schema is strict-additive.
+    // R6.7: only GET (0x40). R8.1: also PUT (0x20). R8.4a:
+    // list-DMA codes (PUTL/PUTLB/PUTLF = 0x24-0x26,
+    // GETL/GETLB/GETLF = 0x44-0x46) surface as the more granular
+    // `UnsupportedMfcListCmd` so downstream tooling can
+    // distinguish "in roadmap" from "out of scope". Everything
+    // else (atomic GETLLAR/PUTLLC/..., barriers, sync,
+    // signal-notification) still surfaces the generic
+    // `UnsupportedMfcCmd` — schema remains strict-additive.
     if e.cmd != MFC_GET_CMD && e.cmd != MFC_PUT_CMD {
+        if is_mfc_list_cmd(e.cmd) {
+            return Err(TraceParseError::UnsupportedMfcListCmd {
+                line,
+                seq: e.seq,
+                target_spu: e.target_spu,
+                cmd: e.cmd,
+            });
+        }
         return Err(TraceParseError::UnsupportedMfcCmd {
             line,
             seq: e.seq,
@@ -3022,24 +3088,93 @@ mod tests {
         assert!(matches!(events[10], CapturedEvent::SpuRdch(ref r) if r.channel == 24));
     }
 
-    /// Negative: cmd != 0x40 is rejected at parse time. PUT (0x20) is
-    /// the most common non-GET cmd; we use it as the canary.
+    /// Negative: cmd != 0x40 and != 0x20 is rejected at parse time.
+    /// R8.4a update: list-DMA codes (PUTL/PUTLB/PUTLF/GETL/GETLB/
+    /// GETLF) now surface the granular `UnsupportedMfcListCmd`
+    /// variant. Atomic / barrier / sync codes still surface the
+    /// generic `UnsupportedMfcCmd`. The canary moves to GETLLAR
+    /// (0xD0, atomic getllar) — definitely out of scope and not
+    /// in any current R8.4 roadmap.
     #[test]
-    fn reject_mfc_cmd_non_get() {
-        // R8.1 update: PUT (0x20) is NOW accepted alongside GET
-        // (0x40). The new canary is GETL (0x44, list variant) —
-        // R8.2+ scope.
+    fn reject_mfc_cmd_non_get_non_put_non_list() {
+        // Canary: GETLLAR (0xD0, atomic reservation). Distinct from
+        // both R6.7/R8.1 supported (0x40, 0x20) and R8.4 list-DMA
+        // (0x24..0x26, 0x44..0x46) codes.
         let jsonl = format!(
             r#"
-{{"seq":0,"side":"spu","kind":"spu_wrch","pc":256,"channel":21,"value":68,"would_stall":false,"target_spu":1}}
-{{"seq":1,"side":"spu","kind":"spu_mfc_cmd","target_spu":1,"pc":256,"cmd":68,"tag":3,"size":128,"lsa":0,"eah":0,"eal":4096,"ea_chunk_sha256":"{TEST_VALID_SHA}"}}
+{{"seq":0,"side":"spu","kind":"spu_wrch","pc":256,"channel":21,"value":208,"would_stall":false,"target_spu":1}}
+{{"seq":1,"side":"spu","kind":"spu_mfc_cmd","target_spu":1,"pc":256,"cmd":208,"tag":3,"size":128,"lsa":0,"eah":0,"eal":4096,"ea_chunk_sha256":"{TEST_VALID_SHA}"}}
 "#
         );
-        let err = parse_jsonl_trace(&jsonl).expect_err("GETL cmd must reject");
+        let err = parse_jsonl_trace(&jsonl).expect_err("GETLLAR cmd must reject");
         assert!(
-            matches!(err, TraceParseError::UnsupportedMfcCmd { cmd: 0x44, .. }),
+            matches!(err, TraceParseError::UnsupportedMfcCmd { cmd: 0xD0, .. }),
             "got {err:?}"
         );
+    }
+
+    /// R8.4a — all six list-DMA codes (PUTL/PUTLB/PUTLF =
+    /// 0x24/0x25/0x26, GETL/GETLB/GETLF = 0x44/0x45/0x46) surface
+    /// the granular `UnsupportedMfcListCmd` variant. This lets
+    /// downstream tooling distinguish "list-DMA, in R8.4 roadmap"
+    /// from "out of scope entirely" (atomic / barrier / sync,
+    /// covered by the generic `UnsupportedMfcCmd`).
+    #[test]
+    fn reject_mfc_list_cmds_with_granular_canary() {
+        let list_cmds: &[u32] = &[0x24, 0x25, 0x26, 0x44, 0x45, 0x46];
+        for &cmd in list_cmds {
+            let jsonl = format!(
+                r#"
+{{"seq":0,"side":"spu","kind":"spu_wrch","pc":256,"channel":21,"value":{cmd},"would_stall":false,"target_spu":1}}
+{{"seq":1,"side":"spu","kind":"spu_mfc_cmd","target_spu":1,"pc":256,"cmd":{cmd},"tag":3,"size":128,"lsa":0,"eah":0,"eal":4096,"ea_chunk_sha256":"{TEST_VALID_SHA}"}}
+"#
+            );
+            let err = parse_jsonl_trace(&jsonl)
+                .expect_err(&format!("list cmd 0x{cmd:x} must reject"));
+            match err {
+                TraceParseError::UnsupportedMfcListCmd { cmd: got_cmd, .. } => {
+                    assert_eq!(got_cmd, cmd, "list-cmd canary preserves the cmd code");
+                }
+                other => panic!(
+                    "list cmd 0x{cmd:x} should be UnsupportedMfcListCmd, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// R8.4a — non-list, non-supported codes (atomic, barrier,
+    /// sync, sndsig) take the generic `UnsupportedMfcCmd` path.
+    /// Ensures the granular `UnsupportedMfcListCmd` doesn't
+    /// over-broaden.
+    #[test]
+    fn reject_non_list_non_supported_mfc_cmds_with_generic_canary() {
+        let non_list_cmds: &[(u32, &str)] = &[
+            (0xD0, "GETLLAR"),
+            (0xB4, "PUTLLC"),
+            (0xB0, "PUTLLUC"),
+            (0xB8, "PUTQLLUC"),
+            (0xC0, "BARRIER"),
+            (0xCC, "SYNC"),
+            (0xA0, "SNDSIG"),
+        ];
+        for &(cmd, mnemonic) in non_list_cmds {
+            let jsonl = format!(
+                r#"
+{{"seq":0,"side":"spu","kind":"spu_wrch","pc":256,"channel":21,"value":{cmd},"would_stall":false,"target_spu":1}}
+{{"seq":1,"side":"spu","kind":"spu_mfc_cmd","target_spu":1,"pc":256,"cmd":{cmd},"tag":3,"size":128,"lsa":0,"eah":0,"eal":4096,"ea_chunk_sha256":"{TEST_VALID_SHA}"}}
+"#
+            );
+            let err = parse_jsonl_trace(&jsonl)
+                .expect_err(&format!("{mnemonic} (0x{cmd:x}) must reject"));
+            match err {
+                TraceParseError::UnsupportedMfcCmd { cmd: got_cmd, .. } => {
+                    assert_eq!(got_cmd, cmd, "{mnemonic} preserved cmd code");
+                }
+                other => panic!(
+                    "{mnemonic} (0x{cmd:x}) should be UnsupportedMfcCmd, got {other:?}"
+                ),
+            }
+        }
     }
 
     /// R8.1 — PUT (0x20) is accepted by the parser as a sibling of

@@ -1386,3 +1386,241 @@ semantics is:
   eventually be fully covered, and future fixtures will move
   to coverage-only (R8.2 style) rather than co-fix
   (R8.3a/b/c style).
+
+### 18.6 R8.3d design-check outcome — slot-fill/slot-consume DEFERRED
+
+After R8.3c closure, R8.3d was scoped as a probe of the
+`WrTagUpdate` write-side clearing semantics. Inspection of
+`rpcs3-upstream-clean/rpcs3/Emu/Cell/SPUThread.cpp:6412-6439`
++ `5557-5559` revealed that RPCS3's actual C++ model is
+**slot-fill on `WrTagUpdate` write + slot-consume on
+`RdTagStat` read** (single-value `ch_tag_stat` slot), not the
+persistent-register model the Rust port currently uses.
+
+For the canonical SPU programming pattern
+`ch22 (mask) → ch23 (update) → ch24 (read)` exercised by all
+12 oracles, the two models are **observationally equivalent**.
+Divergence requires one of:
+
+1. **`ch24` read without a preceding `ch23` write** — RPCS3
+   stalls (slot already consumed), Rust returns
+   `completed_tags & mask`. SPU can't reach OUT_MBOX, no
+   canonical TTY captureable.
+2. **Mutating `ch22` (mask) between `ch23` and `ch24`** —
+   RPCS3 returns the stale pre-mask-change slot value, Rust
+   returns the current mask filter. Cell BE programming
+   model treats this as unspecified.
+
+Neither scenario produces a clean canonical TTY that a CC0
+oracle could capture, and both violate canonical SPU
+programming patterns. **Concluded: clearing/slot-semantic
+deferred.** No oracle, no fix.
+
+> The Rust `completed_tags` model is intentionally
+> oracle-scoped. It is observationally equivalent to RPCS3's
+> `ch_tag_stat` slot model for canonical
+> `ch22 → ch23 → ch24` sequences. Non-canonical `ch24` reads
+> without a preceding `WrTagUpdate`, or mask changes between
+> `WrTagUpdate` and `RdTagStat`, are deferred until a real
+> oracle forces them.
+
+When a future oracle (real-game capture or homebrew artistic)
+reaches the divergent corner, refactor `SpuChannels` from
+`completed_tags: u32` (persistent register) to `ch_tag_stat:
+Option<u32>` (slot). Until then, the current model is
+correct for everything that gets captured.
+
+---
+
+## 19. R8.4 — MFC GETL (list DMA, GET direction) roadmap
+
+R8.4 introduces MFC list-DMA support, scoped initially to
+GETL (cmd code 0x44) — the GET direction with a per-element
+descriptor list. PUTL (cmd 0x24) is deferred to R8.5+ because
+the descriptor format and walk logic are identical (only the
+data direction differs); landing GETL first reduces
+diagnostic surface.
+
+### 19.1 RPCS3 reference model
+
+Verified by inspecting [`rpcs3/Emu/Cell/SPUThread.cpp:2866-3020`](../rpcs3/Emu/Cell/SPUThread.cpp#L2866)
++ [`MFC.h:5-36`](../rpcs3/Emu/Cell/MFC.h#L5).
+
+**Command codes** (`MFC.h:12-14`):
+
+| Code | Mnemonic | Direction | Modifiers              |
+|------|----------|-----------|------------------------|
+| 0x24 | PUTL     | LS → EA   | list                   |
+| 0x25 | PUTLB    | LS → EA   | list + barrier         |
+| 0x26 | PUTLF    | LS → EA   | list + fence           |
+| 0x44 | GETL     | EA → LS   | list                   |
+| 0x45 | GETLB    | EA → LS   | list + barrier         |
+| 0x46 | GETLF    | EA → LS   | list + fence           |
+
+`MFC_LIST_MASK = 0x04` (set in all six). `MFC_BARRIER_MASK
+= 0x01`, `MFC_FENCE_MASK = 0x02`.
+
+**List element descriptor** (`SPUThread.cpp:2873-2879`,
+8 bytes each):
+
+```c
+struct alignas(8) list_element {
+    u8 sb;          // Stall-and-Notify bit (0x80) + 7-bit padding
+    u8 pad;         // reserved
+    be_t<u16> ts;   // List Transfer Size in bytes (masked & 0x7FFF, max 32 KiB)
+    be_t<u32> ea;   // External Address Low (BE; descriptor's EA)
+};
+```
+
+**Dispatch parameters** (when SPU writes ch16-21 for a
+GETL):
+
+| Channel | Field    | Semantics                                                   |
+|---------|----------|-------------------------------------------------------------|
+| ch16    | `mfc_lsa`| Destination LS base address (masked `& 0x3fff0`, 16-aligned) |
+| ch17    | `mfc_eah`| Must be 0 (PS3 32-bit EA)                                   |
+| ch18    | `mfc_eal`| **LS offset of the list descriptor array** (NOT data EA)    |
+| ch19    | `mfc_size`| **Total list size in BYTES** (must be multiple of 8 = N elements × 8) |
+| ch20    | `mfc_tag`| Tag (0..31)                                                 |
+| ch21    | `mfc_cmd`| 0x44 GETL (or 0x45 GETLB / 0x46 GETLF)                       |
+
+**Per-element transfer:** for each element `i`, read
+`ts[i]` bytes from `EA = items[i].ea` (in EA memory) and
+copy to `LS = mfc_lsa + cumulative_ts_sum`. The cumulative
+LS offset accumulates the aligned-up-to-16 transfer sizes.
+Stall-and-notify bit (0x80 in `sb`) pauses dispatch
+mid-list; out of R8.4 scope (defer to later — SPURS uses
+this for pipeline pacing).
+
+### 19.2 Required writer extension (R8.4b prerequisite)
+
+The current R6.7 A.1 + R8.1 writer hook in `SPUThread.cpp`
+captures `spu_mfc_cmd` only for cmd 0x40 (GET) and 0x20
+(PUT). For GETL, the hook must:
+
+1. **Detect list cmds**: extend `capture_dma` to include
+   `cmd_code & MFC_LIST_MASK != 0` (or explicit `cmd_code
+   == MFC_GETL_CMD`).
+2. **Capture the descriptor array**: read N × 8 bytes from
+   `this->ls + (mfc_eal & 0x3fff8)` (the list lives in
+   LS), serialize as a separate side-file
+   `<sha>.dmalistdesc`. The sha pins descriptor bytes
+   identically to how `.dmachunk` pins single-DMA bytes.
+3. **Capture each element's EA bytes**: for each descriptor
+   `i`, read `items[i].ts & 0x7fff` bytes from
+   `vm::_ptr<u8>(items[i].ea)` (in EA), serialize as
+   `<sha>.dmachunk` (REUSE existing pool — same
+   content-addressed scheme).
+4. **Emit `spu_mfc_cmd` with list-aware fields**: new
+   schema additive — `descriptor_sha256` + `element_chunks:
+   [sha256...]` (one per element). The existing
+   `ea_chunk_sha256` field becomes either NULL or a
+   "summary" for the list case (TBD design choice for
+   R8.4b).
+5. **Emit one `mfc_dma_complete`** with the tag and
+   `transferred_bytes` = sum of all element sizes (matches
+   what the SPU sees in completed_tags).
+
+The writer extension lives in the same `runtime_hooks` patch
+as R6.7 A.1 / R8.1 — bumps the runtime_hooks SHA pin.
+
+### 19.3 Required parser/state-machine extension (R8.4c)
+
+Parser:
+- Accept cmd 0x44 GETL (initially; 0x45/0x46 deferred).
+- New event field `descriptor_sha256` (REQUIRED for list
+  cmds) and `element_chunks` (REQUIRED, non-empty).
+- New side-file resolver for `<sha>.dmalistdesc` (mirrors
+  the `.dmachunk` resolver in `dma_chunk.rs`).
+- Validation: descriptor size = `mfc_size`, element count
+  = `mfc_size / 8`, each `element_chunks[i]` SHA-256 length
+  64 lower-hex.
+
+State machine (`MfcReplayState`):
+- New method `process_mfc_list_cmd` that loads the
+  descriptor side-file, parses N elements, loads each
+  element's `.dmachunk`, copies bytes into LS at the
+  computed offset (`lsa + sum of prior aligned-up ts`).
+- Stall-and-notify bit `0x80` rejected with a new error
+  variant `UnsupportedListStallNotify` (deferred to R8.5+).
+- All elements complete atomically — single tag-stat OR-set
+  per list cmd (matches Cell BE behavior: the WHOLE list
+  is one tag).
+
+Executor (`rpcs3-spu-thread`):
+- `wrch ch21` with `cmd = 0x44` (when set) routes through
+  the GETL callback path (R8.4d). For replay, the
+  pre-replay helper bakes the LS into the program's
+  segment ahead of time (same shape as
+  `apply_mfc_dma_pre_replay`).
+
+### 19.4 Required runtime bridge extension (R8.4d)
+
+New FFI: `rust_spu_set_dma_getl_callback(handle, fn,
+user_data)`. Signature:
+
+```c
+typedef int32_t (*rust_spu_dma_getl_cb_t)(
+    void* user_data,
+    uint32_t descriptor_lsa,  // LS offset of list descriptors
+    uint8_t* descriptor_ls_ptr, // direct LS pointer (read by callback)
+    uint32_t descriptor_size,  // total list size in bytes
+    uint32_t lsa_dest_base,    // destination LS base
+    uint32_t tag);
+```
+
+Bridge implementation (`bridge_dma_getl_callback` in
+`SPURustBridge.cpp`):
+- Read descriptor array from the SPU's LS via the supplied
+  pointer.
+- For each element, copy `ts` bytes from `vm::_ptr<u8>(ea)`
+  to the SPU's LS at `lsa_dest_base + cumulative_offset`.
+- Push `1 << tag` into the Rust handle's tag-stat queue
+  on success.
+- Return 0 success / -1 if any element exceeds 16 KiB
+  (R8.4 cap, matches R6.7 single-cmd cap) / -1 if the
+  descriptor's element count is 0 (degenerate case).
+
+The `refuse_mfc` gate already relaxes when any DMA callback
+is installed (per R7.2 / R8.1 design); adding the GETL
+callback fits the same pattern.
+
+### 19.5 R8.4 phase plan
+
+| Phase | Scope | Deliverable | Engine changes |
+|-------|-------|-------------|----------------|
+| **R8.4a** | DESIGN + parser canary | `UnsupportedMfcListCmd` variant; trace_fmt rejection per-code; this roadmap | Rust core only (replay-layer parser) |
+| R8.4b | Writer hook + parser accept | C++ writer captures descriptor + per-element chunks; Rust parser accepts schema-additive list fields; runtime_hooks SHA bumps | C++ writer + Rust parser |
+| R8.4c | Replay state machine | `process_mfc_list_cmd`; new side-file resolver for `.dmalistdesc`; `apply_mfc_dma_pre_replay` walks elements | Rust core (state machine + loader) |
+| R8.4d | CC0 GETL fixture + 13th oracle + runtime bridge | `single_spu_dma_getl_v1.self`; FFI callback + bridge handler; rpcs3.exe rebuild; bridge patch SHA bumps | Rust core + C++ bridge + new fixture |
+| (R8.4e) | PUTL equivalent | Mirror R8.4b/c/d for cmd 0x24 | Same surfaces as R8.4b/c/d, opposite data direction |
+| (R8.4f) | GETLB / GETLF | Barrier + fence variants if any oracle needs them | Likely zero or minimal new logic — bit flags only |
+
+R8.4a deliberately ships **only** the granular rejection
+canary. No writer change, no replay change, no runtime
+change, no fixture. All 12 existing oracles continue to
+pass byte-identical. The unit tests
+(`reject_mfc_list_cmds_with_granular_canary` +
+`reject_non_list_non_supported_mfc_cmds_with_generic_canary`)
+lock the rejection surface so any accidental drift would be
+caught.
+
+### 19.6 Hard rules carried forward to R8.4+
+
+- The 11-12 oracles built so far MUST remain green at every
+  R8.4 phase boundary. List DMA is strictly additive.
+- No fake list descriptor / no fake element chunk. Each
+  `.dmalistdesc` and `.dmachunk` must be byte-for-byte
+  captured from real RPCS3 vm:: memory.
+- The descriptor array MUST be content-addressed (SHA-256)
+  identically to single-DMA `.dmachunk` — no special
+  treatment.
+- Element chunks REUSE the existing `behavior-freeze/
+  fixtures/spu/dma/` pool. Dedup applies (a GETL element
+  whose bytes match the R8.2 counting pattern shares the
+  `471fb943…` chunk).
+- PUTL deferred until GETL is fully landed AND a real
+  oracle is captured. Inverting direction without an
+  oracle is fake-semantics territory.
+- Stall-and-notify (descriptor `sb` bit 0x80) deferred to
+  R8.5+. R8.4 oracles MUST NOT exercise it.
