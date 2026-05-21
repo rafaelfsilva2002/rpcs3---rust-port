@@ -1,8 +1,26 @@
-# Project Status — R8.4c LANDED (13th oracle: GETL replay state machine)
+# Project Status — R8.4d LANDED (runtime bridge GETL + 13th oracle triple-symmetric)
 
 **Authoritative current source of truth for the RPCS3 → Rust port.**
 
-Last updated: **2026-05-21 (R8.4c landing)**. R8.4c promotes
+Last updated: **2026-05-21 (R8.4d landing)**. R8.4d completes
+the R8.4 GETL roadmap by adding the runtime bridge half: the
+Rust SPU bridge now delegates `single_spu_dma_getl_v1.self`
+end-to-end with `RPCS3_SPU_RUST_BRIDGE=1`. New C ABI
+`rust_spu_set_dma_getl_callback` plus a 7-arg
+`bridge_dma_getl_callback` in `SPURustBridge.cpp` walks the
+descriptor list in SPU LS, per element memcpys `ts` bytes
+from `vm::_ptr<u8>(ea)` to `lsa_dest_base + cumulative_offset`,
+queues the tag-stat atomically. Stall-and-notify (`sb & 0x80`)
++ PUTL + GETLB/GETLF are rejected so the bridge falls back
+honestly to C++. Triple-symmetry gate extended with the
+`get_list` fixture; all 7 fixtures green (`total_steps=1598`
+for GETL with `DELEGATED EXECUTION OK`, no fallback).
+Bridge patch SHA bumped:
+`0afda1c69…` → `d2d531850f4743b240fb59573695ea247614d0aeecb8624726206937be52d2e5`.
+rpcs3.exe rebuilt: `3f2348de…` → `0f5cc2bec90986da7aa1eb9d601230c8986563a92e5027ac991f5742507b749d`.
+See "R8.4d phase closure (2026-05-21)" below.
+
+Previously: **2026-05-21 (R8.4c landing)**. R8.4c promotes
 the R8.4b capture-only GETL fixture to the 13th replay-
 validated oracle. New `MfcReplayState::process_mfc_list_cmd`
 walks the captured `.dmalistdesc` descriptor, parses each
@@ -17,7 +35,7 @@ for the `.dmalistdesc` extension. Replay test
 proves cross-backend byte-identical with canonical
 `0xDF1EEA5A`. Rust-core only fix; no C++ patches changed;
 rpcs3.exe unchanged. R8.4d adds the runtime bridge GETL
-callback (still pending). See "R8.4c phase closure
+callback (now landed — see § R8.4d above). See "R8.4c phase closure
 (2026-05-21)" below.
 
 Previously: **2026-05-21 (R8.4b landing)**. R8.4b lands the
@@ -134,6 +152,22 @@ Do NOT treat the archive as current.
 
 ## 1. Executive current status
 
+- **R8.4d is LANDED** (2026-05-21). Runtime bridge GETL
+  + triple-symmetry expansion completes the R8.4 GETL
+  roadmap. New C ABI `rust_spu_set_dma_getl_callback` +
+  C++ `bridge_dma_getl_callback` (7-arg) walks the
+  descriptor in SPU LS and per element memcpys from
+  `vm::_ptr<u8>(ea)` to `lsa_dest_base +
+  cumulative_offset`. Tag-stat queued atomically.
+  Stall-and-notify (`sb & 0x80`) + PUTL + GETLB/GETLF
+  rejected (bridge falls back honestly). Bridge ON
+  delegates `single_spu_dma_getl_v1.self` end-to-end
+  (`DELEGATED EXECUTION OK total_steps=1598`, no
+  fallback); all 7 triple-symmetry fixtures green
+  (get / put / get_multi / get_any / get_tag_poll /
+  get_tag_immediate / get_list). Bridge SHA bumped
+  `0afda1c69…` → `d2d531850f…`; rpcs3.exe rebuilt
+  `3f2348de…` → `0f5cc2bec90986da…`. See § 8.4d.
 - **R8.4c is LANDED** (2026-05-21). 13th replay-validated
   oracle: `single_spu_dma_getl_v1` (promoted from R8.4b
   capture-only). New `MfcReplayState::process_mfc_list_cmd`
@@ -141,9 +175,7 @@ Do NOT treat the archive as current.
   `dma_chunk.rs`; R8.4a canary lifted only for GETL.
   Rust-core only fix; C++ patches unchanged; rpcs3.exe
   unchanged. Replay test passes cross-backend
-  byte-identical with canonical `0xDF1EEA5A`. R8.4d
-  (runtime bridge GETL + triple-symmetry expansion)
-  remains the next phase. See § 8.4c.
+  byte-identical with canonical `0xDF1EEA5A`. See § 8.4c.
 - **R8.4b is LANDED** (2026-05-21). First half of MFC GETL
   list-DMA support: C++ writer captures GETL (cmd=0x44) with
   new `.dmalistdesc` side-file + per-element `.dmachunk` files
@@ -219,9 +251,11 @@ Do NOT treat the archive as current.
   persistent handle → R6.5 / R6.5b bridge acceptance → R6.6 game_like
   cross-path → R6.7 design + A.1-A.5 + Phase C — all landed and
   gated green.
-- **Twelve replay-validated SPU oracles exist**, all
+- **Thirteen replay-validated SPU oracles exist**, all
   `diff_snapshots(interp, jit).is_identical()` byte-identical
-  across `InterpreterExecutor` and `RecompilerExecutor`.
+  across `InterpreterExecutor` and `RecompilerExecutor`. The
+  13th, `single_spu_dma_getl_v1`, landed in R8.4c and went
+  fully triple-symmetric (bridge ON delegated) in R8.4d.
 - **`single_spu_dma_put_v1` is the 8th oracle** (R8.1 landed
   2026-05-19; runtime-delegated under bridge ON same day).
   Symmetric inverse of GET: SPU fills LS with `i & 0xFF` counting
@@ -1516,6 +1550,112 @@ both unchanged from R8.4b.
 - Stall-and-notify bit 0x80 (R8.5+).
 - 3+ element GETL fixtures (mechanically in-scope; no
   fixture yet).
+
+---
+
+## 8.4d R8.4d closure summary (2026-05-21)
+
+R8.4d closes the R8.4 GETL roadmap by landing the runtime
+bridge half. Bridge ON now delegates
+`single_spu_dma_getl_v1.self` end-to-end with no fallback;
+all three execution paths (bridge OFF / bridge ON / replay)
+converge byte-identical on canonical TTY
+`[dma_getl_v1] OK cause=0x1 status=0xdf1eea5a`.
+
+**Scope:**
+
+- **`rpcs3-spu-thread::SpuChannels`** — new
+  `dma_getl_callback: Option<DmaGetlCallback>` field (7-arg
+  `#[repr(C)]` struct: func ptr + opaque `user_data`). The
+  `refuse_mfc` gate is relaxed when ANY of the 3 callbacks
+  (GET/PUT/GETL) is installed, so list-GET dispatch routes
+  to the new callback instead of MfcUnsupported.
+
+- **`rpcs3-spu-interpreter`** — wrch ch21 dispatch extended:
+  `cmd == 0x44` GETL now early-returns through the callback
+  path with its own validation (size > 0 && size <= 0x800
+  && size % 8 == 0; descriptor_lsa + size <= 256 KiB;
+  eah == 0; tag < 32). Callback is invoked with descriptor
+  source pointer + destination base pointer + descriptor_size
+  + tag. On rc == 0 the interpreter advances pc + 4 and
+  queues `1 << tag` into `mfc_tag_stat_queue`. Any unhandled
+  cmd / failed callback still surfaces `MfcUnsupported`.
+
+- **`rpcs3-spu-ffi`** — new C ABI
+  `rust_spu_set_dma_getl_callback` + new typedef
+  `rust_spu_dma_getl_cb_t` (7-arg signature). Returns 0
+  success / -1 null handle / -100 panic. `func = NULL`
+  clears an installed callback. Two new FFI tests:
+  `rust_spu_runtime_dma_getl_callback_round_trip` (install/
+  clear/null-handle invariants under `CALLBACK_TEST_MUTEX`)
+  and `rust_spu_get_put_getl_callbacks_coexist` (all 3
+  callbacks installable simultaneously; refuse_mfc state
+  observable). All 28 FFI tests pass (up from 26 pre-R8.4d).
+
+- **`SPURustBridge.cpp`** — new
+  `bridge_dma_getl_callback` (7-arg). Validates
+  `descriptor_ls_ptr` + `descriptor_size % 8 == 0` then walks
+  each 8-byte BE slot: rejects `sb & 0x80` (stall-and-notify,
+  R8.5+ scope), `ts == 0`, `ts > 0x4000`, cumulative LS
+  overflow, null `vm::_ptr<u8>(ea)`. On success, memcpys
+  `ts` bytes from EA to `dest_ls_ptr + cumulative_offset`
+  per element. Logs
+  `[Rust SPU bridge] R8.4d DMA GETL dispatched: cmd=0x44 ...
+  transferred_bytes=%u tag=%u ... tag-stat 0x%x queued`.
+  Installed in `try_delegate_execution` alongside GET + PUT
+  (rejected install fails the delegation gracefully).
+
+**Patch SHAs at R8.4d landing:**
+
+| patch | sha256 | status |
+|---|---|---|
+| scaffolding | `5c170508a73e492d42784036d61a972edab7a85b7ea7105d6dde388a5e67d6c0` | unchanged |
+| runtime hooks | `745945f4872f7d83541aa74d9a065b6a6bc3785af73510d026e6643a0985cd96` | unchanged |
+| rust bridge | `d2d531850f4743b240fb59573695ea247614d0aeecb8624726206937be52d2e5` | **bumped** (was `0afda1c69…`) |
+
+**rpcs3.exe at R8.4d landing:** sha256
+`0f5cc2bec90986da7aa1eb9d601230c8986563a92e5027ac991f5742507b749d`
+(`3f2348de…` → `0f5cc2bec90986da…` after R8.4d rebuild with
+the new bridge patch applied). `rpcs3_spu_ffi.lib` rebuilt
+with R8.4d additions and mirrored from rpcs3-master to
+upstream-clean.
+
+**Triple-symmetry gate (`check_triple_symmetry.py`):**
+
+- New `GET_LIST_FIXTURE` entry (canonical TTY
+  `[dma_getl_v1] OK cause=0x1 status=0xdf1eea5a`,
+  delegation marker `DMA GETL dispatched`,
+  rust_log_intro `R8.4d DMA GETL`).
+- All 7 fixtures green (get / put / get_multi / get_any /
+  get_tag_poll / get_tag_immediate / get_list). Bridge ON
+  GETL: `DELEGATED EXECUTION OK (total_steps=1598)`, no
+  fallback. R6.7 A.5 + R8.1 + R8.2 + R8.3a/b/c + R8.4c
+  oracles unchanged.
+
+**Hard rules preserved (per R6.7 / R7 / R8.1 charter):**
+
+- No fake DMA, no fake list descriptor, no manual JSONL
+  edits, no fake tag-stat.
+- No v4 / SPURS promotion.
+- No PUTL, no GETLB/GETLF, no stall-and-notify (sb bit 0x80
+  is REJECTED, bridge falls back honestly).
+- Runtime scope limited to GETL (cmd 0x44) only; all other
+  list / atomic / barrier / multi-SPU paths surface
+  `MfcUnsupported`.
+- Default bridge OFF preserved; R8.4d only activates on
+  `RPCS3_SPU_RUST_BRIDGE=1`.
+
+**Out of R8.4d scope (deferred to R8.4e+):**
+
+- PUTL (R8.4e) — symmetric inverse of GETL (LS → EA list).
+  Reuse the descriptor-walk shape; `bridge_dma_putl_callback`
+  reads SPU LS at `lsa_src_base + cumulative_offset`,
+  writes via `vm::_ptr<u8>(ea)`.
+- GETLB / GETLF (R8.4f) — barrier / fence variants of GETL.
+- Stall-and-notify bit 0x80 (R8.5+) — needs SPU-to-PPU
+  signaling integration via `mfc_notify` channel.
+- 3+ element fixtures + descriptor-size edge cases (256-
+  element max).
 
 ---
 

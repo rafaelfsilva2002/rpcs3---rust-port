@@ -432,6 +432,39 @@ pub struct SpuChannels {
     /// interpreter); pure-FFI users without a callback see PUT as
     /// `MfcUnsupported` under [`Self::refuse_mfc`].
     pub dma_put_callback: Option<DmaPutCallback>,
+
+    /// R8.4d — optional runtime DMA GETL (list DMA, cmd=0x44)
+    /// callback. The interpreter intercepts `wrch ch21 (MFC_Cmd)`
+    /// with cmd=0x44 and invokes the callback with:
+    /// - `descriptor_lsa` (= mfc_eal): SPU LS offset of the
+    ///   descriptor array
+    /// - `descriptor_ls_ptr`: read-only pointer into the Rust
+    ///   handle's LS at `descriptor_lsa`, valid for
+    ///   `descriptor_size` bytes (8 × N)
+    /// - `descriptor_size` (= mfc_size): total descriptor bytes
+    /// - `lsa_dest_base` (= mfc_lsa): SPU LS offset where the
+    ///   first element lands
+    /// - `dest_ls_ptr`: mutable pointer into the Rust handle's
+    ///   LS at `lsa_dest_base`, valid for the cumulative sum of
+    ///   element ts (bounded by the bridge to ≤ 256 KiB total)
+    /// - `tag`: MFC tag to mark complete on success
+    ///
+    /// The C++ bridge handler walks each 8-byte BE descriptor
+    /// (`{ u8 sb; u8 pad; be_u16 ts; be_u32 ea; }`), validates
+    /// `sb & 0x80 == 0` (no stall-and-notify, R8.5+ scope),
+    /// `ts > 0`, `ts ≤ 0x4000`, cumulative LS ≤ 256 KiB, then
+    /// copies each element from `vm::_ptr<u8>(ea)` into
+    /// `dest_ls_ptr` at the cumulative offset. On success
+    /// returns 0; the interpreter then pushes `1 << tag` into
+    /// the tag-stat queue.
+    ///
+    /// Default `None`: pure-FFI users without a callback see
+    /// GETL as `MfcUnsupported` under [`Self::refuse_mfc`].
+    /// Replay paths consume GETL through
+    /// `MfcReplayState::process_mfc_list_cmd` (R8.4c), which
+    /// loads the captured `.dmalistdesc` + per-element
+    /// `.dmachunk` from disk — no callback needed.
+    pub dma_getl_callback: Option<DmaGetlCallback>,
 }
 
 /// R7.2 — function pointer + opaque context for the runtime DMA GET
@@ -483,6 +516,49 @@ pub struct DmaPutCallback {
         eal: u32,
         src_ls_ptr: *const u8,
         size: u32,
+        tag: u32,
+    ) -> i32,
+    pub user_data: *mut core::ffi::c_void,
+}
+
+/// R8.4d — function pointer + opaque context for the runtime DMA
+/// GETL (list-DMA EA→LS) callback. Differs from
+/// [`DmaGetCallback`] / [`DmaPutCallback`] in arity: GETL needs
+/// BOTH the descriptor source (in LS) and the destination base
+/// (also in LS) pointers, plus the descriptor size separately
+/// from the per-element transfer cap.
+///
+/// The C++ bridge handler:
+/// 1. Parses each 8-byte BE slot from `descriptor_ls_ptr`:
+///    `{ u8 sb; u8 pad; be_u16 ts; be_u32 ea }`.
+/// 2. Validates per element: `sb & 0x80 == 0` (no
+///    stall-and-notify), `ts > 0`, `ts ≤ 0x4000`, cumulative
+///    destination ≤ 256 KiB, `vm::_ptr<u8>(ea)` accessible.
+/// 3. Copies each element from `vm::_ptr<u8>(ea)` to
+///    `dest_ls_ptr + cumulative_offset` (advancing by raw `ts`
+///    sum — no padding-up, matches Cell BE observed in R8.4b
+///    capture).
+/// 4. Returns 0 on success (interpreter pushes `1 << tag`),
+///    non-zero on any validation failure (interpreter surfaces
+///    `MfcUnsupported` → bridge falls back to C++).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmaGetlCallback {
+    /// C ABI function pointer. Signature:
+    ///   `int32_t cb(void* user_data,
+    ///               uint32_t descriptor_lsa,
+    ///               const uint8_t* descriptor_ls_ptr,
+    ///               uint32_t descriptor_size,
+    ///               uint32_t lsa_dest_base,
+    ///               uint8_t* dest_ls_ptr,
+    ///               uint32_t tag)`
+    pub func: unsafe extern "C" fn(
+        user_data: *mut core::ffi::c_void,
+        descriptor_lsa: u32,
+        descriptor_ls_ptr: *const u8,
+        descriptor_size: u32,
+        lsa_dest_base: u32,
+        dest_ls_ptr: *mut u8,
         tag: u32,
     ) -> i32,
     pub user_data: *mut core::ffi::c_void,
@@ -627,6 +703,7 @@ impl SpuChannels {
         if self.refuse_mfc && is_mfc_channel(channel)
             && self.dma_get_callback.is_none()
             && self.dma_put_callback.is_none()
+            && self.dma_getl_callback.is_none()
         {
             return Err(ChannelStatus::MfcRefused);
         }
@@ -734,6 +811,7 @@ impl SpuChannels {
         if self.refuse_mfc && is_mfc_channel(channel)
             && self.dma_get_callback.is_none()
             && self.dma_put_callback.is_none()
+            && self.dma_getl_callback.is_none()
         {
             return Err(ChannelStatus::MfcRefused);
         }
@@ -790,6 +868,7 @@ impl SpuChannels {
         if self.refuse_mfc && is_mfc_channel(channel)
             && self.dma_get_callback.is_none()
             && self.dma_put_callback.is_none()
+            && self.dma_getl_callback.is_none()
         {
             return Err(ChannelStatus::MfcRefused);
         }

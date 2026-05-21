@@ -18,9 +18,13 @@ canonical OUT_MBOX status for a given DMA fixture:
 R7.3 introduced this gate for `single_spu_dma_get_v1` (cs =
 `0xdeada12f`). R8.1 extends it to `single_spu_dma_put_v1`
 (spu sentinel = `0xc0ffeeca`, ea_status = `0xcafea57e`).
+R8.2 / R8.3a / R8.3b / R8.3c add multi-GET / ANY-wait / repeated
+ch24-poll / IMMEDIATE-probe fixtures. R8.4d adds list-GET (GETL)
+via the new `bridge_dma_getl_callback` (status = `0xdf1eea5a`).
 
-Two fixtures are supported via `--fixture {get,put}` (default
-`get` for backwards compatibility).
+Seven fixtures supported via `--fixture
+{get,put,get_multi,get_any,get_tag_poll,get_tag_immediate,get_list}`
+(default `get` for backwards compatibility).
 
 This gate is the load-bearing R7.3 + R8.1 acceptance and is
 documented in `docs/PROJECT_STATUS.md` and
@@ -215,6 +219,31 @@ GET_TAG_IMMEDIATE_FIXTURE = FixtureSpec(
 )
 
 
+# R8.4d — list-GET (GETL) fixture (13th oracle). A single wrch ch21
+# with cmd=0x44 instructs the MFC to walk an N-element BE descriptor
+# array in SPU LS and per element copies `ts` bytes from RPCS3 EA to
+# Rust LS at the cumulative offset (raw `ts` sum, no padding-up).
+# Tag-stat queued atomically after the list completes. Bridge ON
+# exercises the new `bridge_dma_getl_callback` installed alongside
+# GET + PUT. Status = ((sum1 << 16) | sum2) ^ 0xDF1EBEAD where the
+# two element checksums are the same counting + constant patterns
+# already used in R8.2/R8.3a/R8.3b/R8.3c, but reached via the GETL
+# path (single ch21 dispatch instead of two queued GETs).
+GET_LIST_FIXTURE = FixtureSpec(
+    name="single_spu_dma_getl_v1",
+    rust_test_target="single_spu_dma_getl_v1_replay",
+    canonical_tty_substr="[dma_getl_v1] OK cause=0x1 status=0xdf1eea5a",
+    canonical_status_summary=(
+        "status = ((sum1 << 16) | sum2) ^ 0xDF1EBEAD where "
+        "sum1 = 0x1FC0 (descriptor #0 counting pattern, 128 B) and "
+        "sum2 = 0x1080 (descriptor #1 constant 0x42, 64 B); "
+        "GETL transferred_bytes = 192 = sum(ts) = 0xDF1EEA5A"
+    ),
+    delegation_log_marker="DMA GETL dispatched",
+    rust_log_intro="R8.4d DMA GETL",
+)
+
+
 FIXTURES = {
     "get": GET_FIXTURE,
     "put": PUT_FIXTURE,
@@ -222,6 +251,7 @@ FIXTURES = {
     "get_any": GET_ANY_FIXTURE,
     "get_tag_poll": GET_TAG_POLL_FIXTURE,
     "get_tag_immediate": GET_TAG_IMMEDIATE_FIXTURE,
+    "get_list": GET_LIST_FIXTURE,
 }
 
 

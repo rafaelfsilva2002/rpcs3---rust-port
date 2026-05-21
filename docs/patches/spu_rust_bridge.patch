@@ -49,10 +49,10 @@ index f863a2b91..d862b2287 100644
      target_precompile_headers(rpcs3_emu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../stdafx.h")
 diff --git a/rpcs3/Emu/Cell/SPURustBridge.cpp b/rpcs3/Emu/Cell/SPURustBridge.cpp
 new file mode 100644
-index 000000000..2f274f8cd
+index 000000000..4252b8e38
 --- /dev/null
 +++ b/rpcs3/Emu/Cell/SPURustBridge.cpp
-@@ -0,0 +1,964 @@
+@@ -0,0 +1,1100 @@
 +#include "stdafx.h"
 +#include "SPURustBridge.h"
 +
@@ -248,6 +248,119 @@ index 000000000..2f274f8cd
 +			"tag=%u on '%s'; real LS/EA path (vm::_ptr<u8>); tag-stat 0x%x queued "
 +			"for subsequent rdch ch24",
 +			eal, size, tag, spu ? spu->get_name().c_str() : "<unknown>",
++			1u << tag);
++		return 0;
++	}
++
++	// R8.4d -- runtime DMA GETL (list-DMA EA->LS) callback. The
++	// Rust interpreter has already validated cmd=0x44, eah=0,
++	// tag<32, descriptor_size > 0 and % 8 == 0 and <= 0x800,
++	// descriptor_lsa + descriptor_size <= 256 KiB before calling
++	// here. The handler:
++	// 1. Walks each 8-byte BE descriptor at descriptor_ls_ptr:
++	//      [0]: sb (bit 0x80 = stall-and-notify, R8.5+ scope)
++	//      [1]: pad
++	//      [2..3]: BE u16 ts
++	//      [4..7]: BE u32 ea (data EA per element)
++	// 2. Validates per element:
++	//    - sb & 0x80 == 0 (no stall-and-notify)
++	//    - ts > 0 and ts <= 0x4000 (R6.7 per-element cap)
++	//    - cumulative destination LS within 256 KiB
++	//    - vm::_ptr<u8>(ea) accessible
++	// 3. Copies each element from vm::_ptr<u8>(ea) to
++	//    dest_ls_ptr + cumulative_offset (raw ts sum advance,
++	//    no padding-up; matches Cell BE observed in R8.4b
++	//    capture: LS[0x10000..0x10080] = elem 0 (128 B);
++	//    LS[0x10080..0x100C0] = elem 1 (64 B)).
++	// 4. Returns 0 on success, -1 on any validation failure
++	//    (interpreter surfaces MfcUnsupported, bridge falls
++	//    back to C++).
++	//
++	// `user_data` is the originating `spu_thread*` (passed at
++	// callback install time, used for diagnostic logging).
++	static int32_t bridge_dma_getl_callback(
++		void* user_data,
++		uint32_t descriptor_lsa,
++		const uint8_t* descriptor_ls_ptr,
++		uint32_t descriptor_size,
++		uint32_t lsa_dest_base,
++		uint8_t* dest_ls_ptr,
++		uint32_t tag)
++	{
++		spu_thread* spu = static_cast<spu_thread*>(user_data);
++		const char* name = spu ? spu->get_name().c_str() : "<unknown>";
++
++		if (!descriptor_ls_ptr || descriptor_size == 0 || descriptor_size % 8 != 0)
++		{
++			spu_rust_bridge_log.warning(
++				"[Rust SPU bridge] bridge_dma_getl_callback: invalid descriptor "
++				"(ptr=%p size=%u) on '%s'; refusing GETL, bridge will fall back",
++				static_cast<const void*>(descriptor_ls_ptr), descriptor_size, name);
++			return -1;
++		}
++
++		const uint32_t element_count = descriptor_size / 8u;
++		uint32_t cumulative_offset = 0;
++		uint32_t total_transferred = 0;
++
++		for (uint32_t i = 0; i < element_count; ++i)
++		{
++			const uint8_t* d = descriptor_ls_ptr + i * 8;
++			const uint8_t sb = d[0];
++			const uint16_t ts = static_cast<uint16_t>((d[2] << 8) | d[3]);
++			const uint32_t ea = (static_cast<uint32_t>(d[4]) << 24)
++				| (static_cast<uint32_t>(d[5]) << 16)
++				| (static_cast<uint32_t>(d[6]) << 8)
++				|  static_cast<uint32_t>(d[7]);
++
++			if (sb & 0x80)
++			{
++				spu_rust_bridge_log.warning(
++					"[Rust SPU bridge] bridge_dma_getl_callback: element %u has "
++					"stall-and-notify bit set on '%s'; refusing GETL (R8.5+ scope)",
++					i, name);
++				return -1;
++			}
++			if (ts == 0 || ts > 0x4000)
++			{
++				spu_rust_bridge_log.warning(
++					"[Rust SPU bridge] bridge_dma_getl_callback: element %u ts=%u "
++					"out of (0, 0x4000] on '%s'; refusing GETL",
++					i, ts, name);
++				return -1;
++			}
++			// Cumulative LS bounds check.
++			if (static_cast<uint64_t>(lsa_dest_base) + cumulative_offset + ts > 0x40000ull)
++			{
++				spu_rust_bridge_log.warning(
++					"[Rust SPU bridge] bridge_dma_getl_callback: element %u "
++					"lsa_dest=0x%x cumulative=0x%x + ts=%u exceeds 256 KiB on '%s'; "
++					"refusing GETL",
++					i, lsa_dest_base, cumulative_offset, ts, name);
++				return -1;
++			}
++			const uint8_t* src = vm::_ptr<const uint8_t>(ea);
++			if (!src)
++			{
++				spu_rust_bridge_log.warning(
++					"[Rust SPU bridge] bridge_dma_getl_callback: element %u "
++					"vm::_ptr<u8>(0x%x) returned null on '%s'; refusing GETL",
++					i, ea, name);
++				return -1;
++			}
++			std::memcpy(dest_ls_ptr + cumulative_offset, src, ts);
++			cumulative_offset += ts;
++			total_transferred += ts;
++		}
++
++		spu_rust_bridge_log.success(
++			"[Rust SPU bridge] R8.4d DMA GETL dispatched: cmd=0x44 "
++			"descriptor_lsa=0x%x descriptor_size=%u element_count=%u "
++			"lsa_dest=0x%x transferred_bytes=%u tag=%u on '%s'; real EA->LS "
++			"path (vm::_ptr<u8> per element); tag-stat 0x%x queued for "
++			"subsequent rdch ch24",
++			descriptor_lsa, descriptor_size, element_count,
++			lsa_dest_base, total_transferred, tag, name,
 +			1u << tag);
 +		return 0;
 +	}
@@ -479,6 +592,29 @@ index 000000000..2f274f8cd
 +			spu_rust_bridge_log.warning(
 +				"[Rust SPU bridge] try_delegate: rust_spu_set_dma_put_callback failed "
 +				"on '%s'; falling back to C++ executor (R8.1 PUT path unavailable).",
++				spu.get_name());
++			rust_spu_drop(h);
++			return false;
++		}
++
++		// R8.4d — install the runtime DMA GETL callback. GETL is a
++		// list-DMA: a single wrch ch21 (cmd=0x44) instructs the MFC to
++		// walk an array of 8-byte BE descriptors in SPU LS at
++		// `descriptor_lsa = mfc_eal & 0x3fff8`, with `descriptor_size`
++		// = N * 8. Each slot has u8 sb, u8 pad, be_u16 ts, be_u32 ea.
++		// For each element the callback memcpys `ts` bytes from
++		// RPCS3 EA (via vm::_ptr<u8>) into Rust LS at
++		// `lsa_dest_base + cumulative_offset` (no padding-up — raw ts
++		// sum). Tag-stat is queued atomically after the whole list
++		// succeeds. Stall-and-notify (sb bit 0x80) is out of scope and
++		// rejected, so the bridge falls back honestly to C++ for that.
++		// PUTL / GETLB / GETLF are not handled and surface
++		// MfcUnsupported.
++		if (rust_spu_set_dma_getl_callback(h, &bridge_dma_getl_callback, &spu) != 0)
++		{
++			spu_rust_bridge_log.warning(
++				"[Rust SPU bridge] try_delegate: rust_spu_set_dma_getl_callback failed "
++				"on '%s'; falling back to C++ executor (R8.4d GETL path unavailable).",
 +				spu.get_name());
 +			rust_spu_drop(h);
 +			return false;
@@ -897,8 +1033,7 @@ index 000000000..2f274f8cd
 +		// OUT_MBOX, sync PC + GPRs, then invoke stop_and_signal(code)
 +		// so the rest of RPCS3 (group join, status_npc, exit_status)
 +		// terminates exactly as the C++ executor would.
-+		//warning: in the working copy of 'rpcs3/Emu/Cell/SPURustBridge.h', LF will be replaced by CRLF the next time Git touches it
- =========================================================
++		// =========================================================
 +
 +		// Drain RPCS3's IN_MBOX: the Rust SPU consumed `in_count`
 +		// values during run from our initial peek. Note the loop body
@@ -997,7 +1132,8 @@ index 000000000..2f274f8cd
 +		spu_rust_bridge_log.success(
 +			"[Rust SPU bridge] DELEGATED EXECUTION OK on '%s' (lv2_id=0x%x): "
 +			"Stop code=0x%x total_steps=%u in_mbox_consumed=%u signal_forwarded=%u "
-+			"stall_iters=%u stall_write_iters=%u final_pc=0x%x. Routing through stop_and_signal() now.",
++			"stall_iters=%u stall_write_iters=%u final_pc=0x%x. Routing through stop_and_signal(warning: in the working copy of 'rpcs3/Emu/Cell/SPURustBridge.h', LF will be replaced by CRLF the next time Git touches it
+) now.",
 +			spu.get_name(), spu.lv2_id, out_code, session->total_steps,
 +			(in_count + session->in_mbox_consumed), signals_forwarded,
 +			session->stall_iterations, session->stall_write_iterations, spu.pc);
@@ -1020,13 +1156,13 @@ index 000000000..2f274f8cd
 +}
 diff --git a/rpcs3/Emu/Cell/SPURustBridge.h b/rpcs3/Emu/Cell/SPURustBridge.h
 new file mode 100644
-index 000000000..b78310753
+index 000000000..949a592e4
 --- /dev/null
 +++ b/rpcs3/Emu/Cell/SPURustBridge.h
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,218 @@
 +#pragma once
 +
-+// R6.1 / R6.2 / R6.3a / R6.3b / R6.3c / R6.4a / R6.4b / R6.5b / R7.1 / R7.2 — RPCS3 ↔ Rust SPU bridge (opt-in, default OFF).
++// R6.1 / R6.2 / R6.3a / R6.3b / R6.3c / R6.4a / R6.4b / R6.5b / R7.1 / R7.2 / R8.1 / R8.4d — RPCS3 ↔ Rust SPU bridge (opt-in, default OFF).
 +//
 +// This header is the C++-side facade over the `rpcs3_spu_ffi` Rust
 +// staticlib. It lets the SPU thread loop optionally delegate
@@ -1156,6 +1292,36 @@ index 000000000..b78310753
 +// fell back at ch16).
 +// PUT, list DMA, atomics, barriers, multi-SPU DMA / SPURS — out
 +// of R7.2 scope; defer to R8+.
++//
++// R8.1 scope: runtime DMA PUT execution. Symmetric inverse of R7.2 —
++// `rust_spu_set_dma_put_callback(handle, &bridge_dma_put_callback,
++// &spu)` is installed at `rust_spu_new` time. On cmd=0x20 the
++// Rust interpreter validates eah/tag/size/lsa and calls the
++// callback, which memcpys `size` bytes from the Rust handle's LS
++// at `mfc_lsa` to RPCS3 EA `eal` via `vm::_ptr<u8>`. Acceptance
++// verified on `single_spu_dma_put_v1.self`: bridge ON delegates
++// end-to-end and produces the same EA sentinels as bridge OFF +
++// replay. List/atomic/barriers/multi-SPU still defer.
++//
++// R8.4d scope: runtime DMA GETL (list-GET) execution. List-DMA is
++// a single wrch ch21 with cmd=0x44 where `mfc_eal & 0x3fff8` points
++// at an array of 8-byte BE descriptors in SPU LS and
++// `mfc_size = N * 8` is the descriptor footprint. Each descriptor:
++// `u8 sb, u8 pad, be_u16 ts, be_u32 ea`. The bridge's
++// `bridge_dma_getl_callback` walks the descriptor array, and per
++// element memcpys `ts` bytes from RPCS3 EA (via `vm::_ptr<u8>`)
++// into Rust LS at `lsa_dest_base + cumulative_offset`, where
++// `cumulative_offset` advances by the raw `ts` sum (no padding-up,
++// per the Cell BE list-DMA contract). Tag-stat is queued atomically
++// after the whole list succeeds. Stall-and-notify (sb bit 0x80) is
++// rejected — falls back to C++ executor honestly. PUTL / GETLB /
++// GETLF are not handled and surface `MfcUnsupported`. Acceptance
++// verified on `single_spu_dma_getl_v1.self` (the R8.4c replay-
++// validated 13th oracle): bridge ON delegates end-to-end and
++// produces canonical TTY `[dma_getl_v1] OK cause=0x1
++// status=0xdf1eea5a`, byte-identical to bridge OFF + replay.
++// PUTL, GETLB/GETLF, list stall-and-notify, atomics, barriers,
++// multi-SPU DMA / SPURS — out of R8.4d scope; defer to R8.5+.
 +//
 +// The whole bridge is compile-time gated by `RPCS3_HAS_SPU_RUST_BRIDGE`,
 +// which the CMake build system sets only when the Rust staticlib

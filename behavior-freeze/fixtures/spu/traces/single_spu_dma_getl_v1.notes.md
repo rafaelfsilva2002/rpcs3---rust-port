@@ -2,6 +2,7 @@
 
 R8.4b — first MFC GETL (list-DMA EA→LS) capture. **R8.4c
 PROMOTED TO 13TH REPLAY-VALIDATED ORACLE** (2026-05-21).
+**R8.4d RUNTIME BRIDGE DELEGATES END-TO-END** (2026-05-21).
 
 Update history:
 - R8.4b (2026-05-21): writer extension + real capture only.
@@ -13,9 +14,14 @@ Update history:
   13th replay-validated oracle**. Cross-backend
   byte-identical via `diff_snapshots(interp, jit)
   .is_identical()` confirmed.
-- R8.4d (pending): runtime bridge GETL callback +
-  triple-symmetry expansion. Until then, bridge ON falls
-  back to C++ at the GETL dispatch.
+- R8.4d (2026-05-21): runtime bridge GETL callback landed
+  (`rust_spu_set_dma_getl_callback` FFI +
+  `bridge_dma_getl_callback` C++ handler). Bridge ON
+  delegates `single_spu_dma_getl_v1.self` end-to-end
+  (`DELEGATED EXECUTION OK total_steps=1598`, no fallback).
+  `check_triple_symmetry.py --fixture get_list` green;
+  bridge patch SHA bumped to `d2d531850f…`; rpcs3.exe
+  rebuilt `0f5cc2bec90986da…`.
 
 Captured 2026-05-21 from RPCS3 against a CC0 PSL1GHT
 homebrew authored for this purpose.
@@ -51,8 +57,11 @@ R8.4b writer extension active. Patches:
   snapshots descriptor + per-element EA bytes, calls
   `record_spu_mfc_getl_cmd`, emits `mfc_dma_complete` with
   `transferred_bytes = sum(ts)`)
-- rust bridge: `0afda1c6…` (UNCHANGED — no bridge runtime
-  GETL yet, R8.4d scope)
+- rust bridge: `0afda1c6…` (at R8.4b/c capture time) →
+  `d2d531850f…` (R8.4d landing — bridge GETL callback
+  added). The capture itself was done against the pre-
+  R8.4d bridge; the new bridge sha applies to runtime
+  delegation only and does NOT affect the captured JSONL.
 
 `bin/rpcs3.exe`:
 - size 63,942,656 bytes
@@ -156,14 +165,41 @@ element_chunks, element_sizes, element_eals).
   canary unit test updated to iterate only the 5
   unsupported codes).
 
-## R8.4d (still pending)
+## R8.4d — IMPLEMENTED
 
-- Runtime bridge `rust_spu_set_dma_getl_callback` FFI.
-- C++ bridge handler in `SPURustBridge.cpp` (read
-  descriptor from SPU's LS, walk elements, copy each from
-  `vm::_ptr<u8>(ea)` to LS at cumulative offset).
-- rpcs3.exe rebuild + bridge patch SHA bump.
-- Triple-symmetry expansion for `--fixture get_list`.
+- `rust_spu_set_dma_getl_callback` FFI ✓ landed with new
+  C ABI `rust_spu_dma_getl_cb_t` (7-arg signature):
+  `(user_data, descriptor_lsa, descriptor_ls_ptr,
+  descriptor_size, lsa_dest_base, dest_ls_ptr, tag) ->
+  int32_t`. Returns 0 success / -1 null handle / -100
+  panic. `func = NULL` clears.
+- `bridge_dma_getl_callback` ✓ in `SPURustBridge.cpp`:
+  walks 8-byte BE descriptors, rejects `sb & 0x80`
+  (R8.5+ scope), `ts == 0`, `ts > 0x4000`, cumulative LS
+  overflow, null `vm::_ptr<u8>(ea)`; memcpys `ts` bytes
+  per element from EA to `dest_ls_ptr +
+  cumulative_offset`; logs
+  `R8.4d DMA GETL dispatched: cmd=0x44 ...
+  transferred_bytes=192 tag=3`.
+- Bridge install in `try_delegate_execution` ✓ alongside
+  GET + PUT (failed install gracefully falls back).
+- `rpcs3.exe` rebuilt ✓ — new sha
+  `0f5cc2bec90986da7aa1eb9d601230c8986563a92e5027ac991f5742507b749d`.
+- Bridge patch SHA bumped ✓ —
+  `0afda1c69…` → `d2d531850f4743b240fb59573695ea247614d0aeecb8624726206937be52d2e5`.
+  `check_patch_separation.py` green with new pin.
+- `check_triple_symmetry.py --fixture get_list` ✓ green;
+  bridge ON `DELEGATED EXECUTION OK total_steps=1598`,
+  no fallback. All 7 fixtures (get / put / get_multi /
+  get_any / get_tag_poll / get_tag_immediate / get_list)
+  green.
+- Two new FFI tests ✓ —
+  `rust_spu_runtime_dma_getl_callback_round_trip` and
+  `rust_spu_get_put_getl_callbacks_coexist`. 28 FFI
+  tests total, up from 26 pre-R8.4d.
+
+PUTL / GETLB / GETLF / stall-and-notify still rejected —
+R8.4e+ scope.
 
 ## Stability
 

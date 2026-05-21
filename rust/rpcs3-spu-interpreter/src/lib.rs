@@ -885,7 +885,8 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
             // bridge falls back honestly.
             if channel == 21 /* MFC_CMD */
                 && (spu.channels.dma_get_callback.is_some()
-                    || spu.channels.dma_put_callback.is_some())
+                    || spu.channels.dma_put_callback.is_some()
+                    || spu.channels.dma_getl_callback.is_some())
             {
                 let cmd = value & 0xff;
                 let lsa = spu.channels.mfc_lsa as usize;
@@ -893,6 +894,65 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
                 let eal = spu.channels.mfc_eal;
                 let size = spu.channels.mfc_size as usize;
                 let tag = spu.channels.mfc_tag_id;
+
+                // R8.4d — GETL has different validation: mfc_eal is
+                // the LS offset of the descriptor list (not data EA),
+                // mfc_size is the descriptor array size (= N * 8),
+                // mfc_lsa is the destination base. Simple GET/PUT
+                // uses lsa+size as the destination region.
+                if cmd == 0x44 {
+                    // GETL validation: eah=0, tag<32, size > 0 and %
+                    // 8 == 0 and ≤ 0x800 (256 elements), descriptor
+                    // (at eal) fits in LS.
+                    let getl_size_ok = size > 0
+                        && size <= 0x800
+                        && size % 8 == 0;
+                    let descriptor_lsa = (eal & 0x3fff8) as usize;
+                    let descriptor_ok = descriptor_lsa
+                        .checked_add(size)
+                        .map_or(false, |end| end <= SPU_LS_SIZE);
+                    let validated_getl = eah == 0 && tag < 32 && getl_size_ok && descriptor_ok;
+                    if validated_getl {
+                        if let Some(cb) = spu.channels.dma_getl_callback {
+                            // R8.4d GETL: callback reads the
+                            // descriptor list (read-only) and writes
+                            // each element into LS at the cumulative
+                            // offset. Bridge handler enforces
+                            // per-element bounds.
+                            let desc_ptr = unsafe {
+                                spu.ls_mut_ptr_unchecked(descriptor_lsa as u32) as *const u8
+                            };
+                            let dest_ptr = unsafe {
+                                spu.ls_mut_ptr_unchecked(lsa as u32)
+                            };
+                            let rc = unsafe {
+                                (cb.func)(
+                                    cb.user_data,
+                                    eal,
+                                    desc_ptr,
+                                    size as u32,
+                                    lsa as u32,
+                                    dest_ptr,
+                                    tag,
+                                )
+                            };
+                            if rc == 0 {
+                                spu.channels.mfc_tag_stat_queue.push_back(1u32 << tag);
+                                spu.pc = pc.wrapping_add(4);
+                                return Ok(StepOutcome::Continue);
+                            }
+                        }
+                    }
+                    // GETL validation failed OR callback missing OR
+                    // callback returned non-zero — fall through to
+                    // MfcUnsupported.
+                    return Ok(StepOutcome::MfcUnsupported {
+                        channel,
+                        is_write: true,
+                        is_count: false,
+                    });
+                }
+
                 let size_ok = size > 0
                     && size <= 0x4000
                     && (matches!(size, 1 | 2 | 4 | 8) || size.is_multiple_of(16));

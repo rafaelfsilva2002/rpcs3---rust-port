@@ -212,6 +212,60 @@ int32_t rust_spu_set_dma_put_callback(rust_spu_t *h,
                                       void *user_data);
 
 /**
+ * R8.4d — C ABI signature for the runtime DMA GETL (list-DMA
+ * EA -> LS) callback. Differs from GET/PUT in arity: GETL needs
+ * BOTH the descriptor source pointer (in SPU LS) and the dest
+ * base pointer (also in SPU LS), plus descriptor_size separately
+ * from per-element transfer sizes.
+ *
+ * Caller (interpreter) passes:
+ * - descriptor_lsa: SPU LS offset of the descriptor list (=
+ *   mfc_eal & 0x3fff8).
+ * - descriptor_ls_ptr: read-only pointer into SPU LS at
+ *   descriptor_lsa, valid for descriptor_size bytes.
+ * - descriptor_size: total descriptor bytes (= N * 8).
+ * - lsa_dest_base: SPU LS offset where the first element lands
+ *   (= mfc_lsa).
+ * - dest_ls_ptr: mutable pointer into SPU LS at lsa_dest_base,
+ *   valid for the cumulative sum of element ts (bounded by the
+ *   bridge to <= 256 KiB total).
+ * - tag: MFC tag to mark complete on success.
+ *
+ * Callee (bridge handler) walks each 8-byte BE descriptor
+ * (`{ u8 sb; u8 pad; be_u16 ts; be_u32 ea }`), validates each
+ * element (sb & 0x80 == 0 -- no stall-and-notify, R8.5+ scope;
+ * ts > 0; ts <= 0x4000; cumulative LS <= 256 KiB;
+ * vm::_ptr<u8>(ea) accessible), then copies each from
+ * vm::_ptr<u8>(ea) to dest_ls_ptr + cumulative_offset
+ * (advancing by raw ts sum -- matches Cell BE observed in
+ * R8.4b capture).
+ *
+ * Returns 0 on success, non-zero to refuse (interpreter then
+ * surfaces `MfcUnsupported`, bridge falls back to C++).
+ */
+typedef int32_t (*rust_spu_dma_getl_cb_t)(void *user_data,
+                                          uint32_t descriptor_lsa,
+                                          const uint8_t *descriptor_ls_ptr,
+                                          uint32_t descriptor_size,
+                                          uint32_t lsa_dest_base,
+                                          uint8_t *dest_ls_ptr,
+                                          uint32_t tag);
+
+/**
+ * R8.4d — install (or clear) the runtime DMA GETL callback.
+ * Pass `func = NULL` to clear an existing callback. The GETL
+ * callback is independent of the GET / PUT callbacks: all three
+ * can be installed simultaneously, and the interpreter routes
+ * `wrch ch21 (MFC_Cmd)` by cmd value (0x40 GET, 0x20 PUT,
+ * 0x44 GETL, else MfcUnsupported).
+ *
+ * Returns 0 on success, -1 if `h` is null.
+ */
+int32_t rust_spu_set_dma_getl_callback(rust_spu_t *h,
+                                       rust_spu_dma_getl_cb_t func,
+                                       void *user_data);
+
+/**
  * Run up to `max_steps` instructions. Returns the outcome that
  * caused the run to halt:
  *

@@ -455,6 +455,70 @@ pub unsafe extern "C" fn rust_spu_set_dma_put_callback(
 }
 
 // =====================================================================
+// R8.4d — DMA GETL list-DMA callback
+// =====================================================================
+
+/// R8.4d — C ABI signature for the runtime DMA GETL callback.
+/// Matches [`rpcs3_spu_thread::DmaGetlCallback::func`]. GETL needs
+/// BOTH the descriptor source (in SPU LS) and the destination
+/// base (also in SPU LS) pointers, plus the descriptor size
+/// separately from the per-element transfer cap.
+///
+/// The bridge handler walks each 8-byte BE descriptor
+/// (`{ u8 sb; u8 pad; be_u16 ts; be_u32 ea }`), validates
+/// (`sb & 0x80 == 0`, `ts > 0`, `ts ≤ 0x4000`, cumulative LS
+/// ≤ 256 KiB, `vm::_ptr<u8>(ea)` accessible), then copies each
+/// element from `vm::_ptr<u8>(ea)` to `dest_ls_ptr +
+/// cumulative_offset` (advancing by raw `ts` sum — matches
+/// Cell BE observed in R8.4b capture).
+///
+/// Returns 0 on success, non-zero to refuse (interpreter then
+/// surfaces `MfcUnsupported`, bridge falls back to C++).
+pub type DmaGetlCallbackFn = unsafe extern "C" fn(
+    user_data: *mut core::ffi::c_void,
+    descriptor_lsa: u32,
+    descriptor_ls_ptr: *const u8,
+    descriptor_size: u32,
+    lsa_dest_base: u32,
+    dest_ls_ptr: *mut u8,
+    tag: u32,
+) -> i32;
+
+/// R8.4d — install (or clear) the runtime DMA GETL callback on
+/// the handle. Pass `func = NULL` to clear an existing callback.
+/// The GETL callback is independent of the GET / PUT callbacks:
+/// all three can be installed simultaneously, and the interpreter
+/// routes `wrch ch21 (MFC_Cmd)` by cmd value (0x40 → GET, 0x20
+/// → PUT, 0x44 → GETL, else → MfcUnsupported).
+///
+/// Returns 0 on success, -1 if `h` is null.
+///
+/// # Safety
+///
+/// Same contract as [`rust_spu_set_dma_get_callback`] /
+/// [`rust_spu_set_dma_put_callback`]: the (`func`, `user_data`)
+/// pair must outlive every `rust_spu_run_until_event` call on
+/// this handle.
+#[no_mangle]
+pub unsafe extern "C" fn rust_spu_set_dma_getl_callback(
+    h: *mut RustSpu,
+    func: Option<DmaGetlCallbackFn>,
+    user_data: *mut core::ffi::c_void,
+) -> i32 {
+    guard(
+        || {
+            let Some(h) = handle_mut(h) else { return -1 };
+            h.spu.channels.dma_getl_callback = func.map(|f| rpcs3_spu_thread::DmaGetlCallback {
+                func: f,
+                user_data,
+            });
+            0
+        },
+        -100,
+    )
+}
+
+// =====================================================================
 // Run / step
 // =====================================================================
 
