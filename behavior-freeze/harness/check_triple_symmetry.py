@@ -167,11 +167,38 @@ GET_ANY_FIXTURE = FixtureSpec(
 )
 
 
+# R8.3b — repeated-RdTagStat polling fixture (11th oracle).
+# Same shape as R8.3a multi (two queued GETs) but the SPU
+# performs TWO ch24 reads with distinct masks (0x08 then 0x20)
+# in the same session, embedding BOTH returned values into the
+# canonical status. Forces persistent `completed_tags` semantics
+# in `SpuChannels`; predicate caught the divergence vs the
+# previous drain-clear semantic (single-read would have empty
+# queue on second). Captured ch24 = 0x08 + 0x20. Canonical
+# status = ((0x1FC0 << 16) | 0x1080) ^ ((0x08 << 24) | (0x20 << 16))
+# ^ 0xCAFEBADC = 0xDD1EAA5C.
+GET_TAG_POLL_FIXTURE = FixtureSpec(
+    name="single_spu_dma_tag_poll_v1",
+    rust_test_target="single_spu_dma_tag_poll_v1_replay",
+    canonical_tty_substr="[dma_tag_poll_v1] OK cause=0x1 status=0xdd1eaa5c",
+    canonical_status_summary=(
+        "status = ((sum1 << 16) | sum2) ^ "
+        "((tag_stat_1 << 24) | (tag_stat_2 << 16)) ^ 0xCAFEBADC "
+        "where sum1 = 0x1FC0, sum2 = 0x1080, tag_stat_1 = 0x08 "
+        "(read #1 mask 0x08 ANY), tag_stat_2 = 0x20 (read #2 "
+        "mask 0x20 ANY) = 0xDD1EAA5C"
+    ),
+    delegation_log_marker="DMA GET dispatched",
+    rust_log_intro="R7.2 DMA GET (multi-dispatch, repeated-poll)",
+)
+
+
 FIXTURES = {
     "get": GET_FIXTURE,
     "put": PUT_FIXTURE,
     "get_multi": GET_MULTI_FIXTURE,
     "get_any": GET_ANY_FIXTURE,
+    "get_tag_poll": GET_TAG_POLL_FIXTURE,
 }
 
 

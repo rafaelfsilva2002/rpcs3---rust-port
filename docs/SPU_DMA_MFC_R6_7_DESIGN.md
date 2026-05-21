@@ -1191,3 +1191,116 @@ The ANY branch + ch24 drain-aggregate fix specifically adds:
   drain-clear semantic doesn't support multi-read polling;
   R8.4+ must refactor to persistent `completed_tags` if such
   a fixture is required.
+
+---
+
+## 17. R8.3b closure note (2026-05-20) — persistent completed_tags
+
+R8.3b lifted the "one ch24 read per session" limitation by
+adding the `completed_tags: u32` field to `SpuChannels` and
+making ch24 reads NEVER clear it. The 11th oracle
+`single_spu_dma_tag_poll_v1` performs two ch24 reads with
+distinct masks in the same SPU session — exactly the pattern
+that the R8.3a drain-clear semantic could not handle.
+
+### 17.1 The divergence
+
+The R8.3a fix drained the queue on each read but the queue
+emptied permanently — there was no persistent state to feed
+subsequent reads. Real Cell BE / RPCS3 C++ exposes
+`completed_tags` as a register that:
+
+- Accumulates bits as MFC DMA completes fire.
+- Is read via ch24 (mask-filtered) but NOT cleared on read.
+- (Some Cell BE generations support per-bit clear via
+  `WrTagUpdate=IMMEDIATE` write — deferred to R8.4+.)
+
+A SPU program that polls multiple tag subsets across the same
+wait window depends on this persistence. With the R8.3a
+implementation, the second ch24 read in
+`single_spu_dma_tag_poll_v1` returned `WouldStall` because the
+queue had drained to empty during the first read. Bridge ON
+fell back to C++ at the stall outcome (correct fallback
+behavior, but NOT what triple-symmetry expects from a fully
+delegated session).
+
+### 17.2 The fix
+
+Single field + single function:
+
+```rust
+pub struct SpuChannels {
+    pub mfc_tag_stat_queue: VecDeque<u32>,  // existing producer queue
+    pub completed_tags: u32,                // R8.3b — persistent register
+    // ... other fields ...
+}
+
+ch::MFC_RD_TAG_STAT => {
+    // Drain queue: absorb any newly-arrived bits into completed_tags.
+    while let Some(v) = self.mfc_tag_stat_queue.pop_front() {
+        self.completed_tags |= v;
+    }
+    if self.completed_tags == 0 {
+        return Err(ChannelStatus::WouldStall);
+    }
+    // Mask-filter return, NEVER clear completed_tags.
+    Ok(self.completed_tags & self.mfc_wr_tag_mask)
+}
+```
+
+The producer queue is retained for backwards compat:
+
+- **Pre-replay** (R6.7 C.3 `apply_mfc_dma_pre_replay`) still
+  pushes one entry per captured `spu_rdch ch24` event. On
+  the first read in replay, all such entries get absorbed
+  into `completed_tags` — subsequent reads see the same
+  state.
+- **Runtime callbacks** (R7.2 GET + R8.1 PUT) still push
+  `1 << tag` per ch21 dispatch. The next ch24 read absorbs
+  whatever has accumulated since the prior absorption.
+
+### 17.3 What R8.3b does NOT do
+
+R8.3b adds persistence ACROSS READS but not clearing
+semantics. Specifically:
+
+- `MFC_TAG_UPDATE_IMMEDIATE` (mode 0) intentionally clears
+  `completed_tags` per-bit on read in real Cell BE. R8.3b
+  oracles use ANY mode exclusively; Immediate is in-scope
+  mechanically but no oracle exercises it.
+- Some Cell BE implementations clear `completed_tags & mask`
+  on `WrTagUpdate` writes (semantic varies by silicon).
+  R8.3b ignores any such side effect.
+
+These limitations are deferred to R8.4+ when an oracle forces
+them, per the empirical-scoping policy.
+
+### 17.4 R8.3b acceptance state
+
+- ✅ 11 replay-validated oracles green (cross-backend byte-identical)
+- ✅ workspace `--lib --no-fail-fast` green (all crates)
+- ✅ `check_trace_fixtures.py` green (11 fixtures listed)
+- ✅ `check_patch_separation.py` green (3 SHA-pinned patches
+  UNCHANGED from R8.1 — R8.3a/R8.3b fixes are Rust-core only)
+- ✅ `check_triple_symmetry.py --fixture {get,put,get_multi,
+  get_any,get_tag_poll}` all five green
+- ✅ rpcs3.exe rebuilt to `34ec50d7…` (relinked fresh
+  `rpcs3_spu_ffi.lib`)
+- ✅ v4 still diagnostic-only
+- ✅ `single_spu_dma_tag_poll_v1` is the project's first
+  repeated-RdTagStat polling oracle; status `0xDD1EAA5C`
+  byte-identical across the three execution paths.
+
+### 17.5 R8.3b hard rules carried forward to R8.4+
+
+- No silent ch24 clearing. `completed_tags` is persistent;
+  any future clearing must happen via explicit `WrTagUpdate`
+  semantic landing in its own R-phase.
+- Polling fixtures must embed BOTH (or all N) ch24 returned
+  values in the canonical status arithmetic. Discarding any
+  read via `(void)` hides per-read divergences (cf. R8.2's
+  latent bug surfaced by R8.3a's tag_stat embed).
+- The cargo-cache rebuild gotcha is now documented: for
+  Rust-core-only fixes that need to relink rpcs3.exe,
+  `touch` a source file in the dependency graph before
+  `cargo build` to force a fresh `.lib`.

@@ -1,8 +1,22 @@
-# Project Status — R8.3a LANDED (10th oracle: ANY-wait mode + ch24 drain-aggregate fix)
+# Project Status — R8.3b LANDED (11th oracle: persistent completed_tags fix)
 
 **Authoritative current source of truth for the RPCS3 → Rust port.**
 
-Last updated: **2026-05-20 (R8.3a landing)**. R8.3a (ANY wait
+Last updated: **2026-05-20 (R8.3b landing)**. R8.3b (repeated-
+RdTagStat polling + 11th oracle) is the SECOND fixture in a row
+that surfaced a real Rust runtime / C++ executor divergence and
+co-fixed it. The new fixture `single_spu_dma_tag_poll_v1`
+mirrors R8.3a multi-DMA but the SPU performs TWO ch24 reads in
+the same session with distinct masks (0x08 then 0x20). The
+drain-clear semantic from R8.3a stalled the second read; fix:
+added `completed_tags: u32` field on `SpuChannels`, persistent
+across reads (mirroring Cell BE / C++ behavior). ch24 read
+drains queue OR-into `completed_tags`, returns
+`completed_tags & mfc_wr_tag_mask` WITHOUT clearing. All 5
+triple-symmetry fixtures green post-fix. See "R8.3b closure
+(2026-05-20)" below.
+
+Previously: **2026-05-20 (R8.3a landing)**. R8.3a (ANY wait
 mode + 10th oracle) is the first fixture that surfaced a real
 divergence between the Rust runtime and the C++ executor — and
 the divergence was co-fixed in the same delivery. The new
@@ -66,6 +80,19 @@ Do NOT treat the archive as current.
 
 ## 1. Executive current status
 
+- **R8.3b is LANDED** (2026-05-20). First repeated-RdTagStat
+  polling oracle + 11th oracle. Two queued GETs + TWO ch24
+  reads (masks 0x08, 0x20, both ANY) in the same session.
+  Both reads must see persistent `completed_tags` bits, with
+  per-mask AND filtering. Pre-fix prediction: replay parked
+  at pc=140 channel 24 (queue drained); bridge ON stall
+  fallback to C++ at total_steps=36. Engine fix: added
+  `completed_tags: u32` on `SpuChannels`, persistent across
+  reads. Fix is single-file Rust core; C++ patches unchanged.
+  rpcs3.exe rebuilt twice (cargo cache gotcha — first build
+  used stale lib; touch + rebuild forced fresh). All 5
+  triple-symmetry fixtures green. Canonical status
+  `0xDD1EAA5C` proven across bridge OFF / bridge ON / replay.
 - **R8.3a is LANDED** (2026-05-20). First ANY-wait-mode replay
   oracle + 10th oracle. Same shape as R8.2 multi but with
   `WrTagUpdate = ANY` (= 1) and tag_stat embedded in canonical
@@ -102,7 +129,7 @@ Do NOT treat the archive as current.
   persistent handle → R6.5 / R6.5b bridge acceptance → R6.6 game_like
   cross-path → R6.7 design + A.1-A.5 + Phase C — all landed and
   gated green.
-- **Ten replay-validated SPU oracles exist**, all
+- **Eleven replay-validated SPU oracles exist**, all
   `diff_snapshots(interp, jit).is_identical()` byte-identical
   across `InterpreterExecutor` and `RecompilerExecutor`.
 - **`single_spu_dma_put_v1` is the 8th oracle** (R8.1 landed
@@ -168,7 +195,7 @@ backed up at `C:\docker-backup\rpcs3-ps3dev-toolchain-local.tar`.
 
 ## 3. Current oracle matrix
 
-All ten oracles below pass cross-backend byte-identical
+All eleven oracles below pass cross-backend byte-identical
 (`diff_snapshots(interp, jit).is_identical()`). Each `.jsonl` has a
 companion `.notes.md` documenting provenance, toolchain, capture
 procedure, engine fixes co-landed, and acceptance criteria.
@@ -184,7 +211,8 @@ procedure, engine fixes co-landed, and acceptance criteria.
 | 7 | [`single_spu_dma_get_v1`](../behavior-freeze/fixtures/spu/traces/single_spu_dma_get_v1.jsonl) | R6.7 A.5 | 15 | MFC GET (ch16-21 wrch + `spu_mfc_cmd` + `mfc_dma_complete` + ch22-23 + rdch ch24) + post-DMA sum + XOR | `0xDEADA12F` | yes (GET 0x40) | bridge ON delegated via R7.2 (`total_steps=1054 stall_iters=0`); triple-symmetric |
 | 8 | [`single_spu_dma_put_v1`](../behavior-freeze/fixtures/spu/traces/single_spu_dma_put_v1.jsonl) | R8.1 | 15 | MFC PUT (symmetric inverse of GET — LS → EA) + 128-byte LS source pattern → ch16-21 + spu_mfc_cmd cmd=0x20 + mfc_dma_complete + ch22-23 + rdch ch24 + ch28 OUT_MBOX sentinel; PPU reads EA back → `ea_status = 0xCAFEA57E` | spu=`0xC0FFEECA`, ea_status=`0xCAFEA57E` | yes (PUT 0x20) | bridge ON delegated via R8.1 (`total_steps=1049 stall_iters=0`); triple-symmetric |
 | 9 | [`single_spu_dma_get_multi_v1`](../behavior-freeze/fixtures/spu/traces/single_spu_dma_get_multi_v1.jsonl) | R8.2 | 23 | TWO QUEUED MFC GETs (cmd 0x40, tags 3 + 5, distinct EAs / sizes 128 + 64 / LSAs 0x10000 + 0x10100, both in-flight before any wait) + WrTagMask=0x28 + WrTagUpdate=ALL + RdTagStat=0x28 + ch28 OUT_MBOX status; FIRST multi-DMA oracle | `0xE12DEA4E` | yes (GET 0x40 × 2) | bridge ON delegated via R7.2 callback × 2 dispatches (`total_steps=1584 stall_iters=0`); triple-symmetric; ZERO engine-side code changes |
-| 10 | **[`single_spu_dma_get_any_v1`](../behavior-freeze/fixtures/spu/traces/single_spu_dma_get_any_v1.jsonl)** | **R8.3a** | **23** | **TWO QUEUED MFC GETs (same shape as R8.2 multi) + WrTagUpdate=ANY (= 1) + captured RdTagStat=0x28 + ch28 OUT_MBOX status embedding tag_stat via `(tag_stat << 24) ^ 0xBEEFBEAD`; FIRST ANY-wait-mode oracle** | **`0x892FAE2D`** | **yes (GET 0x40 × 2, ANY mode)** | **bridge ON delegated post-fix (`total_steps=1588`); R8.3a engine fix: `MFC_RD_TAG_STAT` read drains queue + ORs + ANDs with `mfc_wr_tag_mask`** |
+| 10 | [`single_spu_dma_get_any_v1`](../behavior-freeze/fixtures/spu/traces/single_spu_dma_get_any_v1.jsonl) | R8.3a | 23 | TWO QUEUED MFC GETs (same shape as R8.2 multi) + WrTagUpdate=ANY (= 1) + captured RdTagStat=0x28 + ch28 OUT_MBOX status embedding tag_stat via `(tag_stat << 24) ^ 0xBEEFBEAD`; FIRST ANY-wait-mode oracle | `0x892FAE2D` | yes (GET 0x40 × 2, ANY mode) | bridge ON delegated post-fix (`total_steps=1588`); R8.3a engine fix: `MFC_RD_TAG_STAT` read drains queue + ORs + ANDs with `mfc_wr_tag_mask` |
+| 11 | **[`single_spu_dma_tag_poll_v1`](../behavior-freeze/fixtures/spu/traces/single_spu_dma_tag_poll_v1.jsonl)** | **R8.3b** | **26** | **TWO QUEUED MFC GETs + TWO ch24 reads in the same SPU session, distinct masks 0x08 / 0x20, both ANY mode + ch28 OUT_MBOX status embedding BOTH returned tag_stats via `((tag_stat_1 << 24) \| (tag_stat_2 << 16)) ^ 0xCAFEBADC`; FIRST repeated-RdTagStat polling oracle** | **`0xDD1EAA5C`** | **yes (GET 0x40 × 2, ANY × 2 reads)** | **bridge ON delegated post-fix (`total_steps=1594`); R8.3b engine fix: added persistent `completed_tags: u32` on `SpuChannels`, ch24 read drains queue + ORs into `completed_tags` + ANDs with mask, NEVER clears** |
 
 Notes on the seventh row:
 
@@ -917,15 +945,153 @@ the C++ patches, which are byte-identical to R8.2.
 (63,942,656 bytes; built 2026-05-20 with R7.1 + R7.2 + R8.1 +
 R8.3a surface).
 
-**Out of R8.3a scope (deferred to R8.4+):** DMA list cmds
+**Out of R8.3a scope (deferred to R8.3b+):** DMA list cmds
 (GETL/PUTL/GETLB/PUTLB), atomic primitives (GETLLAR/PUTLLC/
 PUTLLUC/PUTQLLUC), MFC barriers / fence bits, multi-SPU DMA
 races on shared EA, SPURS production support, repeated ch24
 reads in the same SPU session (current drain-clear semantics
-work for the single-read shape but not for polling), persistent
-`completed_tags` state in `SpuChannels`, in-line state-machine
+work for the single-read shape but not for polling — **landed
+in R8.3b, see § 8.3b**), persistent `completed_tags` state in
+`SpuChannels` (**landed in R8.3b**), in-line state-machine
 executor wiring. The R6 / R7 / R8.1 / R8.2 hard rules carry
 forward verbatim.
+
+---
+
+## 8.3b R8.3b closure summary (2026-05-20)
+
+R8.3b landed on the same day as R8.3a as the SECOND consecutive
+fixture to surface and co-fix a real runtime/replay divergence.
+The 11th oracle `single_spu_dma_tag_poll_v1` forces persistent
+`completed_tags` semantics — exactly the limitation that the
+R8.3a closure note documented as "deferred until such a fixture
+exists per the empirical-scoping policy".
+
+**Scope.** Two queued MFC GETs (same tags / EAs / sizes as
+R8.3a) + `WrTagMask = 0x08, WrTagUpdate = ANY, RdTagStat → 0x08` +
+`WrTagMask = 0x20, WrTagUpdate = ANY, RdTagStat → 0x20`. Both
+reads execute in the same SPU session, between which the SPU
+only changes the mask register. The SPU embeds BOTH returned
+values into the canonical via `((tag_stat_1 << 24) | (tag_stat_2
+<< 16)) ^ 0xCAFEBADC = 0xDD1EAA5C`. The captured trace contains
+two `spu_rdch ch24` events (values 0x08 and 0x20) instead of one.
+
+**Predicted divergences (all confirmed empirically before the
+fix landed).**
+
+- **Replay:** parked at pc=140 reason=ChannelRead{channel:24}.
+  First read drained the queue, second read found queue empty
+  → WouldStall → executor reports park outcome → trace replay
+  fails with `UnexpectedSpuState{expected:Finished(0x101),
+  actual:Parked{...}}`.
+- **Bridge ON:** Rust bridge log:
+  `R7.2 DMA GET dispatched ... R7.2 DMA GET dispatched ...
+   try_delegate: StallRead stall on unknown channel during read
+   (stall_iters=0 total_steps=36) ... falling back to C++
+   executor`. The C++ executor takes over from the stall point
+  and completes the SPU correctly, producing canonical TTY,
+  but the Rust bridge did NOT delegate end-to-end (the
+  triple-symmetry [2/3] gate FAILed on "expected DELEGATED
+  EXECUTION OK").
+- **Bridge OFF:** OK (C++ has persistent `completed_tags`).
+
+**Engine fix.** Single field + single function change in
+`rust/rpcs3-spu-thread/src/lib.rs`:
+
+```rust
+pub struct SpuChannels {
+    // ... existing fields ...
+    pub mfc_tag_stat_queue: std::collections::VecDeque<u32>,
+    pub completed_tags: u32,  // R8.3b — persistent register
+}
+
+// In SpuChannels::read:
+ch::MFC_RD_TAG_STAT => {
+    while let Some(v) = self.mfc_tag_stat_queue.pop_front() {
+        self.completed_tags |= v;
+    }
+    if self.completed_tags == 0 {
+        return Err(ChannelStatus::WouldStall);
+    }
+    Ok(self.completed_tags & self.mfc_wr_tag_mask)
+}
+```
+
+Behavior:
+- Drain queue OR-into `completed_tags` (absorbs any
+  newly-arrived per-tag bits from callbacks or pre-replay).
+- Return `WouldStall` only if `completed_tags == 0`.
+- Return `completed_tags & mfc_wr_tag_mask` — NEVER clears
+  `completed_tags`. Multiple reads observe the same persistent
+  state with per-mask filtering.
+
+This matches Cell BE / C++ executor semantics exactly for read
+behavior. Clear-on-write (R8.4+) is deferred.
+
+**Companion unit test rewritten.** The R8.3a test
+`mfc_rdtagstat_drains_queue_and_aggregates_with_mask` was
+replaced by `mfc_rdtagstat_persistent_completed_tags_with_mask_filtering`
+covering: empty stall, first-read absorb, second-read same-mask
+(no stall — R8.3b invariant), per-mask filtering between reads,
+additional callback push absorbed, full-mask read returns
+aggregate.
+
+**rpcs3.exe rebuild (twice, cargo cache gotcha).** First build
+attempt produced no new `rpcs3_spu_ffi.lib` because cargo's
+dependency tracker thought the build was up to date (the diff
+between R8.3a and R8.3b was in `rpcs3-spu-thread` but the
+package timestamp / hash wasn't refreshed). Symptom: triple-
+symmetry's first pass still reported stall fallback for R8.3b.
+Fix: `touch rpcs3-spu-thread/src/lib.rs && cargo build --release
+-p rpcs3-spu-ffi` forced a rebuild. The fresh `.lib` produced
+sha-changed binary; `msbuild rpcs3.sln /t:rpcs3` relinked
+rpcs3.exe in 25 seconds. Final sha:
+`34ec50d73d22eabb49fc9c6f3ddfebd55d58db76a61ce5e5c6dac14b0d20f851`
+(was `3d25d782…` at R8.3a). The gotcha is now documented in
+the memory file — for future Rust-core-only fixes, always
+`touch` a relevant source before `cargo build` to bypass the
+cache.
+
+**Triple-symmetry post-fix.** All 5 fixtures green:
+
+| Path | GET | PUT | GET_MULTI | GET_ANY | GET_TAG_POLL |
+|---|---|---|---|---|---|
+| bridge OFF TTY | ✓ | ✓ | ✓ | ✓ | ✓ |
+| bridge ON delegation | R7.2 ts=1054 | R8.1 ts=1049 | R7.2×2 ts=1584 | R7.2×2-ANY ts=1588 | R7.2×2-poll ts=1594 |
+| replay oracle | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+The increasing `total_steps` across the four DMA fixtures
+(1054 → 1049 → 1584 → 1588 → 1594) maps cleanly onto the
+SPU work: 1 GET + sum loop → 1 PUT + sum loop → 2 GETs + 1
+double-sum loop → 2 GETs + 1 wait sequence + 1 double-sum
+loop → 2 GETs + 2 wait sequences + 1 double-sum loop.
+
+**Patch SHAs at R8.3b landing:**
+
+| Patch | sha256 | Δ vs R8.3a |
+|---|---|---|
+| scaffolding | `cda976d7b7bace826b3e8c38475fab5e077c88201bd0b31768541f06635143a1` | unchanged |
+| runtime hooks | `1f598d37c07d30f7e8b43fa0e53018b7c9277f628c2af58ab40bf987ffbd46ff` | unchanged |
+| rust bridge | `0afda1c6943feb5d98329299a57dd68404095efb0a792839779febed13ab8a7e` | unchanged |
+
+R8.3b is a Rust-core-only fix; all 3 C++ patch SHAs remain
+identical to R8.1's pins.
+
+**rpcs3.exe at R8.3b landing:** sha256
+`34ec50d73d22eabb49fc9c6f3ddfebd55d58db76a61ce5e5c6dac14b0d20f851`
+(63,942,656 bytes; built 2026-05-20 with R7.1 + R7.2 + R8.1 +
+R8.3a + R8.3b surface).
+
+**Out of R8.3b scope (deferred to R8.4+):** DMA list cmds
+(GETL/PUTL/GETLB/PUTLB), atomic primitives (GETLLAR/PUTLLC/
+PUTLLUC/PUTQLLUC), MFC barriers / fence bits, multi-SPU DMA
+races on shared EA, SPURS production support, `MFC_TAG_UPDATE_
+IMMEDIATE` (= 0) which conceptually clears `completed_tags`
+per-bit on read (R8.3b only handles ANY mode; Immediate
+deferred until an oracle exercises it), explicit per-bit
+clearing via `WrTagUpdate` write (in some Cell BE
+implementations), in-line state-machine executor wiring. The
+R6 / R7 / R8.1 / R8.2 / R8.3a hard rules carry forward verbatim.
 
 ---
 
