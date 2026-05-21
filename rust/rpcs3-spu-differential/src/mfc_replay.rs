@@ -480,10 +480,12 @@ impl MfcReplayState {
                 // matching `spu_mfc_cmd` event's `cmd` field is
                 // re-checked in `process_mfc_cmd`). R8.1 added
                 // PUT (0x20) alongside GET (0x40). R8.4c added
-                // GETL (0x44). Other list / atomic / barrier codes
-                // remain rejected.
+                // GETL (0x44). R8.4e added PUTL (0x24). Other
+                // list / atomic / barrier codes remain rejected.
                 let cmd = value & 0xff;
-                if cmd != MFC_GET_CMD && cmd != MFC_PUT_CMD && cmd != 0x44 {
+                if cmd != MFC_GET_CMD && cmd != MFC_PUT_CMD
+                    && cmd != 0x44 && cmd != 0x24
+                {
                     return Err(MfcReplayError::UnsupportedMfcCmd { cmd });
                 }
                 self.awaiting_mfc_cmd_event = true;
@@ -721,10 +723,13 @@ impl MfcReplayState {
         ls: &mut [u8],
     ) -> Result<(), MfcReplayError> {
         // R8.4c — GETL (0x44) dispatches to its dedicated list
-        // path. PUT (0x20) takes the vacuous-staging trick
-        // below. GET (0x40) falls through to the AssertNow
-        // `process_mfc_cmd`.
-        if event.cmd == 0x44 {
+        // path. R8.4e — PUTL (0x24) also dispatches to the same
+        // list path (process_mfc_list_cmd reads the cmd field
+        // and applies direction-specific semantics: LS → EA
+        // verification for PUTL, EA → LS copy for GETL). PUT
+        // (0x20) takes the vacuous-staging trick below. GET
+        // (0x40) falls through to the AssertNow `process_mfc_cmd`.
+        if event.cmd == 0x44 || event.cmd == 0x24 {
             return self.process_mfc_list_cmd(event, ls);
         }
         if event.cmd != MFC_PUT_CMD {
@@ -781,13 +786,25 @@ impl MfcReplayState {
         result
     }
 
-    /// R8.4c — process a captured GETL `spu_mfc_cmd` event.
-    /// Loads the descriptor via [`resolve_dma_listdesc_side_file`],
-    /// parses each 8-byte slot (BE on wire), validates against
-    /// the trace event's per-element fields, loads each element
-    /// chunk via the existing [`resolve_dma_chunk_side_file`], and
-    /// copies bytes into `ls` at the cumulative destination
-    /// offset (`lsa + sum of prior element ts`).
+    /// R8.4c / R8.4e — process a captured list-DMA `spu_mfc_cmd`
+    /// event (GETL cmd=0x44 or PUTL cmd=0x24). Loads the
+    /// descriptor via [`resolve_dma_listdesc_side_file`], parses
+    /// each 8-byte slot (BE on wire), validates against the trace
+    /// event's per-element fields, loads each element chunk via
+    /// the existing [`resolve_dma_chunk_side_file`].
+    ///
+    /// For **GETL** (0x44, EA → LS): copies element chunk bytes
+    /// into `ls` at the cumulative destination offset (`lsa +
+    /// sum of prior element ts`).
+    ///
+    /// For **PUTL** (0x24, LS → EA): does NOT mutate `ls`. The
+    /// captured chunk bytes represent LS-source state at dispatch
+    /// time; replay defers the assertion that
+    /// `ls[lsa + sum(prior ts)..lsa + sum(prior ts) + ts] ==
+    /// chunk` to post-replay (the caller verifies the SPU's
+    /// final LS state via `apply_mfc_dma_pre_replay`'s output).
+    /// This mirrors the R8.1 PUT pre-replay split: the dispatch-
+    /// time assertion is impossible from this pre-replay context.
     ///
     /// Per Cell BE list-DMA, the entire list completes atomically
     /// as a single tag. The state machine registers the in-flight
@@ -795,7 +812,7 @@ impl MfcReplayState {
     /// it (with `transferred_bytes == sum(ts)`).
     ///
     /// Caller MUST ensure:
-    /// - `event.cmd == 0x44 GETL`
+    /// - `event.cmd == 0x44 GETL` or `event.cmd == 0x24 PUTL`.
     /// - All five list fields (descriptor_sha256, descriptor_size,
     ///   element_chunks, element_sizes, element_eals) are present
     ///   and internally consistent (parser-validated; re-checked
@@ -818,8 +835,9 @@ impl MfcReplayState {
         }
         self.awaiting_mfc_cmd_event = false;
 
-        // Defensive: cmd must be GETL.
-        if event.cmd != 0x44 {
+        // Defensive: cmd must be GETL or PUTL.
+        let is_putl = event.cmd == 0x24;
+        if event.cmd != 0x44 && !is_putl {
             return Err(MfcReplayError::UnsupportedMfcCmd { cmd: event.cmd });
         }
         if event.eah != 0 {
@@ -981,7 +999,10 @@ impl MfcReplayState {
 
             // Load the element chunk via the existing
             // .dmachunk loader (REUSE — content-addressed dedup
-            // means R8.2/R8.3 chunk files apply directly).
+            // means R8.2/R8.3 chunk files apply directly). For
+            // BOTH GETL and PUTL: this validates the .dmachunk
+            // side-file's SHA + size and surfaces malformed/
+            // missing chunks early.
             let chunk_bytes = resolve_dma_chunk_side_file(
                 &self.trace_path,
                 &self.canonical_dma_dir,
@@ -991,9 +1012,24 @@ impl MfcReplayState {
             .map_err(MfcReplayError::DmaChunkLoad)?;
             debug_assert_eq!(chunk_bytes.len(), ts_be as usize);
 
-            let lo = cumulative_lsa as usize;
-            let hi = lsa_end as usize;
-            ls[lo..hi].copy_from_slice(&chunk_bytes);
+            // R8.4c — GETL writes to LS at cumulative offset.
+            // R8.4e — PUTL does NOT write to LS (LS holds the
+            // SOURCE; the destination is EA, which we don't
+            // model). The dispatch-time LS assertion is deferred
+            // post-replay (caller verifies SPU's final LS state
+            // matches the captured chunk bytes, mirroring R8.1
+            // PUT's deferred-assertion pattern). The
+            // chunk_bytes load above already validated SHA +
+            // size at the side-file layer.
+            if !is_putl {
+                let lo = cumulative_lsa as usize;
+                let hi = lsa_end as usize;
+                ls[lo..hi].copy_from_slice(&chunk_bytes);
+            }
+            // Drop chunk_bytes for PUTL — it lives in the side-
+            // file pool; the caller's post-replay verify path
+            // re-resolves it from the same pool.
+            let _ = chunk_bytes;
 
             // Per Cell BE list-DMA: next element lands at
             // base + sum(ts), without padding alignment (per

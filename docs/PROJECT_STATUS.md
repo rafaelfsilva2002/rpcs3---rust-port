@@ -1,8 +1,35 @@
-# Project Status — R8.4d LANDED (runtime bridge GETL + 13th oracle triple-symmetric)
+# Project Status — R8.4e LANDED (PUTL list-DMA — 14th oracle, end-to-end in one cycle)
 
 **Authoritative current source of truth for the RPCS3 → Rust port.**
 
-Last updated: **2026-05-21 (R8.4d landing)**. R8.4d completes
+Last updated: **2026-05-21 (R8.4e landing)**. R8.4e closes
+the R8.4 list-DMA closing-half by landing PUTL (cmd=0x24,
+LS → EA) end-to-end in a single phase: writer + capture +
+replay + runtime bridge + triple-symmetry, no engine fixes
+required (R8.4c/d's plumbing already supports the symmetric
+inverse). New 14th replay-validated oracle
+`single_spu_dma_putl_v1`; bridge ON delegates end-to-end with
+`DELEGATED EXECUTION OK total_steps=1394`; triple-symmetry
+`--fixture put_list` green; all 8 fixtures (get / put /
+get_multi / get_any / get_tag_poll / get_tag_immediate /
+get_list / put_list) green. The new `bridge_dma_putl_callback`
+mirrors `bridge_dma_getl_callback` but uses
+`const uint8_t* src_ls_ptr` because PUTL never mutates LS.
+All 3 patch SHAs bumped: scaffolding `5c170508…` →
+`402c2d139526a4efd592ba6f052f0c59067aaf09b9d079d75d03ca4a09fe4e5a`,
+runtime hooks `745945f4…` →
+`3760b78c8854dd83157f5ef5e501ae85b4fd9b46dc143ae226fb19703bf4a974`,
+bridge `d2d531850f…` →
+`e09b9c40b3187f89b559c5fcde949a86491974c836525338d51dd2e99600850e`.
+rpcs3.exe rebuilt: `0f5cc2bec9…` →
+`64ff57a1248ebb857fcffda2ff392fffa432deb7f0dd75deb07cbb670152cd33`.
+ZERO new `.dmachunk` (perfect pool dedup with prior 13
+oracles); ZERO new `.dmalistdesc` (lucky EA layout dedup
+with R8.4b GETL); ONE new `.spuimg`. PUTLB / PUTLF / GETLB /
+GETLF / stall-and-notify defer R8.4f / R8.5+.
+See "R8.4e phase closure (2026-05-21)" below.
+
+Previously: **2026-05-21 (R8.4d landing)**. R8.4d completed
 the R8.4 GETL roadmap by adding the runtime bridge half: the
 Rust SPU bridge now delegates `single_spu_dma_getl_v1.self`
 end-to-end with `RPCS3_SPU_RUST_BRIDGE=1`. New C ABI
@@ -13,7 +40,7 @@ from `vm::_ptr<u8>(ea)` to `lsa_dest_base + cumulative_offset`,
 queues the tag-stat atomically. Stall-and-notify (`sb & 0x80`)
 + PUTL + GETLB/GETLF are rejected so the bridge falls back
 honestly to C++. Triple-symmetry gate extended with the
-`get_list` fixture; all 7 fixtures green (`total_steps=1598`
+`get_list` fixture; 7 fixtures green (`total_steps=1598`
 for GETL with `DELEGATED EXECUTION OK`, no fallback).
 Bridge patch SHA bumped:
 `0afda1c69…` → `d2d531850f4743b240fb59573695ea247614d0aeecb8624726206937be52d2e5`.
@@ -152,6 +179,23 @@ Do NOT treat the archive as current.
 
 ## 1. Executive current status
 
+- **R8.4e is LANDED** (2026-05-21). Runtime bridge PUTL
+  + 14th replay-validated oracle. Symmetric inverse of
+  R8.4d GETL: writer + capture + replay + runtime bridge
+  + triple-symmetry all in one cycle (no engine fixes —
+  R8.4c/d's plumbing already covers PUTL). New 14th
+  oracle `single_spu_dma_putl_v1`; bridge ON delegates
+  end-to-end (`DELEGATED EXECUTION OK total_steps=1394`,
+  no fallback); all 8 triple-symmetry fixtures green
+  (get / put / get_multi / get_any / get_tag_poll /
+  get_tag_immediate / get_list / put_list). New
+  `bridge_dma_putl_callback` uses `const uint8_t* src_ls_ptr`
+  (PUTL only reads LS). All 3 patch SHAs bumped:
+  scaffolding `5c170508…` → `402c2d13…`, runtime hooks
+  `745945f4…` → `3760b78c…`, bridge `d2d531850f…` →
+  `e09b9c40…`. rpcs3.exe rebuilt `0f5cc2bec9…` →
+  `64ff57a1…`. ZERO new `.dmachunk` / `.dmalistdesc`
+  (perfect pool dedup). See § 8.4e.
 - **R8.4d is LANDED** (2026-05-21). Runtime bridge GETL
   + triple-symmetry expansion completes the R8.4 GETL
   roadmap. New C ABI `rust_spu_set_dma_getl_callback` +
@@ -163,9 +207,7 @@ Do NOT treat the archive as current.
   rejected (bridge falls back honestly). Bridge ON
   delegates `single_spu_dma_getl_v1.self` end-to-end
   (`DELEGATED EXECUTION OK total_steps=1598`, no
-  fallback); all 7 triple-symmetry fixtures green
-  (get / put / get_multi / get_any / get_tag_poll /
-  get_tag_immediate / get_list). Bridge SHA bumped
+  fallback). Bridge SHA bumped
   `0afda1c69…` → `d2d531850f…`; rpcs3.exe rebuilt
   `3f2348de…` → `0f5cc2bec90986da…`. See § 8.4d.
 - **R8.4c is LANDED** (2026-05-21). 13th replay-validated
@@ -251,11 +293,14 @@ Do NOT treat the archive as current.
   persistent handle → R6.5 / R6.5b bridge acceptance → R6.6 game_like
   cross-path → R6.7 design + A.1-A.5 + Phase C — all landed and
   gated green.
-- **Thirteen replay-validated SPU oracles exist**, all
+- **Fourteen replay-validated SPU oracles exist**, all
   `diff_snapshots(interp, jit).is_identical()` byte-identical
   across `InterpreterExecutor` and `RecompilerExecutor`. The
   13th, `single_spu_dma_getl_v1`, landed in R8.4c and went
   fully triple-symmetric (bridge ON delegated) in R8.4d.
+  The 14th, `single_spu_dma_putl_v1`, landed end-to-end in
+  R8.4e (capture + replay + runtime bridge + triple-symmetry
+  in one cycle).
 - **`single_spu_dma_put_v1` is the 8th oracle** (R8.1 landed
   2026-05-19; runtime-delegated under bridge ON same day).
   Symmetric inverse of GET: SPU fills LS with `i & 0xFF` counting
@@ -1647,15 +1692,173 @@ upstream-clean.
 
 **Out of R8.4d scope (deferred to R8.4e+):**
 
-- PUTL (R8.4e) — symmetric inverse of GETL (LS → EA list).
-  Reuse the descriptor-walk shape; `bridge_dma_putl_callback`
-  reads SPU LS at `lsa_src_base + cumulative_offset`,
-  writes via `vm::_ptr<u8>(ea)`.
-- GETLB / GETLF (R8.4f) — barrier / fence variants of GETL.
+- PUTL (R8.4e) — **LANDED** (see § 8.4e below).
+- GETLB / GETLF / PUTLB / PUTLF (R8.4f) — barrier / fence
+  variants of GETL/PUTL.
 - Stall-and-notify bit 0x80 (R8.5+) — needs SPU-to-PPU
   signaling integration via `mfc_notify` channel.
 - 3+ element fixtures + descriptor-size edge cases (256-
   element max).
+
+---
+
+## 8.4e R8.4e closure summary (2026-05-21)
+
+R8.4e lands MFC PUTL list-DMA (cmd=0x24, LS → EA) end-to-end
+in one cycle: writer + capture + replay + runtime bridge +
+triple-symmetry, NO engine fixes (R8.4c/d's plumbing already
+covers the symmetric inverse direction). New 14th replay-
+validated oracle `single_spu_dma_putl_v1`; bridge ON delegates
+`single_spu_dma_putl_v1.self` end-to-end producing canonical
+TTY `[dma_putl_v1] OK cause=0x1 spu=0xc0ffeeba
+ea_status=0xa12fda7e`, byte-identical to bridge OFF + replay.
+
+**Scope:**
+
+- **SPUTraceJsonl.{h,cpp}** — relaxed
+  `record_spu_mfc_getl_cmd` cmd guard from `cmd != 0x44u`
+  to `cmd != 0x44u && cmd != 0x24u` (wire format identical
+  between directions). Doc comments updated to mention the
+  R8.4e PUTL extension.
+
+- **SPUThread.cpp** — ch21 dispatcher: `capture_getl_pre`
+  predicate extended to `getl_or_putl` (matches 0x44 OR
+  0x24). Per-element snapshot path branches: GETL reads
+  from `vm::_ptr<u8>(ea)`, PUTL reads from
+  `this->ls + mfc_lsa + cumulative_offset` (LS source bytes)
+  with cumulative LS bounds check. `mfc_dma_complete`
+  `transferred_bytes` computation already worked
+  unchanged (re-parses descriptor for sum of ts).
+
+- **`rpcs3-spu-differential::trace_fmt`** — added
+  `MFC_PUTL_CMD = 0x24`; removed from
+  `MFC_LIST_CMDS_UNSUPPORTED`. Accept clause now reads
+  `cmd != GET && cmd != PUT && cmd != GETL && cmd != PUTL`.
+  `validate_getl_additive_fields` invoked for BOTH GETL and
+  PUTL (wire format identical). 1 new test
+  `r8_4e_putl_parses_and_validates`; canary test iterator
+  drops 0x24.
+
+- **`rpcs3-spu-differential::mfc_replay`** — wrch ch21 cmd
+  guard accepts 0x24; `process_mfc_cmd_pre_replay` dispatch
+  routes cmd 0x24 to `process_mfc_list_cmd`. Inside
+  `process_mfc_list_cmd`: new local `is_putl` flag;
+  cmd-validation defensively accepts 0x24 alongside 0x44;
+  per-element processing loads + validates the .dmachunk
+  via the existing loader for BOTH directions; the LS write
+  step `ls[lo..hi].copy_from_slice(&chunk_bytes)` is gated
+  by `if !is_putl` — PUTL does NOT mutate LS (the SPU's own
+  bytecode populates LS source pre-dispatch; replay verifies
+  the source bytes match the captured chunk POST-execution).
+
+- **`rpcs3-spu-thread`** — new `dma_putl_callback:
+  Option<DmaPutlCallback>` field on `SpuChannels` (#[repr(C)]
+  7-arg struct: func ptr + opaque user_data). The
+  `refuse_mfc` gate is relaxed when ANY of 4 callbacks
+  (GET/PUT/GETL/PUTL) is installed.
+
+- **`rpcs3-spu-interpreter`** — wrch ch21 dispatch extended:
+  `cmd == 0x24` PUTL routes through the same validation
+  envelope as GETL (size > 0, size <= 0x800, size % 8 == 0,
+  descriptor_lsa + size <= 256 KiB, eah == 0, tag < 32) and
+  invokes `dma_putl_callback` with `src_ls_ptr` (a
+  `*const u8` pointing at the LS source region).
+
+- **`rpcs3-spu-ffi`** — new C ABI
+  `rust_spu_set_dma_putl_callback` + typedef
+  `rust_spu_dma_putl_cb_t` (7-arg with `const uint8_t*
+  src_ls_ptr`). Returns 0 success / -1 null handle / -100
+  panic. `func = NULL` clears. Two new FFI tests:
+  `rust_spu_runtime_dma_putl_callback_round_trip` and
+  `rust_spu_get_put_getl_putl_callbacks_coexist`. All 30
+  FFI tests pass (up from 28 pre-R8.4e).
+
+- **`SPURustBridge.cpp`** — new
+  `bridge_dma_putl_callback` (7-arg, mirrors
+  `bridge_dma_getl_callback` but copy direction is LS → EA).
+  Validates `descriptor_ls_ptr` / `src_ls_ptr` / each 8-byte
+  BE slot (rejects `sb & 0x80`, `ts == 0`, `ts > 0x4000`,
+  cumulative LS overflow, null `vm::_ptr<u8>(ea)`).
+  memcpys per element from `src_ls_ptr +
+  cumulative_offset` to `vm::_ptr<u8>(ea)`. Logs
+  `R8.4e DMA PUTL dispatched ... transferred_bytes=192
+  tag=...`. Installed in `try_delegate_execution`
+  alongside GET + PUT + GETL.
+
+**SHAs at R8.4e landing:**
+
+| patch | sha256 | status |
+|---|---|---|
+| scaffolding | `402c2d139526a4efd592ba6f052f0c59067aaf09b9d079d75d03ca4a09fe4e5a` | **bumped** (was `5c170508…`) |
+| runtime hooks | `3760b78c8854dd83157f5ef5e501ae85b4fd9b46dc143ae226fb19703bf4a974` | **bumped** (was `745945f4…`) |
+| rust bridge | `e09b9c40b3187f89b559c5fcde949a86491974c836525338d51dd2e99600850e` | **bumped** (was `d2d531850f…`) |
+
+**rpcs3.exe at R8.4e landing:** sha256
+`64ff57a1248ebb857fcffda2ff392fffa432deb7f0dd75deb07cbb670152cd33`
+(`0f5cc2bec9…` → `64ff57a1…` after R8.4e rebuild).
+
+**Fixture artifacts:**
+
+- `.self`: 939,511 bytes sha
+  `d7efc5629cca9fdfb05d07271d4b1813d7cf40c45a6066c1135acd27a9ae76b9`
+  (NEW).
+- `.jsonl`: 15 events, ~3.1 KB (NEW).
+- `.spuimg`:
+  `3474dea93b83f18920eced5d37725ac19b3ffda6de67c0227a8496bd3a1189dd`
+  (NEW — different SPU bytecode).
+- `.dmalistdesc`:
+  `79238773912c38db59bf192072b2d89fcb1757d7be59870765cc2be911271126`
+  (REUSES R8.4b GETL's descriptor — lucky EA layout match).
+- `.dmachunk` element 0 (128 B counting):
+  `471fb943aa23c511f6f72f8d1652d9c880cfa392ad80503120547703e56a2be5`
+  (REUSES R6.7 GET / R8.1 PUT / R8.2 / R8.3a-c / R8.4b-d).
+- `.dmachunk` element 1 (64 B constant 0x42):
+  `c422e7070cb1cb455b5de9afee0d975e303d0239c72030cd7414ab5c382d3ae8`
+  (REUSES R8.2 / R8.3a-c / R8.4b-d).
+
+ZERO new `.dmachunk` files (perfect content-addressed pool
+dedup). ZERO new `.dmalistdesc` files (lucky EA layout match
+with R8.4b GETL). ONE new `.spuimg` (different SPU bytecode).
+
+**Triple-symmetry gate (`check_triple_symmetry.py`):**
+
+- New `PUT_LIST_FIXTURE` entry (canonical TTY
+  `[dma_putl_v1] OK cause=0x1 spu=0xc0ffeeba ea_status=0xa12fda7e`,
+  delegation marker `DMA PUTL dispatched`, rust_log_intro
+  `R8.4e DMA PUTL`).
+- All 8 fixtures green (get / put / get_multi / get_any /
+  get_tag_poll / get_tag_immediate / get_list / put_list).
+  Bridge ON PUTL: `DELEGATED EXECUTION OK
+  total_steps=1394`, no fallback.
+
+**Hard rules preserved (per R6.7 / R7 / R8.1 / R8.4d charter):**
+
+- No fake JSONL, no manual trace edits, no fake DMA, no fake
+  list descriptor, no fake tag-stat.
+- No v4 / SPURS promotion.
+- No GETLB / GETLF / PUTLB / PUTLF (still surface
+  `UnsupportedMfcListCmd`).
+- No stall-and-notify (sb bit 0x80 is REJECTED, bridge falls
+  back honestly).
+- Runtime scope limited to GETL + PUTL (cmds 0x44 / 0x24)
+  only; all other list / atomic / barrier / multi-SPU paths
+  surface `MfcUnsupported`.
+- Default bridge OFF preserved; R8.4e only activates on
+  `RPCS3_SPU_RUST_BRIDGE=1`.
+- Existing 13 oracles remain green.
+
+**Workspace tests:** 5673 pass, 0 fail (up from 5670 pre-R8.4e
+— 3 new tests added: `r8_4e_putl_parses_and_validates`,
+`rust_spu_runtime_dma_putl_callback_round_trip`,
+`rust_spu_get_put_getl_putl_callbacks_coexist`).
+
+**Out of R8.4e scope (deferred to R8.4f+):**
+
+- PUTLB (0x25) / PUTLF (0x26) / GETLB (0x45) / GETLF (0x46)
+  — list + barrier/fence variants.
+- Stall-and-notify bit 0x80 (R8.5+) — needs SPU-to-PPU
+  signaling integration via `mfc_notify` channel.
+- 3+ element fixtures + descriptor-size edge cases.
 
 ---
 

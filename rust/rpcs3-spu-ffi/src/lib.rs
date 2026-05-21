@@ -518,6 +518,65 @@ pub unsafe extern "C" fn rust_spu_set_dma_getl_callback(
     )
 }
 
+/// R8.4e — C ABI signature for the runtime DMA PUTL callback.
+/// Symmetric inverse of [`DmaGetlCallbackFn`]: the descriptor
+/// still lives in SPU LS, but each element's bytes are READ
+/// from `src_ls_ptr + cumulative_offset` and WRITTEN to RPCS3
+/// EA via `vm::_ptr<u8>(ea)`. `src_ls_ptr` is `*const u8`
+/// (PUTL never mutates LS).
+///
+/// The bridge handler walks each 8-byte BE descriptor, validates
+/// (`sb & 0x80 == 0`, `ts > 0`, `ts ≤ 0x4000`, cumulative LS
+/// ≤ 256 KiB, `vm::_ptr<u8>(ea)` accessible), then copies each
+/// element from `src_ls_ptr + cumulative_offset` to
+/// `vm::_ptr<u8>(ea)` (advancing by raw `ts` sum).
+///
+/// Returns 0 on success, non-zero to refuse (interpreter then
+/// surfaces `MfcUnsupported`, bridge falls back to C++).
+pub type DmaPutlCallbackFn = unsafe extern "C" fn(
+    user_data: *mut core::ffi::c_void,
+    descriptor_lsa: u32,
+    descriptor_ls_ptr: *const u8,
+    descriptor_size: u32,
+    lsa_src_base: u32,
+    src_ls_ptr: *const u8,
+    tag: u32,
+) -> i32;
+
+/// R8.4e — install (or clear) the runtime DMA PUTL callback on
+/// the handle. Pass `func = NULL` to clear an existing callback.
+/// The PUTL callback is independent of the GET / PUT / GETL
+/// callbacks: all four can be installed simultaneously, and the
+/// interpreter routes `wrch ch21 (MFC_Cmd)` by cmd value (0x40
+/// → GET, 0x20 → PUT, 0x44 → GETL, 0x24 → PUTL, else →
+/// MfcUnsupported).
+///
+/// Returns 0 on success, -1 if `h` is null.
+///
+/// # Safety
+///
+/// Same contract as the other dma_set_* functions: the
+/// (`func`, `user_data`) pair must outlive every
+/// `rust_spu_run_until_event` call on this handle.
+#[no_mangle]
+pub unsafe extern "C" fn rust_spu_set_dma_putl_callback(
+    h: *mut RustSpu,
+    func: Option<DmaPutlCallbackFn>,
+    user_data: *mut core::ffi::c_void,
+) -> i32 {
+    guard(
+        || {
+            let Some(h) = handle_mut(h) else { return -1 };
+            h.spu.channels.dma_putl_callback = func.map(|f| rpcs3_spu_thread::DmaPutlCallback {
+                func: f,
+                user_data,
+            });
+            0
+        },
+        -100,
+    )
+}
+
 // =====================================================================
 // Run / step
 // =====================================================================

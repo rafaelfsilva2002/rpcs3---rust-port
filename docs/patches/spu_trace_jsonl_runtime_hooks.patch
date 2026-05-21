@@ -37,7 +37,7 @@ index 81bb6fd89..5c05315f6 100644
  	}
  
 diff --git a/rpcs3/Emu/Cell/SPUThread.cpp b/rpcs3/Emu/Cell/SPUThread.cpp
-index 855d95a44..e548800fa 100644
+index 855d95a44..dbc5e15fc 100644
 --- a/rpcs3/Emu/Cell/SPUThread.cpp
 +++ b/rpcs3/Emu/Cell/SPUThread.cpp
 @@ -21,6 +21,8 @@
@@ -364,7 +364,7 @@ index 855d95a44..e548800fa 100644
  		return true;
  	}
  
-@@ -6238,43 +6438,292 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
+@@ -6238,43 +6438,332 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
  			ch_tag_upd = value;
  		}
  
@@ -503,8 +503,15 @@ index 855d95a44..e548800fa 100644
 +		//   the R6.7 simple-cmd cap per element for sanity).
 +		// - each element's sb bit 0x80 (stall-and-notify) must be
 +		//   zero — out of R8.4b scope.
++		//
++		// R8.4e — PUTL detection. Same shape as GETL; only the
++		// per-element bytes captured differ: PUTL snapshots LS
++		// source bytes at (mfc_lsa + cumulative_offset), while
++		// GETL snapshots EA source bytes via vm::_ptr<u8>(ea).
++		// Wire format / side-files / additive fields identical.
 +		const u32 descriptor_lsa_clean = mfc_eal & 0x3fff8u;
-+		const bool capture_getl_pre = (cmd_code == 0x44u)
++		const bool getl_or_putl = (cmd_code == 0x44u) || (cmd_code == 0x24u);
++		const bool capture_getl_pre = getl_or_putl
 +			&& mfc_size_at_dispatch > 0u
 +			&& mfc_size_at_dispatch % 8u == 0u
 +			&& mfc_size_at_dispatch <= 0x800u  // 256 elements * 8 = 2 KiB cap
@@ -542,12 +549,15 @@ index 855d95a44..e548800fa 100644
 +			else if (capture_getl_pre)
 +			{
 +				// R8.4b: GETL descriptor + per-element EA snapshots.
++				// R8.4e: PUTL same shape, but per-element bytes are
++				// LS-source (cumulative offset from mfc_lsa).
 +				// All reads happen BEFORE process_mfc_cmd() to keep
 +				// captured bytes pristine. We bail (do NOT emit) on
 +				// any stall-and-notify bit (defer R8.5+) or any
 +				// per-element size out of R6.7 cap.
 +				try
 +				{
++					const bool is_putl = (cmd_code == 0x24u);
 +					const u32 element_count = mfc_size_at_dispatch / 8u;
 +					const u8* desc_src = this->ls + descriptor_lsa_clean;
 +					std::vector<u8> desc_snapshot(desc_src, desc_src + mfc_size_at_dispatch);
@@ -563,6 +573,10 @@ index 855d95a44..e548800fa 100644
 +					std::vector<u32> elem_sizes(element_count);
 +					std::vector<u32> elem_eals(element_count);
 +					bool elements_ok = true;
++					// R8.4e: track cumulative LS offset for PUTL source
++					// snapshots. Raw ts sum (no padding-up), per Cell
++					// BE list-DMA contract.
++					u32 putl_cumulative = 0;
 +					for (u32 i = 0; i < element_count; ++i)
 +					{
 +						const u8* d = desc_src + i * 8;
@@ -575,29 +589,55 @@ index 855d95a44..e548800fa 100644
 +						if (sb & 0x80u)
 +						{
 +							std::fprintf(stderr,
-+								"[spu_trace] GETL capture skipped: element %u has stall-and-notify bit set (deferred R8.5+)\n", i);
++								"[spu_trace] %sL capture skipped: element %u has stall-and-notify bit set (deferred R8.5+)\n",
++								is_putl ? "PUT" : "GET", i);
 +							elements_ok = false;
 +							break;
 +						}
 +						if (ts_be == 0u || ts_be > 0x4000u)
 +						{
 +							std::fprintf(stderr,
-+								"[spu_trace] GETL capture skipped: element %u ts=%u out of R6.7 simple-cmd cap [1,0x4000]\n", i, ts_be);
++								"[spu_trace] %sL capture skipped: element %u ts=%u out of R6.7 simple-cmd cap [1,0x4000]\n",
++								is_putl ? "PUT" : "GET", i, ts_be);
 +							elements_ok = false;
 +							break;
 +						}
 +						elem_sizes[i] = ts_be;
 +						elem_eals[i] = ea_be;
-+						const u8* ea_src = vm::_ptr<u8>(ea_be);
-+						if (!ea_src)
++						if (is_putl)
 +						{
-+							std::fprintf(stderr,
-+								"[spu_trace] GETL capture skipped: element %u EA=0x%x vm::_ptr returned null\n", i, ea_be);
-+							elements_ok = false;
-+							break;
++							// R8.4e — PUTL: source bytes live in LS at
++							// (mfc_lsa + cumulative_offset). Bounds-check
++							// against 256 KiB LS before reading.
++							const u64 src_lsa_end =
++								static_cast<u64>(mfc_lsa) + putl_cumulative + ts_be;
++							if (src_lsa_end > 0x40000ull)
++							{
++								std::fprintf(stderr,
++									"[spu_trace] PUTL capture skipped: element %u source LS overflow (lsa=0x%x cumulative=0x%x ts=%u)\n",
++									i, mfc_lsa, putl_cumulative, ts_be);
++								elements_ok = false;
++								break;
++							}
++							const u8* ls_src = this->ls + mfc_lsa + putl_cumulative;
++							elem_snapshots[i].assign(ls_src, ls_src + ts_be);
++							elem_ptrs[i] = elem_snapshots[i].data();
++							putl_cumulative += ts_be;
 +						}
-+						elem_snapshots[i].assign(ea_src, ea_src + ts_be);
-+						elem_ptrs[i] = elem_snapshots[i].data();
++						else
++						{
++							// R8.4b — GETL: source bytes live in EA via vm::_ptr.
++							const u8* ea_src = vm::_ptr<u8>(ea_be);
++							if (!ea_src)
++							{
++								std::fprintf(stderr,
++									"[spu_trace] GETL capture skipped: element %u EA=0x%x vm::_ptr returned null\n", i, ea_be);
++								elements_ok = false;
++								break;
++							}
++							elem_snapshots[i].assign(ea_src, ea_src + ts_be);
++							elem_ptrs[i] = elem_snapshots[i].data();
++						}
 +					}
 +
 +					if (elements_ok)
@@ -606,7 +646,7 @@ index 855d95a44..e548800fa 100644
 +							trace_target_spu_mfc, trace_pc_mfc,
 +							static_cast<u32>(cmd_code), mfc_tag,
 +							mfc_size_at_dispatch,
-+							mfc_lsa,            // lsa_dest_base
++							mfc_lsa,            // lsa_src_base (PUTL) / lsa_dest_base (GETL)
 +							mfc_eah,
 +							mfc_eal,            // descriptor_lsa
 +							desc_snapshot.data(),
@@ -619,8 +659,8 @@ index 855d95a44..e548800fa 100644
 +				catch (...)
 +				{
 +					// Best-effort — vm::_ptr can throw on out-of-bounds
-+					// EA. Skip the entire GETL capture if any element
-+					// is unreadable.
++					// EA (GETL only — PUTL reads LS which is host-safe).
++					// Skip the entire capture if any element is unreadable.
 +				}
 +			}
 +		}
@@ -658,7 +698,7 @@ index 855d95a44..e548800fa 100644
  	}
  
  	case MFC_WrListStallAck:
-@@ -6432,6 +6881,15 @@ bool spu_thread::stop_and_signal(u32 code)
+@@ -6432,6 +6921,15 @@ bool spu_thread::stop_and_signal(u32 code)
  {
  	spu_log.trace("stop_and_signal(code=0x%x)", code);
  

@@ -6,7 +6,7 @@ index f863a2b91..d862b2287 100644
      Cell/SPUCommonRecompiler.cpp
      Cell/SPULLVMRecompiler.cpp
      Cell/SPUThread.cpp
-+    # R5.8 A.3 -- SPU trace JSONL writer scaffolding (gated, disabled by default).
++    # R5.8 A.3 — SPU trace JSONL writer scaffolding (gated, disabled by default).
 +    # See docs/SPU_TRACE_CAPTURE_RUNTIME_HOOKS.md for runtime-hook integration.
 +    Cell/SPUTraceJsonl.cpp
 +    # R6.1 -- Rust SPU bridge (opt-in via env var RPCS3_SPU_RUST_BRIDGE=1).
@@ -48,10 +48,10 @@ index f863a2b91..d862b2287 100644
      target_precompile_headers(rpcs3_emu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../stdafx.h")
 diff --git a/rpcs3/Emu/Cell/SPUTraceJsonl.cpp b/rpcs3/Emu/Cell/SPUTraceJsonl.cpp
 new file mode 100644
-index 000000000..3261f41fd
+index 000000000..59c70ad3a
 --- /dev/null
 +++ b/rpcs3/Emu/Cell/SPUTraceJsonl.cpp
-@@ -0,0 +1,1027 @@
+@@ -0,0 +1,1037 @@
 +#include "stdafx.h"
 +
 +// R5.8 A.3 — SPU PPU↔SPU trace JSONL writer (impl).
@@ -695,13 +695,22 @@ index 000000000..3261f41fd
 +	emit_line(os.str());
 +}
 +
-+// R8.4b — GETL list-DMA recorder. Same general contract as
++// R8.4b — list-DMA recorder. Same general contract as
 +// `record_spu_mfc_cmd` but with two side-file kinds:
 +// `<sha>.dmalistdesc` for the descriptor array (one per cmd) and
 +// `<sha>.dmachunk` for each element (REUSE of the existing pool;
 +// deduplicates with simple GET/PUT chunks when patterns match).
 +// JSONL emit is dropped if any side-file write fails — caller
 +// MUST skip the subsequent `record_mfc_dma_complete` if so.
++//
++// R8.4e: now also accepts cmd=0x24 PUTL (symmetric LS → EA). The
++// wire format is identical (same fields, same .dmalistdesc /
++// .dmachunk side-files); only the byte direction differs. The
++// caller (SPUThread.cpp ch21 dispatch) is responsible for
++// providing the correct per-element source bytes — for GETL the
++// snapshots are pre-DMA EA reads (the source), for PUTL the
++// snapshots are pre-DMA LS reads (also the source). Receiver
++// (replay) infers direction from the `cmd` field.
 +void TraceWriter::record_spu_mfc_getl_cmd(std::uint32_t target_spu, std::uint32_t pc,
 +	std::uint32_t cmd, std::uint32_t tag,
 +	std::uint32_t descriptor_size,
@@ -716,12 +725,13 @@ index 000000000..3261f41fd
 +{
 +	if (!enabled()) return;
 +
-+	// Defensive — caller error guards. R8.4b scope only handles
-+	// cmd 0x44 GETL; the runtime hook MUST filter.
-+	if (cmd != 0x44u)
++	// Defensive — caller error guards. R8.4b/c scope: cmd 0x44 GETL.
++	// R8.4e: also accepts cmd 0x24 PUTL. The runtime hook MUST
++	// filter; the wire format is identical between directions.
++	if (cmd != 0x44u && cmd != 0x24u)
 +	{
 +		std::fprintf(stderr,
-+			"[spu_trace] record_spu_mfc_getl_cmd dropped: cmd=0x%x is not 0x44 GETL\n", cmd);
++			"[spu_trace] record_spu_mfc_getl_cmd dropped: cmd=0x%x is not 0x44 GETL or 0x24 PUTL\n", cmd);
 +		return;
 +	}
 +	if (!descriptor_bytes || descriptor_size == 0 || descriptor_size % 8 != 0)
@@ -996,8 +1006,7 @@ index 000000000..3261f41fd
 +	if (m_trace_path.empty())
 +	{
 +		std::fprintf(stderr,
-+			"[spu_trace] write_dma_listdwarning: in the working copy of 'rpcs3/Emu/Cell/SPUTraceJsonl.h', LF will be replaced by CRLF the next time Git touches it
-esc_side_file: m_trace_path is empty\n");
++			"[spu_trace] write_dma_listdesc_side_file: m_trace_path is empty\n");
 +		return false;
 +	}
 +
@@ -1082,10 +1091,10 @@ esc_side_file: m_trace_path is empty\n");
 +} // namespace rpcs3::spu_trace
 diff --git a/rpcs3/Emu/Cell/SPUTraceJsonl.h b/rpcs3/Emu/Cell/SPUTraceJsonl.h
 new file mode 100644
-index 000000000..43d3fcebd
+index 000000000..d701c4c45
 --- /dev/null
 +++ b/rpcs3/Emu/Cell/SPUTraceJsonl.h
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,330 @@
 +// R5.8 A.3 — SPU PPU↔SPU trace JSONL writer.
 +//
 +// Self-contained, gated, disabled-by-default trace emitter that produces
@@ -1313,8 +1322,11 @@ index 000000000..43d3fcebd
 +	// contract as simple GET/PUT). Caller MUST skip the
 +	// subsequent `record_mfc_dma_complete` if so.
 +	//
-+	// Scope (R8.4b): GETL only (0x44). GETLB (0x45) / GETLF
-+	// (0x46) and PUTL family defer to R8.4f / R8.4e+.
++	// Scope (R8.4b): GETL (0x44). R8.4e extends to PUTL (0x24)
++	// (symmetric LS → EA; wire format identical, only direction
++	// differs — caller provides LS-source snapshots instead of
++	// EA-source). GETLB (0x45) / GETLF (0x46) / PUTLB (0x25) /
++	// PUTLF (0x26) defer to R8.4f.
 +	// Stall-and-notify (descriptor `sb` bit 0x80) defers to
 +	// R8.5+; caller MUST refuse capture if any element has it.
 +	void record_spu_mfc_getl_cmd(std::uint32_t target_spu, std::uint32_t pc,

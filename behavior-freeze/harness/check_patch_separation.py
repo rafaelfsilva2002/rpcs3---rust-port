@@ -66,10 +66,21 @@ RUNTIME_HOOKS = PATCH_DIR / "spu_trace_jsonl_runtime_hooks.patch"
 # if the file is absent, the gate stays green (R6.0 / pre-R6.1
 # states are valid).
 RUST_BRIDGE = PATCH_DIR / "spu_rust_bridge.patch"
-# R8.4d (2026-05-21) — superseded R8.1 sha
-# 0afda1c6943feb5d98329299a57dd68404095efb0a792839779febed13ab8a7e
-# Extends R8.1's runtime DMA GET + PUT dispatch with list-GET (GETL,
-# cmd=0x44):
+# R8.4e (2026-05-21) — superseded R8.4d sha
+# d2d531850f4743b240fb59573695ea247614d0aeecb8624726206937be52d2e5
+# Extends R8.4d's runtime DMA GETL with list-PUT (PUTL, cmd=0x24).
+# Symmetric inverse: same descriptor walk; each element copies
+# `ts` bytes FROM Rust LS at `lsa_src_base + cumulative_offset`
+# TO RPCS3 EA via `vm::_ptr<u8>(ea)`. The new
+# `bridge_dma_putl_callback` mirrors `bridge_dma_getl_callback`
+# but with the LS pointer as `const uint8_t*` (PUTL never mutates
+# LS). The 4th `rust_spu_set_dma_putl_callback` is installed
+# alongside GET/PUT/GETL in `try_delegate_execution`; refuse_mfc
+# gate now relaxes for ANY of the 4. PUTLB/PUTLF/GETLB/GETLF and
+# stall-and-notify still rejected (R8.4f / R8.5+).
+# Original R8.4d content (now superseded):
+#   Extends R8.1's runtime DMA GET + PUT dispatch with list-GET (GETL,
+#   cmd=0x44):
 #   - bridge_dma_getl_callback() — walks the SPU LS descriptor array
 #     at `descriptor_lsa = mfc_eal & 0x3fff8` for `descriptor_size`
 #     bytes (= N * 8). Each 8-byte BE descriptor `u8 sb, u8 pad,
@@ -101,7 +112,7 @@ RUST_BRIDGE = PATCH_DIR / "spu_rust_bridge.patch"
 # MfcUnsupported fallback); replay oracle byte-identical (13th
 # oracle).
 RUST_BRIDGE_PINNED_SHA256 = (
-    "d2d531850f4743b240fb59573695ea247614d0aeecb8624726206937be52d2e5"
+    "e09b9c40b3187f89b559c5fcde949a86491974c836525338d51dd2e99600850e"
 )
 
 # Hot-path source files that runtime hooks edit; scaffolding MUST NOT

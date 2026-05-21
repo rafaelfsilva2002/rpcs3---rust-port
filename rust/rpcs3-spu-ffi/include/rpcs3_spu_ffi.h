@@ -266,6 +266,60 @@ int32_t rust_spu_set_dma_getl_callback(rust_spu_t *h,
                                        void *user_data);
 
 /**
+ * R8.4e — C ABI signature for the runtime DMA PUTL (list-DMA
+ * LS -> EA) callback. Symmetric inverse of GETL: the descriptor
+ * still lives in SPU LS, but each element's bytes are READ from
+ * `src_ls_ptr + cumulative_offset` and WRITTEN to RPCS3 EA via
+ * `vm::_ptr<u8>(ea)`. `src_ls_ptr` is `const uint8_t*` (PUTL
+ * never mutates LS).
+ *
+ * Caller (interpreter) passes:
+ * - descriptor_lsa: SPU LS offset of the descriptor list (=
+ *   mfc_eal & 0x3fff8).
+ * - descriptor_ls_ptr: read-only pointer into SPU LS at
+ *   descriptor_lsa, valid for descriptor_size bytes.
+ * - descriptor_size: total descriptor bytes (= N * 8).
+ * - lsa_src_base: SPU LS offset where the first element source
+ *   resides (= mfc_lsa).
+ * - src_ls_ptr: READ-ONLY pointer into SPU LS at lsa_src_base,
+ *   valid for the cumulative sum of element ts (bounded by the
+ *   bridge to <= 256 KiB total).
+ * - tag: MFC tag to mark complete on success.
+ *
+ * Callee (bridge handler) walks each 8-byte BE descriptor
+ * (`{ u8 sb; u8 pad; be_u16 ts; be_u32 ea }`), validates each
+ * element (sb & 0x80 == 0 -- no stall-and-notify, R8.5+ scope;
+ * ts > 0; ts <= 0x4000; cumulative LS <= 256 KiB;
+ * vm::_ptr<u8>(ea) accessible), then copies each from
+ * `src_ls_ptr + cumulative_offset` to `vm::_ptr<u8>(ea)`
+ * (advancing by raw ts sum).
+ *
+ * Returns 0 on success, non-zero to refuse (interpreter then
+ * surfaces `MfcUnsupported`, bridge falls back to C++).
+ */
+typedef int32_t (*rust_spu_dma_putl_cb_t)(void *user_data,
+                                          uint32_t descriptor_lsa,
+                                          const uint8_t *descriptor_ls_ptr,
+                                          uint32_t descriptor_size,
+                                          uint32_t lsa_src_base,
+                                          const uint8_t *src_ls_ptr,
+                                          uint32_t tag);
+
+/**
+ * R8.4e — install (or clear) the runtime DMA PUTL callback.
+ * Pass `func = NULL` to clear an existing callback. The PUTL
+ * callback is independent of the GET / PUT / GETL callbacks:
+ * all four can be installed simultaneously, and the interpreter
+ * routes `wrch ch21 (MFC_Cmd)` by cmd value (0x40 GET, 0x20 PUT,
+ * 0x44 GETL, 0x24 PUTL, else MfcUnsupported).
+ *
+ * Returns 0 on success, -1 if `h` is null.
+ */
+int32_t rust_spu_set_dma_putl_callback(rust_spu_t *h,
+                                       rust_spu_dma_putl_cb_t func,
+                                       void *user_data);
+
+/**
  * Run up to `max_steps` instructions. Returns the outcome that
  * caused the run to halt:
  *

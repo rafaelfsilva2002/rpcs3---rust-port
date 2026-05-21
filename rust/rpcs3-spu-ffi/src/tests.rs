@@ -1396,3 +1396,123 @@ fn rust_spu_get_put_getl_callbacks_coexist() {
         rust_spu_drop(h);
     }
 }
+
+// =====================================================================
+// R8.4e — DMA PUTL list-DMA callback observers
+// =====================================================================
+
+static R84E_CB_CALLS: AtomicU32 = AtomicU32::new(0);
+static R84E_LAST_DESC_LSA: AtomicU32 = AtomicU32::new(0);
+static R84E_LAST_DESC_SIZE: AtomicU32 = AtomicU32::new(0);
+static R84E_LAST_LSA_BASE: AtomicU32 = AtomicU32::new(0);
+static R84E_LAST_TAG: AtomicU32 = AtomicU32::new(0);
+static R84E_FIRST_DESC_BYTE: AtomicU32 = AtomicU32::new(0xFFFF);
+
+unsafe extern "C" fn r84e_putl_callback(
+    _user_data: *mut core::ffi::c_void,
+    descriptor_lsa: u32,
+    descriptor_ls_ptr: *const u8,
+    descriptor_size: u32,
+    lsa_src_base: u32,
+    _src_ls_ptr: *const u8,
+    tag: u32,
+) -> i32 {
+    R84E_CB_CALLS.fetch_add(1, Ordering::SeqCst);
+    R84E_LAST_DESC_LSA.store(descriptor_lsa, Ordering::SeqCst);
+    R84E_LAST_DESC_SIZE.store(descriptor_size, Ordering::SeqCst);
+    R84E_LAST_LSA_BASE.store(lsa_src_base, Ordering::SeqCst);
+    R84E_LAST_TAG.store(tag, Ordering::SeqCst);
+    if !descriptor_ls_ptr.is_null() && descriptor_size > 0 {
+        R84E_FIRST_DESC_BYTE.store(*descriptor_ls_ptr as u32, Ordering::SeqCst);
+    }
+    0 // success
+}
+
+/// R8.4e — installer round-trip + null-handle invariants for the
+/// PUTL callback. Full bytecode-driven invocation lives in the
+/// replay test + triple-symmetry harness (post R8.4e).
+#[test]
+fn rust_spu_runtime_dma_putl_callback_round_trip() {
+    let _g = CALLBACK_TEST_MUTEX.lock().unwrap();
+    unsafe {
+        R84E_CB_CALLS.store(0, Ordering::SeqCst);
+        R84E_LAST_DESC_LSA.store(0xDEAD, Ordering::SeqCst);
+        R84E_LAST_DESC_SIZE.store(0xDEAD, Ordering::SeqCst);
+        R84E_LAST_LSA_BASE.store(0xDEAD, Ordering::SeqCst);
+        R84E_LAST_TAG.store(0xDEAD, Ordering::SeqCst);
+        R84E_FIRST_DESC_BYTE.store(0xFFFF, Ordering::SeqCst);
+
+        let h = rust_spu_new();
+        assert!(!h.is_null());
+
+        // Install PUTL callback + refuse_mfc (relaxed when any
+        // callback installed — including PUTL).
+        assert_eq!(
+            rust_spu_set_dma_putl_callback(h, Some(r84e_putl_callback), core::ptr::null_mut()),
+            0,
+        );
+        assert_eq!(rust_spu_set_refuse_mfc(h, 1), 0);
+
+        // Round-trip: install, clear, install again.
+        assert_eq!(rust_spu_set_dma_putl_callback(h, None, core::ptr::null_mut()), 0);
+        assert_eq!(
+            rust_spu_set_dma_putl_callback(h, Some(r84e_putl_callback), core::ptr::null_mut()),
+            0,
+        );
+
+        // Null handle.
+        assert_eq!(
+            rust_spu_set_dma_putl_callback(
+                core::ptr::null_mut(),
+                Some(r84e_putl_callback),
+                core::ptr::null_mut(),
+            ),
+            -1,
+        );
+        assert_eq!(
+            rust_spu_set_dma_putl_callback(
+                core::ptr::null_mut(),
+                None,
+                core::ptr::null_mut(),
+            ),
+            -1,
+        );
+
+        rust_spu_drop(h);
+    }
+}
+
+/// R8.4e — all four callbacks (GET / PUT / GETL / PUTL) can
+/// coexist on the same handle. Each install/clear is independent.
+#[test]
+fn rust_spu_get_put_getl_putl_callbacks_coexist() {
+    let _g = CALLBACK_TEST_MUTEX.lock().unwrap();
+    unsafe {
+        let h = rust_spu_new();
+        // Install all four.
+        assert_eq!(
+            rust_spu_set_dma_get_callback(h, Some(r72_test_callback), core::ptr::null_mut()),
+            0,
+        );
+        assert_eq!(
+            rust_spu_set_dma_put_callback(h, Some(r81_put_callback), core::ptr::null_mut()),
+            0,
+        );
+        assert_eq!(
+            rust_spu_set_dma_getl_callback(h, Some(r84d_getl_callback), core::ptr::null_mut()),
+            0,
+        );
+        assert_eq!(
+            rust_spu_set_dma_putl_callback(h, Some(r84e_putl_callback), core::ptr::null_mut()),
+            0,
+        );
+        // refuse_mfc still relaxes (any of the 4 callbacks counts).
+        assert_eq!(rust_spu_set_refuse_mfc(h, 1), 0);
+        // Clear them one at a time; each clear must succeed.
+        assert_eq!(rust_spu_set_dma_get_callback(h, None, core::ptr::null_mut()), 0);
+        assert_eq!(rust_spu_set_dma_put_callback(h, None, core::ptr::null_mut()), 0);
+        assert_eq!(rust_spu_set_dma_getl_callback(h, None, core::ptr::null_mut()), 0);
+        assert_eq!(rust_spu_set_dma_putl_callback(h, None, core::ptr::null_mut()), 0);
+        rust_spu_drop(h);
+    }
+}

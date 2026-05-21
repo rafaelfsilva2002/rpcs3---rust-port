@@ -21,10 +21,12 @@ R7.3 introduced this gate for `single_spu_dma_get_v1` (cs =
 R8.2 / R8.3a / R8.3b / R8.3c add multi-GET / ANY-wait / repeated
 ch24-poll / IMMEDIATE-probe fixtures. R8.4d adds list-GET (GETL)
 via the new `bridge_dma_getl_callback` (status = `0xdf1eea5a`).
+R8.4e adds list-PUT (PUTL) via `bridge_dma_putl_callback`
+(spu = `0xc0ffeeba`, ea_status = `0xa12fda7e`).
 
-Seven fixtures supported via `--fixture
-{get,put,get_multi,get_any,get_tag_poll,get_tag_immediate,get_list}`
-(default `get` for backwards compatibility).
+Eight fixtures supported via `--fixture
+{get,put,get_multi,get_any,get_tag_poll,get_tag_immediate,
+get_list,put_list}` (default `get` for backwards compatibility).
 
 This gate is the load-bearing R7.3 + R8.1 acceptance and is
 documented in `docs/PROJECT_STATUS.md` and
@@ -244,6 +246,36 @@ GET_LIST_FIXTURE = FixtureSpec(
 )
 
 
+# R8.4e — list-PUT (PUTL) fixture (14th oracle). Symmetric inverse
+# of R8.4d GETL: a single wrch ch21 with cmd=0x24 walks the same
+# 8-byte BE descriptor array, but per element copies `ts` bytes
+# FROM Rust LS at `lsa_src_base + cumulative_offset` TO RPCS3 EA
+# via `vm::_ptr<u8>(ea)`. The bridge `bridge_dma_putl_callback`
+# uses `const uint8_t* src_ls_ptr` (PUTL never mutates LS).
+#
+# Canonical TTY embeds TWO values: the SPU's fixed sentinel
+# (`spu=0xc0ffeeba`, written via OUT_MBOX at SPU exit) AND the
+# PPU-computed `ea_status = 0xa12fda7e` (= ((sum_ea1<<16)|sum_ea2)
+# ^ 0xBEEFCAFE, sums computed over the post-DMA EA buffers). The
+# SPU writes the sentinel BEFORE PPU reads EA, so a dropped/silent
+# PUTL would surface as a distinct (wrong) ea_status — sentinel
+# alone is insufficient evidence of successful EA write.
+PUT_LIST_FIXTURE = FixtureSpec(
+    name="single_spu_dma_putl_v1",
+    rust_test_target="single_spu_dma_putl_v1_replay",
+    canonical_tty_substr="[dma_putl_v1] OK cause=0x1 spu=0xc0ffeeba ea_status=0xa12fda7e",
+    canonical_status_summary=(
+        "spu sentinel = 0xC0FFEEBA (fixed); "
+        "ea_status = ((sum_ea1 << 16) | sum_ea2) ^ 0xBEEFCAFE "
+        "where sum_ea1 = 0x1FC0 (ea_dst1, 128 B counting pattern after PUTL) "
+        "and sum_ea2 = 0x1080 (ea_dst2, 64 B constant 0x42 after PUTL) "
+        "= 0xA12FDA7E"
+    ),
+    delegation_log_marker="DMA PUTL dispatched",
+    rust_log_intro="R8.4e DMA PUTL",
+)
+
+
 FIXTURES = {
     "get": GET_FIXTURE,
     "put": PUT_FIXTURE,
@@ -252,6 +284,7 @@ FIXTURES = {
     "get_tag_poll": GET_TAG_POLL_FIXTURE,
     "get_tag_immediate": GET_TAG_IMMEDIATE_FIXTURE,
     "get_list": GET_LIST_FIXTURE,
+    "put_list": PUT_LIST_FIXTURE,
 }
 
 
