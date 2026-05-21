@@ -1,23 +1,57 @@
 diff --git a/rpcs3/Emu/CMakeLists.txt b/rpcs3/Emu/CMakeLists.txt
-index f863a2b91..129199900 100644
+index f863a2b91..d862b2287 100644
 --- a/rpcs3/Emu/CMakeLists.txt
 +++ b/rpcs3/Emu/CMakeLists.txt
-@@ -184,6 +184,9 @@ target_sources(rpcs3_emu PRIVATE
+@@ -184,6 +184,14 @@ target_sources(rpcs3_emu PRIVATE
      Cell/SPUCommonRecompiler.cpp
      Cell/SPULLVMRecompiler.cpp
      Cell/SPUThread.cpp
-+    # R5.8 A.3 — SPU trace JSONL writer scaffolding (gated, disabled by default).
++    # R5.8 A.3 -- SPU trace JSONL writer scaffolding (gated, disabled by default).
 +    # See docs/SPU_TRACE_CAPTURE_RUNTIME_HOOKS.md for runtime-hook integration.
 +    Cell/SPUTraceJsonl.cpp
++    # R6.1 -- Rust SPU bridge (opt-in via env var RPCS3_SPU_RUST_BRIDGE=1).
++    # Compile-time gated by RPCS3_HAS_SPU_RUST_BRIDGE (set below
++    # when the staticlib `rust/target/release/rpcs3_spu_ffi.lib` or
++    # `librpcs3_spu_ffi.a` exists). See docs/SPU_RUST_BRIDGE_PATCH.md.
++    Cell/SPURustBridge.cpp
      Cell/lv2/lv2.cpp
      Cell/lv2/sys_bdemu.cpp
      Cell/lv2/sys_btsetting.cpp
+@@ -698,6 +706,28 @@ if(APPLE)
+     endif()
+ endif()
+ 
++# R6.1 -- Optional link against the rpcs3-spu-ffi Rust staticlib.
++# Build the staticlib via:  scripts/build_rust_spu_ffi.{sh,ps1}
++# If the .lib/.a is present, link it + define RPCS3_HAS_SPU_RUST_BRIDGE=1
++# so SPURustBridge.cpp compiles out the FFI calls. If absent, the
++# bridge is compile-time disabled and `is_enabled()` returns false.
++# This keeps RPCS3 buildable without touching the Rust side.
++set(RUST_SPU_FFI_LIB_MSVC "${CMAKE_CURRENT_SOURCE_DIR}/../../rust/target/release/rpcs3_spu_ffi.lib")
++set(RUST_SPU_FFI_LIB_UNIX "${CMAKE_CURRENT_SOURCE_DIR}/../../rust/target/release/librpcs3_spu_ffi.a")
++set(RUST_SPU_FFI_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../../rust/rpcs3-spu-ffi/include")
++if(EXISTS "${RUST_SPU_FFI_LIB_MSVC}")
++    target_link_libraries(rpcs3_emu PRIVATE "${RUST_SPU_FFI_LIB_MSVC}")
++    target_include_directories(rpcs3_emu PRIVATE "${RUST_SPU_FFI_INCLUDE}")
++    target_compile_definitions(rpcs3_emu PRIVATE RPCS3_HAS_SPU_RUST_BRIDGE=1)
++    message(STATUS "R6.1: linking rpcs3_spu_ffi.lib (MSVC staticlib)")
++elseif(EXISTS "${RUST_SPU_FFI_LIB_UNIX}")
++    target_link_libraries(rpcs3_emu PRIVATE "${RUST_SPU_FFI_LIB_UNIX}")
++    target_include_directories(rpcs3_emu PRIVATE "${RUST_SPU_FFI_INCLUDE}")
++    target_compile_definitions(rpcs3_emu PRIVATE RPCS3_HAS_SPU_RUST_BRIDGE=1)
++    message(STATUS "R6.1: linking librpcs3_spu_ffi.a (Unix staticlib)")
++else()
++    message(STATUS "R6.1: rpcs3_spu_ffi staticlib not found; bridge disabled at compile time. Run scripts/build_rust_spu_ffi.{sh,ps1} to enable.")
++endif()
+ 
+ if(USE_PRECOMPILED_HEADERS)
+     target_precompile_headers(rpcs3_emu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../stdafx.h")
 diff --git a/rpcs3/Emu/Cell/SPUTraceJsonl.cpp b/rpcs3/Emu/Cell/SPUTraceJsonl.cpp
 new file mode 100644
-index 000000000..8bbd9d78f
+index 000000000..3261f41fd
 --- /dev/null
 +++ b/rpcs3/Emu/Cell/SPUTraceJsonl.cpp
-@@ -0,0 +1,758 @@
+@@ -0,0 +1,1027 @@
 +#include "stdafx.h"
 +
 +// R5.8 A.3 — SPU PPU↔SPU trace JSONL writer (impl).
@@ -661,6 +695,181 @@ index 000000000..8bbd9d78f
 +	emit_line(os.str());
 +}
 +
++// R8.4b — GETL list-DMA recorder. Same general contract as
++// `record_spu_mfc_cmd` but with two side-file kinds:
++// `<sha>.dmalistdesc` for the descriptor array (one per cmd) and
++// `<sha>.dmachunk` for each element (REUSE of the existing pool;
++// deduplicates with simple GET/PUT chunks when patterns match).
++// JSONL emit is dropped if any side-file write fails — caller
++// MUST skip the subsequent `record_mfc_dma_complete` if so.
++void TraceWriter::record_spu_mfc_getl_cmd(std::uint32_t target_spu, std::uint32_t pc,
++	std::uint32_t cmd, std::uint32_t tag,
++	std::uint32_t descriptor_size,
++	std::uint32_t lsa_dest_base,
++	std::uint32_t eah,
++	std::uint32_t descriptor_lsa,
++	const std::uint8_t* descriptor_bytes,
++	std::uint32_t element_count,
++	const std::uint8_t* const* element_chunks,
++	const std::uint32_t* element_sizes,
++	const std::uint32_t* element_eals)
++{
++	if (!enabled()) return;
++
++	// Defensive — caller error guards. R8.4b scope only handles
++	// cmd 0x44 GETL; the runtime hook MUST filter.
++	if (cmd != 0x44u)
++	{
++		std::fprintf(stderr,
++			"[spu_trace] record_spu_mfc_getl_cmd dropped: cmd=0x%x is not 0x44 GETL\n", cmd);
++		return;
++	}
++	if (!descriptor_bytes || descriptor_size == 0 || descriptor_size % 8 != 0)
++	{
++		std::fprintf(stderr,
++			"[spu_trace] record_spu_mfc_getl_cmd dropped: invalid descriptor (bytes=%p size=%u)\n",
++			static_cast<const void*>(descriptor_bytes), descriptor_size);
++		return;
++	}
++	if (element_count == 0 || element_count != descriptor_size / 8u)
++	{
++		std::fprintf(stderr,
++			"[spu_trace] record_spu_mfc_getl_cmd dropped: element_count=%u mismatches descriptor_size=%u (expected %u)\n",
++			element_count, descriptor_size, descriptor_size / 8u);
++		return;
++	}
++	if (!element_chunks || !element_sizes || !element_eals)
++	{
++		std::fprintf(stderr,
++			"[spu_trace] record_spu_mfc_getl_cmd dropped: null element arrays\n");
++		return;
++	}
++
++	// Snapshot descriptor + per-element bytes BEFORE taking the
++	// lock or hashing. Caller has already snapshotted; we copy
++	// defensively to remain self-contained.
++	std::vector<std::uint8_t> desc_snapshot(descriptor_bytes, descriptor_bytes + descriptor_size);
++
++	auto sha256_hex_of = [](const std::vector<std::uint8_t>& v, std::string& out_hex) -> bool {
++		unsigned char hash[32];
++		if (mbedtls_sha256_ret(v.data(), v.size(), hash, /*is224=*/0) != 0)
++		{
++			return false;
++		}
++		static constexpr char hex_chars[] = "0123456789abcdef";
++		char hex[65];
++		for (std::size_t i = 0; i < 32; ++i)
++		{
++			hex[i * 2]     = hex_chars[(hash[i] >> 4) & 0xF];
++			hex[i * 2 + 1] = hex_chars[hash[i] & 0xF];
++		}
++		hex[64] = '\0';
++		out_hex.assign(hex, 64);
++		return true;
++	};
++
++	std::string desc_sha;
++	if (!sha256_hex_of(desc_snapshot, desc_sha))
++	{
++		std::fprintf(stderr,
++			"[spu_trace] record_spu_mfc_getl_cmd dropped: descriptor sha256 failed for target_spu=%u tag=%u\n",
++			target_spu, tag);
++		return;
++	}
++
++	// Per-element snapshots + hashes.
++	std::vector<std::vector<std::uint8_t>> elem_snapshots(element_count);
++	std::vector<std::string> elem_shas(element_count);
++	for (std::uint32_t i = 0; i < element_count; ++i)
++	{
++		if (!element_chunks[i] || element_sizes[i] == 0)
++		{
++			std::fprintf(stderr,
++				"[spu_trace] record_spu_mfc_getl_cmd dropped: element %u has null/zero chunk (size=%u)\n",
++				i, element_sizes[i]);
++			return;
++		}
++		elem_snapshots[i].assign(element_chunks[i], element_chunks[i] + element_sizes[i]);
++		if (!sha256_hex_of(elem_snapshots[i], elem_shas[i]))
++		{
++			std::fprintf(stderr,
++				"[spu_trace] record_spu_mfc_getl_cmd dropped: element %u sha256 failed\n", i);
++			return;
++		}
++	}
++
++	std::lock_guard<std::mutex> lk(m_write_mutex);
++
++	// Descriptor side-file MUST land before anything else.
++	if (!write_dma_listdesc_side_file(desc_sha, desc_snapshot.data(), descriptor_size))
++	{
++		std::fprintf(stderr,
++			"[spu_trace] record_spu_mfc_getl_cmd dropped for target_spu=%u tag=%u: "
++			"descriptor side-file write failed; JSONL NOT emitted\n",
++			target_spu, tag);
++		return;
++	}
++
++	// Each element chunk MUST land. REUSE the existing
++	// `.dmachunk` pool — same content-addressed scheme as
++	// simple GET/PUT, so dedup is automatic.
++	for (std::uint32_t i = 0; i < element_count; ++i)
++	{
++		if (!write_dma_chunk_side_file(elem_shas[i], elem_snapshots[i].data(), element_sizes[i]))
++		{
++			std::fprintf(stderr,
++				"[spu_trace] record_spu_mfc_getl_cmd dropped for target_spu=%u tag=%u: "
++				"element %u chunk side-file write failed; JSONL NOT emitted\n",
++				target_spu, tag, i);
++			return;
++		}
++	}
++
++	const auto seq = next_seq();
++	std::ostringstream os;
++	start_event(os, seq, true, "spu_mfc_cmd");
++	os << ",\"target_spu\":";        append_u32(os, target_spu);
++	os << ",\"pc\":";                append_u32(os, pc);
++	os << ",\"cmd\":";               append_u32(os, cmd);
++	os << ",\"tag\":";               append_u32(os, tag);
++	os << ",\"size\":";              append_u32(os, descriptor_size);
++	os << ",\"lsa\":";               append_u32(os, lsa_dest_base);
++	os << ",\"eah\":";               append_u32(os, eah);
++	os << ",\"eal\":";               append_u32(os, descriptor_lsa);
++	// `ea_chunk_sha256` slot overload: descriptor SHA, so that
++	// the existing GET/PUT-aware parser shape stays compatible
++	// (every spu_mfc_cmd event carries some ea_chunk_sha256
++	// string). R8.4c parser-level treats this as the descriptor
++	// pointer when cmd=0x44.
++	os << ",\"ea_chunk_sha256\":\"" << desc_sha << '"';
++	// R8.4b additive list-DMA fields.
++	os << ",\"descriptor_sha256\":\"" << desc_sha << '"';
++	os << ",\"descriptor_size\":";   append_u32(os, descriptor_size);
++	os << ",\"element_chunks\":[";
++	for (std::uint32_t i = 0; i < element_count; ++i)
++	{
++		if (i) os << ",";
++		os << '"' << elem_shas[i] << '"';
++	}
++	os << "]";
++	os << ",\"element_sizes\":[";
++	for (std::uint32_t i = 0; i < element_count; ++i)
++	{
++		if (i) os << ",";
++		append_u32(os, element_sizes[i]);
++	}
++	os << "]";
++	os << ",\"element_eals\":[";
++	for (std::uint32_t i = 0; i < element_count; ++i)
++	{
++		if (i) os << ",";
++		append_u32(os, element_eals[i]);
++	}
++	os << "]";
++	os << "}";
++	emit_line(os.str());
++}
++
 +void TraceWriter::record_mfc_dma_complete(std::uint32_t target_spu, std::uint32_t tag,
 +	std::uint32_t transferred_bytes)
 +{
@@ -775,13 +984,108 @@ index 000000000..8bbd9d78f
 +	return true;
 +}
 +
++// R8.4b — descriptor side-file for GETL. Same dedup-on-existing-SHA
++// shape as `write_dma_chunk_side_file`, separate file extension
++// (`.dmalistdesc`) so the canonical pool can distinguish per-element
++// data chunks from list descriptors at a glance. Mirrors the
++// `.dmachunk` / `.spuimg` write contract: returns true iff the file
++// exists on disk with exactly `size` bytes after the call.
++bool TraceWriter::write_dma_listdesc_side_file(const std::string& sha256_hex,
++	const std::uint8_t* bytes, std::uint32_t size)
++{
++	if (m_trace_path.empty())
++	{
++		std::fprintf(stderr,
++			"[spu_trace] write_dma_listdwarning: in the working copy of 'rpcs3/Emu/Cell/SPUTraceJsonl.h', LF will be replaced by CRLF the next time Git touches it
+esc_side_file: m_trace_path is empty\n");
++		return false;
++	}
++
++	namespace fs = std::filesystem;
++	std::error_code ec;
++
++	const fs::path dma_dir = fs::path(m_trace_path).concat(".dma");
++	fs::create_directories(dma_dir, ec);
++	if (ec)
++	{
++		std::fprintf(stderr,
++			"[spu_trace] write_dma_listdesc_side_file: create_directories('%s') failed: %s\n",
++			dma_dir.string().c_str(), ec.message().c_str());
++		return false;
++	}
++	if (!fs::is_directory(dma_dir, ec))
++	{
++		std::fprintf(stderr,
++			"[spu_trace] write_dma_listdesc_side_file: '%s' is not a directory after create_directories (ec=%s)\n",
++			dma_dir.string().c_str(), ec.message().c_str());
++		return false;
++	}
++
++	const fs::path file_path = dma_dir / (sha256_hex + ".dmalistdesc");
++
++	if (fs::exists(file_path, ec))
++	{
++		ec.clear();
++		const auto existing_size = fs::file_size(file_path, ec);
++		if (!ec && existing_size == size)
++		{
++			return true; // content-addressed dedup
++		}
++		std::fprintf(stderr,
++			"[spu_trace] write_dma_listdesc_side_file: '%s' exists with size %llu, expected %u - overwriting\n",
++			file_path.string().c_str(),
++			static_cast<unsigned long long>(existing_size), size);
++	}
++
++	{
++		std::ofstream of(file_path, std::ios::binary | std::ios::trunc);
++		if (!of.is_open())
++		{
++			std::fprintf(stderr,
++				"[spu_trace] write_dma_listdesc_side_file: ofstream open('%s', binary|trunc) failed\n",
++				file_path.string().c_str());
++			return false;
++		}
++		of.write(reinterpret_cast<const char*>(bytes), static_cast<std::streamsize>(size));
++		if (!of.good())
++		{
++			const auto wrote = static_cast<long long>(of.tellp());
++			std::fprintf(stderr,
++				"[spu_trace] write_dma_listdesc_side_file: short/failed write to '%s' (wrote ~%lld of %u)\n",
++				file_path.string().c_str(), wrote, size);
++			return false;
++		}
++		of.flush();
++	}
++
++	ec.clear();
++	const auto final_size = fs::file_size(file_path, ec);
++	if (ec)
++	{
++		std::fprintf(stderr,
++			"[spu_trace] write_dma_listdesc_side_file: post-write file_size('%s') failed: %s\n",
++			file_path.string().c_str(), ec.message().c_str());
++		return false;
++	}
++	if (final_size != size)
++	{
++		std::fprintf(stderr,
++			"[spu_trace] write_dma_listdesc_side_file: post-write size mismatch for '%s': on disk %llu, expected %u\n",
++			file_path.string().c_str(),
++			static_cast<unsigned long long>(final_size), size);
++		return false;
++	}
++
++	return true;
++}
++
 +} // namespace rpcs3::spu_trace
 diff --git a/rpcs3/Emu/Cell/SPUTraceJsonl.h b/rpcs3/Emu/Cell/SPUTraceJsonl.h
 new file mode 100644
-index 000000000..f062be67f
+index 000000000..43d3fcebd
 --- /dev/null
 +++ b/rpcs3/Emu/Cell/SPUTraceJsonl.h
-@@ -0,0 +1,274 @@
+@@ -0,0 +1,327 @@
 +// R5.8 A.3 — SPU PPU↔SPU trace JSONL writer.
 +//
 +// Self-contained, gated, disabled-by-default trace emitter that produces
@@ -980,6 +1284,51 @@ index 000000000..f062be67f
 +		std::uint32_t lsa, std::uint32_t eah, std::uint32_t eal,
 +		const std::uint8_t* ea_bytes, std::uint32_t ea_bytes_size);
 +
++	// R8.4b -- `spu_mfc_cmd` recorder for GETL (cmd 0x44,
++	// list-DMA EA -> LS). Caller (runtime hook) snapshots:
++	//
++	// - `descriptor_bytes`: `descriptor_size` bytes from the
++	//   SPU's LS at `descriptor_lsa & 0x3fff8`. Each 8-byte
++	//   slot is one list_element { u8 sb; u8 pad; be_t<u16> ts;
++	//   be_t<u32> ea; }.
++	//
++	// - `element_chunks[i]`: `element_sizes[i]` bytes from
++	//   `vm::_ptr<u8>(element_eals[i])` for each element.
++	//
++	// The recorder writes:
++	// 1. `<trace_path>.dma/<sha>.dmalistdesc` for descriptor bytes.
++	// 2. `<trace_path>.dma/<sha>.dmachunk` for each element
++	//    (REUSE of the existing pool -- dedup-friendly).
++	// 3. Single JSONL `spu_mfc_cmd` line with cmd=68, the
++	//    standard fields (size = descriptor_size, eal =
++	//    descriptor_lsa, lsa = lsa_dest_base, eah = 0), and
++	//    new fields: `descriptor_sha256`, `descriptor_size`,
++	//    `element_chunks` (array of N SHA hex strings),
++	//    `element_sizes` (array of N), `element_eals` (array
++	//    of N). The existing `ea_chunk_sha256` field is set to
++	//    the descriptor SHA so simple-GET/PUT-aware parsers
++	//    continue to see a valid SHA string in the slot.
++	//
++	// JSONL emit is dropped if any side-file write fails (same
++	// contract as simple GET/PUT). Caller MUST skip the
++	// subsequent `record_mfc_dma_complete` if so.
++	//
++	// Scope (R8.4b): GETL only (0x44). GETLB (0x45) / GETLF
++	// (0x46) and PUTL family defer to R8.4f / R8.4e+.
++	// Stall-and-notify (descriptor `sb` bit 0x80) defers to
++	// R8.5+; caller MUST refuse capture if any element has it.
++	void record_spu_mfc_getl_cmd(std::uint32_t target_spu, std::uint32_t pc,
++		std::uint32_t cmd, std::uint32_t tag,
++		std::uint32_t descriptor_size,
++		std::uint32_t lsa_dest_base,
++		std::uint32_t eah,
++		std::uint32_t descriptor_lsa,
++		const std::uint8_t* descriptor_bytes,
++		std::uint32_t element_count,
++		const std::uint8_t* const* element_chunks,
++		const std::uint32_t* element_sizes,
++		const std::uint32_t* element_eals);
++
 +	// R6.7 A.1 — `mfc_dma_complete`: emitted after the C++
 +	// `process_mfc_cmd()` returns. Per R6.7 design § 4.1 it MUST
 +	// appear strictly after the matching `spu_mfc_cmd` and strictly
@@ -1039,6 +1388,14 @@ index 000000000..f062be67f
 +	bool write_dma_chunk_side_file(const std::string& sha256_hex,
 +		const std::uint8_t* bytes, std::uint32_t size);
 +
++	// R8.4b -- write captured descriptor list bytes (N * 8 bytes
++	// total) to `<trace_path>.dma/<sha>.dmalistdesc`. Same dedup
++	// contract as `write_dma_chunk_side_file`: returns true iff
++	// the file exists on disk with exactly `size` bytes after
++	// the call. Caller MUST hold `m_write_mutex`.
++	bool write_dma_listdesc_side_file(const std::string& sha256_hex,
++		const std::uint8_t* bytes, std::uint32_t size);
++
 +	std::atomic<bool> m_enabled{false};
 +	std::atomic<std::uint64_t> m_seq{0};
 +	std::ofstream m_file;
@@ -1057,30 +1414,67 @@ index 000000000..f062be67f
 +
 +} // namespace rpcs3::spu_trace
 diff --git a/rpcs3/emucore.vcxproj b/rpcs3/emucore.vcxproj
-index 3606a2091..f2aacd897 100644
+index 3606a2091..b765e5494 100644
 --- a/rpcs3/emucore.vcxproj
 +++ b/rpcs3/emucore.vcxproj
-@@ -547,6 +547,7 @@
+@@ -546,7 +546,9 @@
+     <ClCompile Include="Emu\Cell\RawSPUThread.cpp" />
      <ClCompile Include="Emu\Cell\SPUCommonRecompiler.cpp" />
      <ClCompile Include="Emu\Cell\SPULLVMRecompiler.cpp" />
++    <ClCompile Include="Emu\Cell\SPURustBridge.cpp" />
      <ClCompile Include="Emu\Cell\SPUThread.cpp" />
 +    <ClCompile Include="Emu\Cell\SPUTraceJsonl.cpp" />
      <ClCompile Include="Emu\CPU\CPUThread.cpp" />
      <ClCompile Include="Emu\VFS.cpp" />
      <ClCompile Include="Emu\RSX\GSRender.cpp" />
-@@ -1000,6 +1001,7 @@
+@@ -999,7 +1001,9 @@
+     <ClInclude Include="Emu\Cell\SPUInterpreter.h" />
      <ClInclude Include="Emu\Cell\SPUOpcodes.h" />
      <ClInclude Include="Emu\Cell\SPURecompiler.h" />
++    <ClInclude Include="Emu\Cell\SPURustBridge.h" />
      <ClInclude Include="Emu\Cell\SPUThread.h" />
 +    <ClInclude Include="Emu\Cell\SPUTraceJsonl.h" />
      <ClInclude Include="Emu\Cell\timers.hpp" />
      <ClInclude Include="Emu\CPU\CPUDisAsm.h" />
      <ClInclude Include="Emu\CPU\CPUThread.h" />
+@@ -1136,4 +1140,25 @@
+   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+   <ImportGroup Label="ExtensionTargets">
+   </ImportGroup>
++  <!--
++    R6.1 - Rust SPU bridge link integration.
++    Conditional on the rpcs3-spu-ffi staticlib being present at
++    $(MSBuildProjectDirectory)\..\rust\target\release\rpcs3_spu_ffi.lib
++    (= R:\rust\target\release\... when building from R:\rpcs3.sln).
++    When present, adds the staticlib to AdditionalDependencies, the
++    cbindgen-generated header dir to AdditionalIncludeDirectories,
++    and defines RPCS3_HAS_SPU_RUST_BRIDGE=1 so SPURustBridge.cpp
++    compiles in the FFI calls. When absent, the bridge is
++    compile-time disabled and rpcs3.exe builds + runs unchanged.
++    Build via: scripts\build_rust_spu_ffi.ps1 (relative to repo root).
++  -->
++  <ItemDefinitionGroup Condition="Exists('$(MSBuildProjectDirectory)\..\rust\target\release\rpcs3_spu_ffi.lib')">
++    <ClCompile>
++      <PreprocessorDefinitions>RPCS3_HAS_SPU_RUST_BRIDGE=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
++      <AdditionalIncludeDirectories>$(MSBuildProjectDirectory)\..\rust\rpcs3-spu-ffi\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
++    </ClCompile>
++    <Link>
++      <AdditionalDependencies>$(MSBuildProjectDirectory)\..\rust\target\release\rpcs3_spu_ffi.lib;%(AdditionalDependencies)</AdditionalDependencies>
++    </Link>
++  </ItemDefinitionGroup>
+ </Project>
+\ No newline at end of file
 diff --git a/rpcs3/emucore.vcxproj.filters b/rpcs3/emucore.vcxproj.filters
-index 87bf4fed6..04a6c16d4 100644
+index 87bf4fed6..9f9f69e7c 100644
 --- a/rpcs3/emucore.vcxproj.filters
 +++ b/rpcs3/emucore.vcxproj.filters
-@@ -186,6 +186,9 @@
+@@ -183,9 +183,15 @@
+     <ClCompile Include="Emu\Cell\RawSPUThread.cpp">
+       <Filter>Emu\Cell</Filter>
+     </ClCompile>
++    <ClCompile Include="Emu\Cell\SPURustBridge.cpp">
++      <Filter>Emu\Cell</Filter>
++    </ClCompile>
      <ClCompile Include="Emu\Cell\SPUThread.cpp">
        <Filter>Emu\Cell</Filter>
      </ClCompile>
@@ -1090,7 +1484,13 @@ index 87bf4fed6..04a6c16d4 100644
      <ClCompile Include="Emu\CPU\CPUThread.cpp">
        <Filter>Emu\CPU</Filter>
      </ClCompile>
-@@ -1512,6 +1515,9 @@
+@@ -1509,9 +1515,15 @@
+     <ClInclude Include="Emu\Cell\SPURecompiler.h">
+       <Filter>Emu\Cell</Filter>
+     </ClInclude>
++    <ClInclude Include="Emu\Cell\SPURustBridge.h">
++      <Filter>Emu\Cell</Filter>
++    </ClInclude>
      <ClInclude Include="Emu\Cell\SPUThread.h">
        <Filter>Emu\Cell</Filter>
      </ClInclude>

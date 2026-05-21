@@ -1,8 +1,28 @@
-# Project Status — R8.3c LANDED (12th oracle: IMMEDIATE wait-mode + replay clear-on-read fix)
+# Project Status — R8.4b LANDED (GETL writer extension + capture-only trace)
 
 **Authoritative current source of truth for the RPCS3 → Rust port.**
 
-Last updated: **2026-05-20 (R8.3c landing)**. R8.3c (IMMEDIATE
+Last updated: **2026-05-21 (R8.4b landing)**. R8.4b lands the
+first half of MFC GETL list-DMA support: C++ writer extension
+(SPUThread.cpp + SPUTraceJsonl.{h,cpp}), real CC0 GETL
+fixture captured (15-event JSONL + new `.dmalistdesc`
+side-file + 2 `.dmachunk` files that dedup with the
+existing pool), Rust parser additive fields
+(`SpuMfcCmdEvent::{descriptor_sha256, descriptor_size,
+element_chunks, element_sizes, element_eals}` all `Option<>`).
+The trace is a **capture-only sentinel** at R8.4b — the
+replay state machine still rejects with
+`UnsupportedMfcListCmd` (R8.4a canary preserved). R8.4c
+lifts the canary AND adds the state machine; R8.4d adds
+the runtime bridge GETL callback + promotes the 13th
+oracle. Two patches bumped: scaffolding (added
+`record_spu_mfc_getl_cmd` + `write_dma_listdesc_side_file`)
+and runtime hooks (SPUThread.cpp ch21 dispatch detects GETL,
+walks descriptor, captures per-element EA snapshots).
+rpcs3.exe rebuilt: `34ec50d7…` → `3f2348de…`. See "R8.4b
+phase closure (2026-05-21)" below.
+
+Previously: **2026-05-20 (R8.3c landing)**. R8.3c (IMMEDIATE
 + overlapping masks + 12th oracle) is the THIRD consecutive
 fixture to surface and co-fix a real divergence. The new
 fixture `single_spu_dma_tag_immediate_v1` mirrors R8.3b but
@@ -96,6 +116,18 @@ Do NOT treat the archive as current.
 
 ## 1. Executive current status
 
+- **R8.4b is LANDED** (2026-05-21). First half of MFC GETL
+  list-DMA support: C++ writer captures GETL (cmd=0x44) with
+  new `.dmalistdesc` side-file + per-element `.dmachunk` files
+  (REUSE existing pool — dedup works). New `SpuMfcCmdEvent`
+  Option<> fields (descriptor_sha256 + 4 list fields) parse
+  cleanly. Replay state machine still rejects via R8.4a's
+  `UnsupportedMfcListCmd` canary (lifted in R8.4c). Two
+  patches bumped (scaffolding + runtime hooks); bridge SHA
+  unchanged (no runtime delegation yet). rpcs3.exe rebuilt
+  (`3f2348de…`). Captured `single_spu_dma_getl_v1.jsonl` is
+  the 13th oracle target — replay test lands in R8.4c. See
+  § 8.4b.
 - **R8.3c is LANDED** (2026-05-20). First IMMEDIATE-wait-mode
   oracle + 12th oracle. Two queued GETs + TWO ch24 reads with
   `WrTagUpdate = IMMEDIATE` (= 0) and overlapping masks
@@ -1198,11 +1230,142 @@ semantics in the chain are 3+ DMA dispatches, explicit per-bit
 clear via WrTagUpdate write (some Cell BE implementations),
 then DMA list cmds.
 
-**Out of R8.3c scope (deferred to R8.4+):** DMA list cmds,
-atomic primitives, MFC barriers / fence bits, multi-SPU DMA
+**Out of R8.3c scope (deferred to R8.4+):** DMA list cmds
+(landing progressively in **R8.4a (design + canary, done) →
+R8.4b (writer + capture, done) → R8.4c (replay state machine,
+next) → R8.4d (runtime bridge + 13th oracle)**), atomic
+primitives, MFC barriers / fence bits, multi-SPU DMA
 races, SPURS, explicit per-bit clear via WrTagUpdate write,
 3+ DMA dispatch chains (mechanically in-scope), in-line state-
 machine executor wiring. All prior hard rules carry forward.
+
+---
+
+## 8.4a R8.4a closure summary (2026-05-20)
+
+DESIGN-only delivery + granular parser canary. R8.3d slot-fill
+probe DEFERRED (RPCS3 model is observationally equivalent to
+Rust persistent register for canonical patterns). New error
+variant `UnsupportedMfcListCmd` differentiates list-DMA codes
+(0x24/0x25/0x26 PUTL family, 0x44/0x45/0x46 GETL family) from
+atomic/barrier codes which keep the generic `UnsupportedMfcCmd`.
+Full R8.4 GETL roadmap documented in `docs/
+SPU_DMA_MFC_R6_7_DESIGN.md` § 19 (4 phases a/b/c/d + e/f
+optional).
+
+Patch SHAs UNCHANGED. rpcs3.exe UNCHANGED. Workspace lib
++2 tests (140 differential lib tests). 12 oracles green.
+
+---
+
+## 8.4b R8.4b closure summary (2026-05-21)
+
+R8.4b lands the writer + capture half of GETL list-DMA. The
+fixture `single_spu_dma_getl_v1` builds, runs canonical
+bridge OFF (`status=0xDF1EEA5A`), and captures a real
+15-event JSONL with all schema-additive fields populated.
+Replay still rejects via the R8.4a canary; promotion to
+13th oracle defers to R8.4c.
+
+**Scope (R8.4b only):**
+
+- **CC0 fixture authoring**: `single_spu_dma_getl_v1.{self,
+  jsonl}` + side-files. PPU prepares 2 EA buffers (128 B
+  counting + 64 B constant 0x42 — same patterns as R8.2/3
+  for max pool dedup). SPU builds a 2-element
+  `list_element[]` in LS, dispatches GETL, sums, packs
+  canonical `0xDF1EEA5A = ((sum1 << 16) | sum2) ^
+  0xC0DEFADA`.
+- **C++ writer extension**:
+  - `SPUTraceJsonl.h`/`SPUTraceJsonl.cpp`: new public method
+    `record_spu_mfc_getl_cmd(target_spu, pc, cmd, tag,
+    descriptor_size, lsa_dest_base, eah, descriptor_lsa,
+    descriptor_bytes, element_count, element_chunks[],
+    element_sizes[], element_eals[])`. Writes
+    `<sha>.dmalistdesc` for the descriptor + N
+    `<sha>.dmachunk` for elements (REUSE existing pool).
+    Emits `spu_mfc_cmd` JSONL with 5 additive fields.
+    New private helper `write_dma_listdesc_side_file` —
+    same shape as `write_dma_chunk_side_file` but
+    `.dmalistdesc` extension.
+  - `SPUThread.cpp` ch21 dispatch hook: detects cmd=0x44,
+    validates (size % 8, ≤ 256 elements, descriptor in
+    LS bounds, eah=0), reads descriptor from LS, parses
+    each element (BE u16 ts + BE u32 ea), validates sb
+    bit 0x80 not set (reject capture if so — R8.5+ scope),
+    validates ts in [1, 0x4000] per element, snapshots
+    each EA via `vm::_ptr<u8>(ea)`. Calls
+    `record_spu_mfc_getl_cmd` BEFORE `process_mfc_cmd()`,
+    emits `mfc_dma_complete` AFTER with
+    `transferred_bytes = sum(ts)`.
+- **Rust parser additive fields**: `SpuMfcCmdEvent` gains
+  five `#[serde(default)] Option<>` fields. Existing
+  GET/PUT events deserialize unchanged (all five default
+  to `None`). GETL events deserialize all five as `Some(...)`.
+  R8.4a canary `UnsupportedMfcListCmd` STILL fires at
+  validate (replay/transform reject is preserved).
+- **Tests**:
+  - `r8_4b_getl_parses_additive_fields_but_still_rejects`:
+    GETL JSONL deserializes correctly (all 5 fields
+    populated) but `parse_jsonl_trace` still returns
+    `UnsupportedMfcListCmd`.
+  - `r8_4b_existing_get_put_traces_still_parse_with_none_list_fields`:
+    regression guard — old GET/PUT events parse with the
+    list fields defaulting to `None`.
+
+**Captured trace shape (15 events):**
+
+| seq | event | notes |
+|---|---|---|
+| 0 | spu_image (sha `f0878b15…`) | new spuimg pool entry |
+| 1-6 | wrch ch16-21 | GETL dispatch params |
+| 7 | `spu_mfc_cmd cmd=68` | + descriptor_sha256 (`79238773…`) + descriptor_size=16 + element_chunks=[`471fb943…`, `c422e707…`] + element_sizes=[128, 64] + element_eals=[0x10011180, 0x10011200] |
+| 8 | mfc_dma_complete | transferred_bytes=192 (=128+64) |
+| 9-11 | ch22/ch23/ch24 | tag wait (mask=0x08, ALL → 0x08) |
+| 12 | wrch ch28 = 0xDF1EEA5A | canonical status |
+| 13 | spu_stop 0x101 | |
+| 14 | final_state | r48=0xDF1EEA5A |
+
+**Pool stats:**
+- `behavior-freeze/fixtures/spu/dma/`:
+  - `471fb943…dmachunk` (R6.7+/R8.x dedup)
+  - `c422e7070…dmachunk` (R8.2+ dedup)
+  - **NEW** `79238773…dmalistdesc` (R8.4b descriptor)
+- `behavior-freeze/fixtures/spu/images/`: 13 entries (was
+  12; new spuimg `f0878b15…`)
+
+**Patch SHAs at R8.4b landing:**
+
+| Patch | sha256 | Δ vs R8.3c |
+|---|---|---|
+| scaffolding | `5c170508a73e492d42784036d61a972edab7a85b7ea7105d6dde388a5e67d6c0` | **BUMPED** (was `cda976d7…`; added `record_spu_mfc_getl_cmd` + `write_dma_listdesc_side_file` to SPUTraceJsonl.{h,cpp}) |
+| runtime hooks | `745945f4872f7d83541aa74d9a065b6a6bc3785af73510d026e6643a0985cd96` | **BUMPED** (was `1f598d37…`; SPUThread.cpp ch21 dispatch detects + captures GETL) |
+| rust bridge | `0afda1c6943feb5d98329299a57dd68404095efb0a792839779febed13ab8a7e` | unchanged (no bridge runtime GETL yet — R8.4d scope) |
+
+**rpcs3.exe at R8.4b landing:** sha256
+`3f2348de0e50b7dd4aadeac92aaec83b678cd84f7f7be88742835cc0c38a0b72`
+(63,942,656 bytes; built 2026-05-21).
+
+**Triple-symmetry regression for prior 6 fixtures**: green
+across all (get / put / get_multi / get_any / get_tag_poll /
+get_tag_immediate) with the new rpcs3.exe binary — GETL
+writer changes are isolated and don't affect non-GETL paths.
+
+**Out of R8.4b scope (deferred to R8.4c+):**
+
+- `MfcReplayState::process_mfc_list_cmd` (R8.4c) — walks
+  the captured descriptor, loads each element chunk into
+  LS at cumulative offset.
+- `apply_mfc_dma_pre_replay` extension for list cmds (R8.4c).
+- `.dmalistdesc` side-file resolver in `dma_chunk.rs` (R8.4c).
+- Lift `UnsupportedMfcListCmd` canary for cmd 0x44 (R8.4c).
+- 13th oracle promotion (replay test against the captured
+  trace, R8.4c).
+- `rust_spu_set_dma_getl_callback` FFI + bridge handler
+  (R8.4d). rpcs3.exe rebuild + bridge SHA bump (R8.4d).
+- Triple-symmetry extension for `get_list` (R8.4d).
+- PUTL family (R8.4e), GETLB/GETLF (R8.4f).
+- Stall-and-notify bit (R8.5+).
 
 ---
 

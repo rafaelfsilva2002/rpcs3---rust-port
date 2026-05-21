@@ -273,6 +273,39 @@ pub struct SpuMfcCmdEvent {
     pub eah: u32,
     pub eal: u32,
     pub ea_chunk_sha256: String,
+    // R8.4b — additive list-DMA fields. Present when cmd is a
+    // list-DMA code (GETL = 0x44 in R8.4b scope; GETLB/GETLF/
+    // PUTL/family in later phases). Absent for simple GET/PUT
+    // (cmd 0x40 / 0x20) — `serde` deserializes missing fields
+    // as `None` via `#[serde(default)]`, so existing R6.7/R8.1
+    // traces parse byte-identical without any schema bump.
+    //
+    // When all four list fields are present, the writer captured
+    // a list-DMA dispatch:
+    // - `descriptor_sha256`: SHA-256 of the N-element descriptor
+    //   array (matches `ea_chunk_sha256` slot value by writer
+    //   convention so the simple-cmd parser still sees a valid
+    //   SHA string in the legacy slot).
+    // - `descriptor_size`: total descriptor bytes (= N * 8).
+    // - `element_chunks`: per-element source-byte SHAs (N entries).
+    //   Each SHA points to a `.dmachunk` in the existing pool.
+    // - `element_sizes`: per-element transfer size `ts` (N entries).
+    // - `element_eals`: per-element source EA (N entries).
+    //
+    // R8.4c will lift the parser canary and consume these via a
+    // new `MfcReplayState::process_mfc_list_cmd` path. R8.4b
+    // parses them but the replay/transform layers still reject
+    // list cmds with `UnsupportedMfcListCmd`.
+    #[serde(default)]
+    pub descriptor_sha256: Option<String>,
+    #[serde(default)]
+    pub descriptor_size: Option<u32>,
+    #[serde(default)]
+    pub element_chunks: Option<Vec<String>>,
+    #[serde(default)]
+    pub element_sizes: Option<Vec<u32>>,
+    #[serde(default)]
+    pub element_eals: Option<Vec<u32>>,
 }
 
 /// R6.7 A.1 schema: tag-completion notification emitted after the C++
@@ -3139,6 +3172,114 @@ mod tests {
                     "list cmd 0x{cmd:x} should be UnsupportedMfcListCmd, got {other:?}"
                 ),
             }
+        }
+    }
+
+    /// R8.4b — when the writer emits a real GETL `spu_mfc_cmd`
+    /// event (with all the additive descriptor / element fields),
+    /// the parser MUST:
+    ///   1. Successfully deserialize the event (the additive
+    ///      fields populate the `Option<>` slots on
+    ///      `SpuMfcCmdEvent`).
+    ///   2. STILL reject with `UnsupportedMfcListCmd` (R8.4a
+    ///      canary preserved; R8.4c lifts).
+    /// This test consumes a GETL JSONL slice patterned after the
+    /// real `single_spu_dma_getl_v1.jsonl` capture.
+    #[test]
+    fn r8_4b_getl_parses_additive_fields_but_still_rejects() {
+        // Two 64-hex SHAs (placeholder values; the parser
+        // validates length + lower-hex but doesn't resolve the
+        // side-files here).
+        let desc_sha = "11".repeat(32);
+        let elem1_sha = "22".repeat(32);
+        let elem2_sha = "33".repeat(32);
+        let jsonl = format!(
+            r#"
+{{"seq":0,"side":"spu","kind":"spu_wrch","pc":256,"channel":21,"value":68,"would_stall":false,"target_spu":1}}
+{{"seq":1,"side":"spu","kind":"spu_mfc_cmd","target_spu":1,"pc":256,"cmd":68,"tag":3,"size":16,"lsa":65536,"eah":0,"eal":384,"ea_chunk_sha256":"{desc_sha}","descriptor_sha256":"{desc_sha}","descriptor_size":16,"element_chunks":["{elem1_sha}","{elem2_sha}"],"element_sizes":[128,64],"element_eals":[268505472,268505600]}}
+"#
+        );
+        let err = parse_jsonl_trace(&jsonl)
+            .expect_err("GETL cmd must still reject at validate");
+        match err {
+            TraceParseError::UnsupportedMfcListCmd { cmd: 0x44, .. } => {}
+            other => panic!(
+                "R8.4b: GETL should reject with UnsupportedMfcListCmd, got {other:?}"
+            ),
+        }
+        // The line WAS deserialized successfully before the
+        // validate step — proof via a parallel raw-deserialize:
+        // strip the wrch line and deserialize the mfc_cmd line
+        // directly to confirm all additive fields parsed.
+        let raw_mfc_line = format!(
+            r#"{{"seq":1,"side":"spu","kind":"spu_mfc_cmd","target_spu":1,"pc":256,"cmd":68,"tag":3,"size":16,"lsa":65536,"eah":0,"eal":384,"ea_chunk_sha256":"{desc_sha}","descriptor_sha256":"{desc_sha}","descriptor_size":16,"element_chunks":["{elem1_sha}","{elem2_sha}"],"element_sizes":[128,64],"element_eals":[268505472,268505600]}}"#
+        );
+        let parsed: CapturedEvent = serde_json::from_str(&raw_mfc_line)
+            .expect("R8.4b: GETL spu_mfc_cmd event must deserialize");
+        match parsed {
+            CapturedEvent::SpuMfcCmd(m) => {
+                assert_eq!(m.cmd, 0x44);
+                assert_eq!(m.size, 16);
+                assert_eq!(m.eal, 384);
+                assert_eq!(m.descriptor_sha256.as_deref(), Some(desc_sha.as_str()));
+                assert_eq!(m.descriptor_size, Some(16));
+                assert_eq!(
+                    m.element_chunks.as_deref(),
+                    Some(&[elem1_sha.clone(), elem2_sha.clone()][..]),
+                    "element_chunks must round-trip"
+                );
+                assert_eq!(
+                    m.element_sizes.as_deref(),
+                    Some(&[128u32, 64u32][..]),
+                    "element_sizes must round-trip"
+                );
+                assert_eq!(
+                    m.element_eals.as_deref(),
+                    Some(&[268505472u32, 268505600u32][..]),
+                    "element_eals must round-trip"
+                );
+            }
+            other => panic!("expected SpuMfcCmd, got {other:?}"),
+        }
+    }
+
+    /// R8.4b — existing GET/PUT events (without the new
+    /// additive fields) MUST continue to deserialize. The
+    /// new `Option<>` fields must default to `None`. Regression
+    /// guard against accidentally making the schema additive
+    /// fields required.
+    #[test]
+    fn r8_4b_existing_get_put_traces_still_parse_with_none_list_fields() {
+        let sha = TEST_VALID_SHA.to_string();
+        // GET — simple cmd 0x40, no list fields in JSON.
+        let get_line = format!(
+            r#"{{"seq":7,"side":"spu","kind":"spu_mfc_cmd","target_spu":1,"pc":256,"cmd":64,"tag":3,"size":128,"lsa":0,"eah":0,"eal":4096,"ea_chunk_sha256":"{sha}"}}"#
+        );
+        let parsed: CapturedEvent = serde_json::from_str(&get_line)
+            .expect("R8.4b: existing GET event must still deserialize");
+        if let CapturedEvent::SpuMfcCmd(m) = parsed {
+            assert_eq!(m.cmd, 0x40);
+            assert!(m.descriptor_sha256.is_none());
+            assert!(m.descriptor_size.is_none());
+            assert!(m.element_chunks.is_none());
+            assert!(m.element_sizes.is_none());
+            assert!(m.element_eals.is_none());
+        } else {
+            panic!("expected SpuMfcCmd");
+        }
+
+        // PUT — simple cmd 0x20, no list fields.
+        let put_line = format!(
+            r#"{{"seq":7,"side":"spu","kind":"spu_mfc_cmd","target_spu":1,"pc":256,"cmd":32,"tag":3,"size":128,"lsa":65536,"eah":0,"eal":4096,"ea_chunk_sha256":"{sha}"}}"#
+        );
+        let parsed: CapturedEvent = serde_json::from_str(&put_line)
+            .expect("R8.4b: existing PUT event must still deserialize");
+        if let CapturedEvent::SpuMfcCmd(m) = parsed {
+            assert_eq!(m.cmd, 0x20);
+            assert!(m.descriptor_sha256.is_none());
+            assert!(m.element_chunks.is_none());
+        } else {
+            panic!("expected SpuMfcCmd");
         }
     }
 

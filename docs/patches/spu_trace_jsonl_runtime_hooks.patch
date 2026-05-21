@@ -37,7 +37,7 @@ index 81bb6fd89..5c05315f6 100644
  	}
  
 diff --git a/rpcs3/Emu/Cell/SPUThread.cpp b/rpcs3/Emu/Cell/SPUThread.cpp
-index 855d95a44..c50035bc8 100644
+index 855d95a44..e548800fa 100644
 --- a/rpcs3/Emu/Cell/SPUThread.cpp
 +++ b/rpcs3/Emu/Cell/SPUThread.cpp
 @@ -21,6 +21,8 @@
@@ -364,7 +364,7 @@ index 855d95a44..c50035bc8 100644
  		return true;
  	}
  
-@@ -6238,43 +6438,165 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
+@@ -6238,43 +6438,292 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
  			ch_tag_upd = value;
  		}
  
@@ -489,6 +489,28 @@ index 855d95a44..c50035bc8 100644
 +			&& (static_cast<u64>(mfc_lsa) + mfc_size_at_dispatch <= 0x40000ull);
 +		const bool capture_dma = capture_get || capture_put;
 +
++		// R8.4b — GETL detection. List-DMA dispatch where mfc_eal
++		// points to the in-LS descriptor array (N * 8 bytes). Each
++		// descriptor element is { u8 sb; u8 pad; be_t<u16> ts;
++		// be_t<u32> ea; } — we capture descriptor bytes + each
++		// element's EA-source bytes. Bounds:
++		// - mfc_size must be multiple of 8 and > 0.
++		// - descriptor_lsa (mfc_eal & 0x3fff8) + mfc_size must fit
++		//   in LS (descriptor lives in LS).
++		// - element count = mfc_size / 8 (sane cap at 256 — matches
++		//   Cell BE's per-cmd list limit).
++		// - each element's ts must be > 0 and <= 0x4000 (we keep
++		//   the R6.7 simple-cmd cap per element for sanity).
++		// - each element's sb bit 0x80 (stall-and-notify) must be
++		//   zero — out of R8.4b scope.
++		const u32 descriptor_lsa_clean = mfc_eal & 0x3fff8u;
++		const bool capture_getl_pre = (cmd_code == 0x44u)
++			&& mfc_size_at_dispatch > 0u
++			&& mfc_size_at_dispatch % 8u == 0u
++			&& mfc_size_at_dispatch <= 0x800u  // 256 elements * 8 = 2 KiB cap
++			&& static_cast<u64>(descriptor_lsa_clean) + mfc_size_at_dispatch <= 0x40000ull
++			&& mfc_eah == 0u;
++
 +		if (trace_tracer_mfc.enabled())
 +		{
 +			trace_tracer_mfc.record_spu_wrch(trace_target_spu_mfc, trace_pc_mfc, ch, value, /*would_stall=*/false);
@@ -517,21 +539,126 @@ index 855d95a44..c50035bc8 100644
 +					// only triggers for GET's vm::_ptr boundary.
 +				}
 +			}
++			else if (capture_getl_pre)
++			{
++				// R8.4b: GETL descriptor + per-element EA snapshots.
++				// All reads happen BEFORE process_mfc_cmd() to keep
++				// captured bytes pristine. We bail (do NOT emit) on
++				// any stall-and-notify bit (defer R8.5+) or any
++				// per-element size out of R6.7 cap.
++				try
++				{
++					const u32 element_count = mfc_size_at_dispatch / 8u;
++					const u8* desc_src = this->ls + descriptor_lsa_clean;
++					std::vector<u8> desc_snapshot(desc_src, desc_src + mfc_size_at_dispatch);
++
++					// Parse descriptor list, validate, snapshot each
++					// element. Layout (8 bytes, BE on wire):
++					//   [0]: sb (1 byte; bit 0x80 = stall-and-notify)
++					//   [1]: pad
++					//   [2..3]: ts (BE u16, size in bytes)
++					//   [4..7]: ea (BE u32, EA pointer)
++					std::vector<std::vector<u8>> elem_snapshots(element_count);
++					std::vector<const u8*> elem_ptrs(element_count);
++					std::vector<u32> elem_sizes(element_count);
++					std::vector<u32> elem_eals(element_count);
++					bool elements_ok = true;
++					for (u32 i = 0; i < element_count; ++i)
++					{
++						const u8* d = desc_src + i * 8;
++						const u8 sb = d[0];
++						const u16 ts_be = static_cast<u16>((d[2] << 8) | d[3]);
++						const u32 ea_be = (static_cast<u32>(d[4]) << 24)
++							| (static_cast<u32>(d[5]) << 16)
++							| (static_cast<u32>(d[6]) << 8)
++							|  static_cast<u32>(d[7]);
++						if (sb & 0x80u)
++						{
++							std::fprintf(stderr,
++								"[spu_trace] GETL capture skipped: element %u has stall-and-notify bit set (deferred R8.5+)\n", i);
++							elements_ok = false;
++							break;
++						}
++						if (ts_be == 0u || ts_be > 0x4000u)
++						{
++							std::fprintf(stderr,
++								"[spu_trace] GETL capture skipped: element %u ts=%u out of R6.7 simple-cmd cap [1,0x4000]\n", i, ts_be);
++							elements_ok = false;
++							break;
++						}
++						elem_sizes[i] = ts_be;
++						elem_eals[i] = ea_be;
++						const u8* ea_src = vm::_ptr<u8>(ea_be);
++						if (!ea_src)
++						{
++							std::fprintf(stderr,
++								"[spu_trace] GETL capture skipped: element %u EA=0x%x vm::_ptr returned null\n", i, ea_be);
++							elements_ok = false;
++							break;
++						}
++						elem_snapshots[i].assign(ea_src, ea_src + ts_be);
++						elem_ptrs[i] = elem_snapshots[i].data();
++					}
++
++					if (elements_ok)
++					{
++						trace_tracer_mfc.record_spu_mfc_getl_cmd(
++							trace_target_spu_mfc, trace_pc_mfc,
++							static_cast<u32>(cmd_code), mfc_tag,
++							mfc_size_at_dispatch,
++							mfc_lsa,            // lsa_dest_base
++							mfc_eah,
++							mfc_eal,            // descriptor_lsa
++							desc_snapshot.data(),
++							element_count,
++							elem_ptrs.data(),
++							elem_sizes.data(),
++							elem_eals.data());
++					}
++				}
++				catch (...)
++				{
++					// Best-effort — vm::_ptr can throw on out-of-bounds
++					// EA. Skip the entire GETL capture if any element
++					// is unreadable.
++				}
++			}
 +		}
 +
 +		const bool ok = process_mfc_cmd();
 +
-+		if (trace_tracer_mfc.enabled() && capture_dma)
++		if (trace_tracer_mfc.enabled())
 +		{
-+			trace_tracer_mfc.record_mfc_dma_complete(
-+				trace_target_spu_mfc, mfc_tag, mfc_size_at_dispatch);
++			if (capture_dma)
++			{
++				trace_tracer_mfc.record_mfc_dma_complete(
++					trace_target_spu_mfc, mfc_tag, mfc_size_at_dispatch);
++			}
++			else if (capture_getl_pre)
++			{
++				// R8.4b: transferred_bytes for GETL is the sum of
++				// per-element ts (descriptor parsed above). Re-parse
++				// the descriptor here defensively rather than passing
++				// the sum across the process_mfc_cmd() boundary.
++				u32 total_transferred = 0;
++				const u8* desc_src = this->ls + descriptor_lsa_clean;
++				const u32 element_count = mfc_size_at_dispatch / 8u;
++				for (u32 i = 0; i < element_count; ++i)
++				{
++					const u8* d = desc_src + i * 8;
++					const u16 ts_be = static_cast<u16>((d[2] << 8) | d[3]);
++					total_transferred += ts_be;
++				}
++				trace_tracer_mfc.record_mfc_dma_complete(
++					trace_target_spu_mfc, mfc_tag, total_transferred);
++			}
 +		}
 +
 +		return ok;
  	}
  
  	case MFC_WrListStallAck:
-@@ -6432,6 +6754,15 @@ bool spu_thread::stop_and_signal(u32 code)
+@@ -6432,6 +6881,15 @@ bool spu_thread::stop_and_signal(u32 code)
  {
  	spu_log.trace("stop_and_signal(code=0x%x)", code);
  

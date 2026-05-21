@@ -1044,6 +1044,13 @@ mod tests {
             eah: 0,
             eal,
             ea_chunk_sha256: sha.to_owned(),
+            // R8.4b — list-DMA fields default to None for
+            // simple GET/PUT helpers used by unit tests.
+            descriptor_sha256: None,
+            descriptor_size: None,
+            element_chunks: None,
+            element_sizes: None,
+            element_eals: None,
         }
     }
 
@@ -1464,6 +1471,11 @@ mod tests {
                 seq: 8, side: CapturedSide::Spu, target_spu, pc: 284,
                 cmd: MFC_GET_CMD, tag, size, lsa, eah: 0, eal: 0xD0010000,
                 ea_chunk_sha256: sha.to_owned(),
+                descriptor_sha256: None,
+                descriptor_size: None,
+                element_chunks: None,
+                element_sizes: None,
+                element_eals: None,
             }),
             CapturedEvent::MfcDmaComplete(MfcDmaCompleteEvent {
                 seq: 9, side: CapturedSide::Spu, target_spu,
