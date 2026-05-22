@@ -1,0 +1,15 @@
+{"seq":0,"side":"spu","kind":"spu_image","target_spu":256,"image_sha256":"54640ed6b7fc956453be233b3239b2a8787fdd0001a65a962b2d60070706ab17","load_addr":0,"size":262144,"entry_pc":0}
+{"seq":1,"side":"spu","kind":"spu_wrch","target_spu":256,"pc":184,"channel":16,"value":65536,"would_stall":false}
+{"seq":2,"side":"spu","kind":"spu_wrch","target_spu":256,"pc":192,"channel":17,"value":0,"would_stall":false}
+{"seq":3,"side":"spu","kind":"spu_wrch","target_spu":256,"pc":196,"channel":18,"value":384,"would_stall":false}
+{"seq":4,"side":"spu","kind":"spu_wrch","target_spu":256,"pc":204,"channel":19,"value":16,"would_stall":false}
+{"seq":5,"side":"spu","kind":"spu_wrch","target_spu":256,"pc":212,"channel":20,"value":3,"would_stall":false}
+{"seq":6,"side":"spu","kind":"spu_wrch","target_spu":256,"pc":220,"channel":21,"value":38,"would_stall":false}
+{"seq":7,"side":"spu","kind":"spu_mfc_cmd","target_spu":256,"pc":220,"cmd":38,"tag":3,"size":16,"lsa":65536,"eah":0,"eal":384,"ea_chunk_sha256":"79238773912c38db59bf192072b2d89fcb1757d7be59870765cc2be911271126","descriptor_sha256":"79238773912c38db59bf192072b2d89fcb1757d7be59870765cc2be911271126","descriptor_size":16,"element_chunks":["471fb943aa23c511f6f72f8d1652d9c880cfa392ad80503120547703e56a2be5","c422e7070cb1cb455b5de9afee0d975e303d0239c72030cd7414ab5c382d3ae8"],"element_sizes":[128,64],"element_eals":[268505472,268505600]}
+{"seq":8,"side":"spu","kind":"mfc_dma_complete","target_spu":256,"tag":3,"transferred_bytes":192}
+{"seq":9,"side":"spu","kind":"spu_wrch","target_spu":256,"pc":224,"channel":22,"value":8,"would_stall":false}
+{"seq":10,"side":"spu","kind":"spu_wrch","target_spu":256,"pc":232,"channel":23,"value":2,"would_stall":false}
+{"seq":11,"side":"spu","kind":"spu_rdch","target_spu":256,"pc":236,"channel":24,"value":8,"would_stall":false}
+{"seq":12,"side":"spu","kind":"spu_wrch","target_spu":256,"pc":248,"channel":28,"value":3237998271,"would_stall":false}
+{"seq":13,"side":"spu","kind":"spu_stop","target_spu":256,"pc":252,"stop_code":257}
+{"seq":14,"side":"spu","kind":"final_state","target_spu":256,"gpr_lane_zero":[{"reg":1,"value":262128},{"reg":2,"value":8},{"reg":3,"value":268505472},{"reg":4,"value":268505600},{"reg":5,"value":1886483059},{"reg":6,"value":269554195},{"reg":7,"value":65664},{"reg":8,"value":1886483059},{"reg":9,"value":4294967295},{"reg":10,"value":66},{"reg":11,"value":65728},{"reg":12,"value":1111638594},{"reg":13,"value":269554195},{"reg":14,"value":1111638594},{"reg":15,"value":4294967295},{"reg":17,"value":384},{"reg":18,"value":66051},{"reg":19,"value":269554195},{"reg":20,"value":8},{"reg":21,"value":269554195},{"reg":22,"value":269554195},{"reg":23,"value":128},{"reg":24,"value":128},{"reg":25,"value":128},{"reg":26,"value":128},{"reg":27,"value":4},{"reg":28,"value":128},{"reg":29,"value":64},{"reg":30,"value":128},{"reg":31,"value":128},{"reg":32,"value":128},{"reg":33,"value":12},{"reg":34,"value":65536},{"reg":36,"value":16},{"reg":37,"value":3},{"reg":38,"value":38},{"reg":39,"value":2},{"reg":40,"value":3237998271}],"channels":{"in_mbox":null,"out_mbox":null,"out_intr_mbox":null,"snr1":0,"snr2":0}}

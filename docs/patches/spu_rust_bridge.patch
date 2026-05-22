@@ -1,4 +1,3 @@
-warning: in the working copy of 'rpcs3/Emu/Cell/SPURustBridge.cpp', LF will be replaced by CRLF the next time Git touches it
 diff --git a/rpcs3/Emu/CMakeLists.txt b/rpcs3/Emu/CMakeLists.txt
 index f863a2b91..d862b2287 100644
 --- a/rpcs3/Emu/CMakeLists.txt
@@ -49,10 +48,10 @@ index f863a2b91..d862b2287 100644
      target_precompile_headers(rpcs3_emu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../stdafx.h")
 diff --git a/rpcs3/Emu/Cell/SPURustBridge.cpp b/rpcs3/Emu/Cell/SPURustBridge.cpp
 new file mode 100644
-index 000000000..d0aed99e3
+index 000000000..85f699ac3
 --- /dev/null
 +++ b/rpcs3/Emu/Cell/SPURustBridge.cpp
-@@ -0,0 +1,1243 @@
+@@ -0,0 +1,1245 @@
 +#include "stdafx.h"
 +#include "SPURustBridge.h"
 +
@@ -477,11 +476,13 @@ index 000000000..d0aed99e3
 +		}
 +
 +		spu_rust_bridge_log.success(
-+			"[Rust SPU bridge] R8.4e DMA PUTL dispatched: cmd=0x24 "
++			"[Rust SPU bridge] R8.4e DMA PUTL dispatched: "
 +			"descriptor_lsa=0x%x descriptor_size=%u element_count=%u "
 +			"lsa_src=0x%x transferred_bytes=%u tag=%u on '%s'; real LS->EA "
 +			"path (vm::_ptr<u8> per element); tag-stat 0x%x queued for "
-+			"subsequent rdch ch24",
++			"subsequent rdch ch24 (cmd=0x24 PUTL / 0x25 PUTLB / 0x26 PUTLF "
++			"all route here per R8.4f-b — barrier/fence stripped at "
++			"do_list_transfer)",
 +			descriptor_lsa, descriptor_size, element_count,
 +			lsa_src_base, total_transferred, tag, name,
 +			1u << tag);
@@ -1229,7 +1230,6 @@ index 000000000..d0aed99e3
 +			if (popped > 0)
 +			{
 +				spu.ch_out_mbox.set_value(out_val);
-warning: in the working copy of 'rpcs3/Emu/Cell/SPURustBridge.h', LF will be replaced by CRLF the next time Git touches it
 +				if (popped > 1)
 +				{
 +					spu_rust_bridge_log.warning(
@@ -1299,13 +1299,13 @@ warning: in the working copy of 'rpcs3/Emu/Cell/SPURustBridge.h', LF will be rep
 +}
 diff --git a/rpcs3/Emu/Cell/SPURustBridge.h b/rpcs3/Emu/Cell/SPURustBridge.h
 new file mode 100644
-index 000000000..19aeb0bac
+index 000000000..f9e77e426
 --- /dev/null
 +++ b/rpcs3/Emu/Cell/SPURustBridge.h
 @@ -0,0 +1,231 @@
 +#pragma once
 +
-+// R6.1 / R6.2 / R6.3a / R6.3b / R6.3c / R6.4a / R6.4b / R6.5b / R7.1 / R7.2 / R8.1 / R8.4d / R8.4e — RPCS3 ↔ Rust SPU bridge (opt-in, default OFF).
++// R6.1 / R6.2 / R6.3a / R6.3b / R6.3c / R6.4a / R6.4b / R6.5b / R7.1 / R7.2 / R8.1 / R8.4d / R8.4e / R8.4f-a / R8.4f-b — RPCS3 ↔ Rust SPU bridge (opt-in, default OFF).
 +//
 +// This header is the C++-side facade over the `rpcs3_spu_ffi` Rust
 +// staticlib. It lets the SPU thread loop optionally delegate

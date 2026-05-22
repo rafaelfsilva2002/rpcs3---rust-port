@@ -481,12 +481,16 @@ impl MfcReplayState {
                 // re-checked in `process_mfc_cmd`). R8.1 added
                 // PUT (0x20) alongside GET (0x40). R8.4c added
                 // GETL (0x44). R8.4e added PUTL (0x24). R8.4f-a
-                // added GETLB (0x45) / GETLF (0x46). Other
-                // list / atomic / barrier codes remain rejected.
+                // added GETLB (0x45) / GETLF (0x46). R8.4f-b
+                // added PUTLB (0x25) / PUTLF (0x26). The entire
+                // 6-code list-DMA family is now accepted; only
+                // atomic / barrier-cmd / sync codes remain
+                // rejected at the wrch ch21 layer.
                 let cmd = value & 0xff;
                 if cmd != MFC_GET_CMD && cmd != MFC_PUT_CMD
                     && cmd != 0x44 && cmd != 0x24
                     && cmd != 0x45 && cmd != 0x46
+                    && cmd != 0x25 && cmd != 0x26
                 {
                     return Err(MfcReplayError::UnsupportedMfcCmd { cmd });
                 }
@@ -732,11 +736,14 @@ impl MfcReplayState {
         // R8.4f-a — GETLB (0x45) / GETLF (0x46) also dispatch
         // to the list path; per RPCS3 `do_list_transfer` the
         // barrier/fence bits are stripped before the per-element
-        // copy, so the data path is byte-identical to GETL. PUT
-        // (0x20) takes the vacuous-staging trick below. GET
+        // copy, so the data path is byte-identical to GETL.
+        // R8.4f-b — PUTLB (0x25) / PUTLF (0x26) likewise — same
+        // logic as PUTL with barrier/fence stripped.
+        // PUT (0x20) takes the vacuous-staging trick below. GET
         // (0x40) falls through to the AssertNow `process_mfc_cmd`.
         if event.cmd == 0x44 || event.cmd == 0x24
             || event.cmd == 0x45 || event.cmd == 0x46
+            || event.cmd == 0x25 || event.cmd == 0x26
         {
             return self.process_mfc_list_cmd(event, ls);
         }
@@ -794,12 +801,14 @@ impl MfcReplayState {
         result
     }
 
-    /// R8.4c / R8.4e / R8.4f-a — process a captured list-DMA
-    /// `spu_mfc_cmd` event:
+    /// R8.4c / R8.4e / R8.4f-a / R8.4f-b — process a captured
+    /// list-DMA `spu_mfc_cmd` event (entire 6-code family):
     /// - GETL (0x44, EA → LS) — R8.4c
     /// - GETLB (0x45, GETL + barrier) — R8.4f-a
     /// - GETLF (0x46, GETL + fence) — R8.4f-a
     /// - PUTL (0x24, LS → EA) — R8.4e
+    /// - PUTLB (0x25, PUTL + barrier) — R8.4f-b
+    /// - PUTLF (0x26, PUTL + fence) — R8.4f-b
     ///
     /// Per RPCS3 `do_list_transfer`, the barrier/fence bits are
     /// stripped from the cmd before the per-element copy
@@ -859,12 +868,19 @@ impl MfcReplayState {
         // Defensive: cmd must be a supported list-DMA code.
         // R8.4c: 0x44 GETL. R8.4e: 0x24 PUTL. R8.4f-a: 0x45
         // GETLB + 0x46 GETLF (data path identical to GETL).
-        let is_putl = event.cmd == 0x24;
+        // R8.4f-b: 0x25 PUTLB + 0x26 PUTLF (data path identical
+        // to PUTL).
+        let is_putl_family =
+            event.cmd == 0x24 || event.cmd == 0x25 || event.cmd == 0x26;
         let is_getl_family =
             event.cmd == 0x44 || event.cmd == 0x45 || event.cmd == 0x46;
-        if !is_getl_family && !is_putl {
+        if !is_getl_family && !is_putl_family {
             return Err(MfcReplayError::UnsupportedMfcCmd { cmd: event.cmd });
         }
+        // For backward compatibility with the rest of this method,
+        // bind `is_putl` to the PUTL-family flag (used below to
+        // gate the LS-write step).
+        let is_putl = is_putl_family;
         if event.eah != 0 {
             return Err(MfcReplayError::UnsupportedMfcEah { eah: event.eah });
         }
@@ -1720,15 +1736,18 @@ mod tests {
         let mut st = MfcReplayState::new(trace_path, canonical);
 
         // R8.4c: GETL (0x44) accepted. R8.4e: PUTL (0x24) accepted.
-        // R8.4f-a: GETLB (0x45) + GETLF (0x46) accepted. New canary
-        // is PUTLB (0x25) — list+barrier on the PUT direction,
-        // still out of scope (R8.4f-b).
-        let err = st.process_wrch(ch::MFC_CMD, 0x25)
-            .expect_err("PUTLB cmd must be rejected");
-        assert!(matches!(err, MfcReplayError::UnsupportedMfcCmd { cmd: 0x25 }), "got {err:?}");
+        // R8.4f-a: GETLB (0x45) + GETLF (0x46) accepted.
+        // R8.4f-b: PUTLB (0x25) + PUTLF (0x26) accepted — the
+        // entire 6-code list-DMA family is now in scope. New
+        // canary is GETLLAR (0xD0, atomic reservation get) —
+        // out of all current scope, defers R8.5+.
+        let err = st.process_wrch(ch::MFC_CMD, 0xD0)
+            .expect_err("GETLLAR cmd must be rejected");
+        assert!(matches!(err, MfcReplayError::UnsupportedMfcCmd { cmd: 0xD0 }), "got {err:?}");
 
         // Sanity: PUT (0x20), GETL (0x44), PUTL (0x24), GETLB
-        // (0x45), GETLF (0x46) are NOW accepted.
+        // (0x45), GETLF (0x46), PUTLB (0x25), PUTLF (0x26) are
+        // NOW accepted.
         let mut st2 = MfcReplayState::new(tmp.path().join("c2.jsonl"), tmp.path().join("d2"));
         std::fs::create_dir_all(tmp.path().join("d2")).unwrap();
         st2.process_wrch(ch::MFC_CMD, 0x20)
@@ -1753,6 +1772,16 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("d6")).unwrap();
         st6.process_wrch(ch::MFC_CMD, 0x46)
             .expect("GETLF cmd must be accepted (R8.4f-a)");
+
+        let mut st7 = MfcReplayState::new(tmp.path().join("c7.jsonl"), tmp.path().join("d7"));
+        std::fs::create_dir_all(tmp.path().join("d7")).unwrap();
+        st7.process_wrch(ch::MFC_CMD, 0x25)
+            .expect("PUTLB cmd must be accepted (R8.4f-b)");
+
+        let mut st8 = MfcReplayState::new(tmp.path().join("c8.jsonl"), tmp.path().join("d8"));
+        std::fs::create_dir_all(tmp.path().join("d8")).unwrap();
+        st8.process_wrch(ch::MFC_CMD, 0x26)
+            .expect("PUTLF cmd must be accepted (R8.4f-b)");
     }
 
     #[test]

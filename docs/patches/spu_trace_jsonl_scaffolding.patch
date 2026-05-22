@@ -48,10 +48,10 @@ index f863a2b91..d862b2287 100644
      target_precompile_headers(rpcs3_emu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../stdafx.h")
 diff --git a/rpcs3/Emu/Cell/SPUTraceJsonl.cpp b/rpcs3/Emu/Cell/SPUTraceJsonl.cpp
 new file mode 100644
-index 000000000..ba6bfe787
+index 000000000..31ff88f12
 --- /dev/null
 +++ b/rpcs3/Emu/Cell/SPUTraceJsonl.cpp
-@@ -0,0 +1,1041 @@
+@@ -0,0 +1,1045 @@
 +#include "stdafx.h"
 +
 +// R5.8 A.3 — SPU PPU↔SPU trace JSONL writer (impl).
@@ -731,11 +731,15 @@ index 000000000..ba6bfe787
 +	// variants of GETL — same EA->LS data path, only ordering
 +	// modifiers differ; ordering bits don't affect single-SPU
 +	// synchronous fixtures so the wire format remains identical).
++	// R8.4f-b: also accepts cmd 0x25 PUTLB and 0x26 PUTLF
++	// (symmetric LS->EA mirror of GETLB/GETLF).
 +	// The runtime hook MUST filter.
-+	if (cmd != 0x44u && cmd != 0x24u && cmd != 0x45u && cmd != 0x46u)
++	if (cmd != 0x44u && cmd != 0x24u && cmd != 0x45u && cmd != 0x46u
++		&& cmd != 0x25u && cmd != 0x26u)
 +	{
 +		std::fprintf(stderr,
-+			"[spu_trace] record_spu_mfc_getl_cmd dropped: cmd=0x%x is not 0x44 GETL / 0x24 PUTL / 0x45 GETLB / 0x46 GETLF\n", cmd);
++			"[spu_trace] record_spu_mfc_getl_cmd dropped: cmd=0x%x is not "
++			"0x44 GETL / 0x24 PUTL / 0x45 GETLB / 0x46 GETLF / 0x25 PUTLB / 0x26 PUTLF\n", cmd);
 +		return;
 +	}
 +	if (!descriptor_bytes || descriptor_size == 0 || descriptor_size % 8 != 0)
@@ -1095,10 +1099,10 @@ index 000000000..ba6bfe787
 +} // namespace rpcs3::spu_trace
 diff --git a/rpcs3/Emu/Cell/SPUTraceJsonl.h b/rpcs3/Emu/Cell/SPUTraceJsonl.h
 new file mode 100644
-index 000000000..c237bc264
+index 000000000..95a9af2e6
 --- /dev/null
 +++ b/rpcs3/Emu/Cell/SPUTraceJsonl.h
-@@ -0,0 +1,336 @@
+@@ -0,0 +1,338 @@
 +// R5.8 A.3 — SPU PPU↔SPU trace JSONL writer.
 +//
 +// Self-contained, gated, disabled-by-default trace emitter that produces
@@ -1331,12 +1335,14 @@ index 000000000..c237bc264
 +	// differs — caller provides LS-source snapshots instead of
 +	// EA-source). R8.4f-a extends to GETLB (0x45) and GETLF
 +	// (0x46) — list+barrier / list+fence variants of GETL.
++	// R8.4f-b extends to PUTLB (0x25) and PUTLF (0x26) —
++	// symmetric LS→EA mirror of GETLB/GETLF.
 +	// The barrier/fence bits only affect ordering of subsequent
 +	// commands on the same tag (no observable effect for
 +	// single-SPU synchronous fixtures), so the wire format
-+	// remains identical to GETL; replay/runtime infers
-+	// direction (EA → LS) from the cmd code's GET base (0x40).
-+	// PUTLB (0x25) / PUTLF (0x26) defer to R8.4f-b.
++	// remains identical across all 6 list-DMA cmd codes;
++	// replay/runtime infers direction (EA → LS vs LS → EA) from
++	// the cmd code's GET (0x40) or PUT (0x20) base.
 +	// Stall-and-notify (descriptor `sb` bit 0x80) defers to
 +	// R8.5+; caller MUST refuse capture if any element has it.
 +	void record_spu_mfc_getl_cmd(std::uint32_t target_spu, std::uint32_t pc,

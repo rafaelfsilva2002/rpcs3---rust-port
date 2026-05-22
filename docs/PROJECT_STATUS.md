@@ -1,8 +1,31 @@
-# Project Status — R8.4f-a LANDED (GETLB + GETLF barrier/fence — 15th + 16th oracles, end-to-end in one cycle)
+# Project Status — R8.4f-b LANDED (PUTLB + PUTLF — 17th + 18th oracles; entire 6-code list-DMA family complete)
 
 **Authoritative current source of truth for the RPCS3 → Rust port.**
 
-Last updated: **2026-05-21 (R8.4f-a landing)**. R8.4f-a adds
+Last updated: **2026-05-21 (R8.4f-b landing)**. R8.4f-b adds
+MFC PUTLB (cmd=0x25, PUTL + barrier) and PUTLF (cmd=0x26,
+PUTL + fence) end-to-end in a single phase. Same REUSE-PUT
+strategy as R8.4f-a's REUSE-GET: per RPCS3 `do_list_transfer`
+the barrier/fence bits are stripped before the per-element
+copy, so the data path is byte-identical to plain PUTL. Two
+new replay-validated oracles (`single_spu_dma_putlb_v1`,
+ea_status `0xA12FDA3B`; `single_spu_dma_putlf_v1`, ea_status
+`0xA12FDA7F`). Bridge ON delegates both with
+`DELEGATED EXECUTION OK total_steps=1394` (identical to PUTL),
+no fallback; all 12 triple-symmetry fixtures green. **The
+entire 6-code list-DMA family (GETL/GETLB/GETLF/PUTL/PUTLB/
+PUTLF) is now end-to-end supported** — `MFC_LIST_CMDS_UNSUPPORTED`
+in the parser is now an empty slice. All 3 patch SHAs bumped:
+scaffolding `5085c4af…` → `d9d60bfa01a942c0523ac4ae5f8307c9bd89c57efc0736b432dc1e38db1d482c`,
+runtime hooks `67bef045…` → `e53518c4393e416d08ad09257ddf0af9c92ff7011a3f0524ff1db9c70593519e`,
+bridge `b9e5e977…` → `106ddede745c6487e3b1f4dbe61c272beb3c16835c164a952a0799ed4de3e899`.
+rpcs3.exe rebuilt: `f3d4e85f…` →
+`85e6fe8d09f7ae02d0cc258f8087a0eb46ab25bde3c66e8eda0050682626f428`.
+ZERO new `.dmachunk` / `.dmalistdesc` (perfect pool dedup);
+TWO new `.spuimg`. Stall-and-notify (bit 0x80) defers R8.5+.
+See § 8.4f-b.
+
+Previously: **2026-05-21 (R8.4f-a landing)**. R8.4f-a adds
 MFC GETLB (cmd=0x45, GETL + barrier) and GETLF (cmd=0x46,
 GETL + fence) end-to-end in a single phase. Per RPCS3
 `do_list_transfer` (`SPUThread.cpp:2887`), barrier/fence bits
@@ -207,6 +230,25 @@ Do NOT treat the archive as current.
 
 ## 1. Executive current status
 
+- **R8.4f-b is LANDED** (2026-05-21). PUTLB (cmd=0x25,
+  list+barrier) + PUTLF (cmd=0x26, list+fence) end-to-end
+  in one cycle. **Closes the 6-code list-DMA family**:
+  GETL/GETLB/GETLF + PUTL/PUTLB/PUTLF all replay-validated +
+  bridge-delegated. Same REUSE-PUTL strategy as R8.4f-a's
+  REUSE-GETL: per RPCS3 `do_list_transfer` barrier/fence
+  bits are stripped before per-element copy. Two new
+  oracles: `single_spu_dma_putlb_v1` (SPU sentinel
+  `0xC0FFEEBB` + ea_status `0xA12FDA3B`) and
+  `single_spu_dma_putlf_v1` (`0xC0FFEEBF` + `0xA12FDA7F`).
+  Bridge ON delegates both end-to-end with
+  `total_steps=1394` (identical to PUTL). All 12
+  triple-symmetry fixtures green (added put_list_b,
+  put_list_f). `MFC_LIST_CMDS_UNSUPPORTED` parser slice is
+  now empty. All 3 patch SHAs bumped: scaffolding
+  `5085c4af…` → `d9d60bfa…`, runtime hooks `67bef045…` →
+  `e53518c4…`, bridge `b9e5e977…` → `106ddede…`. rpcs3.exe
+  rebuilt `f3d4e85f…` → `85e6fe8d…`. ZERO new `.dmachunk` /
+  `.dmalistdesc`; TWO new `.spuimg`. See § 8.4f-b.
 - **R8.4f-a is LANDED** (2026-05-21). GETLB (cmd=0x45,
   list+barrier) + GETLF (cmd=0x46, list+fence) end-to-end in
   one cycle: writer + capture + replay + runtime bridge +
@@ -345,17 +387,14 @@ Do NOT treat the archive as current.
   persistent handle → R6.5 / R6.5b bridge acceptance → R6.6 game_like
   cross-path → R6.7 design + A.1-A.5 + Phase C — all landed and
   gated green.
-- **Sixteen replay-validated SPU oracles exist**, all
+- **Eighteen replay-validated SPU oracles exist**, all
   `diff_snapshots(interp, jit).is_identical()` byte-identical
   across `InterpreterExecutor` and `RecompilerExecutor`. The
-  13th, `single_spu_dma_getl_v1`, landed in R8.4c and went
-  fully triple-symmetric (bridge ON delegated) in R8.4d.
-  The 14th, `single_spu_dma_putl_v1`, landed end-to-end in
-  R8.4e. The 15th + 16th, `single_spu_dma_getlb_v1` +
-  `single_spu_dma_getlf_v1`, landed end-to-end in R8.4f-a
-  (barrier/fence variants of GETL — REUSE GETL semantics
-  across all layers since per RPCS3 `do_list_transfer`
-  barrier/fence bits are stripped before the per-element
+  13th-18th oracles cover the entire MFC list-DMA 6-code
+  family: GETL (R8.4c) + PUTL (R8.4e) + GETLB/GETLF
+  (R8.4f-a) + PUTLB/PUTLF (R8.4f-b). All barrier/fence
+  variants reuse their base GETL/PUTL data path per RPCS3
+  `do_list_transfer` (bits stripped before per-element
   copy).
 - **`single_spu_dma_put_v1` is the 8th oracle** (R8.1 landed
   2026-05-19; runtime-delegated under bridge ON same day).
@@ -2054,6 +2093,103 @@ GETLF:
   assumption by direct C++ inspection first.
 - Stall-and-notify bit 0x80 (R8.5+).
 - 3+ element fixtures + descriptor edge cases.
+
+---
+
+## 8.4f-b R8.4f-b closure summary (2026-05-21)
+
+R8.4f-b adds MFC PUTLB (cmd=0x25) and PUTLF (cmd=0x26) —
+the barrier/fence variants of PUTL — end-to-end in a single
+phase. Mirrors R8.4f-a's REUSE-GETL strategy on the symmetric
+inverse direction (LS → EA). **Closes the entire 6-code MFC
+list-DMA family**: GETL (R8.4c) + GETLB/GETLF (R8.4f-a) +
+PUTL (R8.4e) + PUTLB/PUTLF (R8.4f-b) — all replay-validated +
+bridge-delegated end-to-end.
+
+**Scope:**
+
+- **SPUTraceJsonl.{h,cpp}** — `record_spu_mfc_getl_cmd` cmd
+  guard relaxed to accept 0x44/0x24/0x45/0x46/0x25/0x26.
+- **SPUThread.cpp** — ch21 dispatcher: new `putl_family`
+  predicate matches 0x24/0x25/0x26; per-element `is_putl`
+  flag covers all 3 PUTL-family codes to take the LS-source
+  snapshot branch.
+- **`rpcs3-spu-differential::trace_fmt`** — added
+  `MFC_PUTLB_CMD = 0x25`, `MFC_PUTLF_CMD = 0x26`;
+  `MFC_LIST_CMDS_UNSUPPORTED = &[]` (empty). Helper
+  `is_mfc_list_supported_cmd` now covers all 6 codes.
+  2 new parser tests (`r8_4f_b_putlb_parses_and_validates`,
+  `r8_4f_b_putlf_parses_and_validates`); canary test
+  iterator is now empty by design.
+- **`rpcs3-spu-differential::mfc_replay`** — wrch ch21 guard
+  accepts 0x25/0x26; `process_mfc_cmd_pre_replay` dispatches
+  0x25/0x26 to `process_mfc_list_cmd`; `process_mfc_list_cmd`
+  defensive guard via `is_putl_family ||
+  is_getl_family`; `is_putl` bound to family flag to keep
+  the existing LS-handling branch logic. Canary in
+  `process_wrch_rejects_unsupported_cmd_code` moved to
+  GETLLAR (0xD0).
+- **`rpcs3-spu-interpreter`** — ch21 dispatch accepts 0x25/
+  0x26 alongside 0x24; `is_putl` extended; routes through
+  `dma_putl_callback`.
+- **`SPURustBridge.cpp`** — `bridge_dma_putl_callback` data
+  path unchanged; log message generalized to mention all 3
+  PUTL variants (PUTL/PUTLB/PUTLF route here per R8.4f-b).
+  NO new bridge function; NO new FFI.
+
+**Patch SHAs at R8.4f-b landing:**
+
+| patch | sha256 | status |
+|---|---|---|
+| scaffolding | `d9d60bfa01a942c0523ac4ae5f8307c9bd89c57efc0736b432dc1e38db1d482c` | **bumped** (was `5085c4af…`) |
+| runtime hooks | `e53518c4393e416d08ad09257ddf0af9c92ff7011a3f0524ff1db9c70593519e` | **bumped** (was `67bef045…`) |
+| rust bridge | `106ddede745c6487e3b1f4dbe61c272beb3c16835c164a952a0799ed4de3e899` | **bumped** (was `b9e5e977…`) |
+
+**rpcs3.exe at R8.4f-b landing:** sha256
+`85e6fe8d09f7ae02d0cc258f8087a0eb46ab25bde3c66e8eda0050682626f428`
+(`f3d4e85f…` → `85e6fe8d…` after R8.4f-b rebuild).
+
+**Fixture artifacts:**
+
+PUTLB (17th):
+- `.self`: 939,514 bytes sha `120f43ba27eb2123…`
+- `.jsonl`: 15 events, ~3 KB
+- `.spuimg`: NEW
+  `1a659f3225c59df282aa2d17c99404cf46a23ac42bb54b800d5b7b369dab6126`
+- `.dmalistdesc` + `.dmachunk`: REUSE canonical pool
+
+PUTLF (18th):
+- `.self`: 939,514 bytes sha `94e5474e8f62a4e0…`
+- `.jsonl`: 15 events
+- `.spuimg`: NEW
+  `54640ed6b7fc956453be233b3239b2a8787fdd0001a65a962b2d60070706ab17`
+- `.dmalistdesc` + `.dmachunk`: REUSE canonical pool
+
+ZERO new `.dmachunk` / `.dmalistdesc` (perfect content-
+addressed pool dedup); TWO new `.spuimg`.
+
+**Triple-symmetry gate:**
+
+- New `PUT_LIST_B_FIXTURE` + `PUT_LIST_F_FIXTURE` entries.
+- All 12 fixtures green. Bridge ON PUTLB + PUTLF:
+  `DELEGATED EXECUTION OK total_steps=1394` (identical to
+  PUTL), no fallback.
+
+**Workspace tests:** 5677 pass, 0 fail (+2 R8.4f-b tests).
+
+**Out of R8.4f-b scope (deferred to R8.5+):**
+
+- Stall-and-notify bit 0x80 (descriptor `sb` bit) — needs
+  SPU↔PPU signaling integration via `mfc_notify` channel.
+- 3+ element list fixtures (mechanically in-scope; no
+  fixture authored yet).
+- PUTRL family (0x34/0x35/0x36) and PUTRL barrier/fence
+  combos — REPLACED PUT variants (atomic-replace; different
+  semantics from plain PUT, may not be a simple REUSE-PUTL
+  extension).
+- Atomic MFC primitives (GETLLAR 0xD0, PUTLLC 0xB4, etc).
+- Barrier / EIEIO / SYNC sync cmds (0xC0/0xC8/0xCC).
+- Multi-SPU DMA + SPURS workloads.
 
 ---
 

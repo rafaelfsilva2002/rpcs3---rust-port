@@ -37,7 +37,7 @@ index 81bb6fd89..5c05315f6 100644
  	}
  
 diff --git a/rpcs3/Emu/Cell/SPUThread.cpp b/rpcs3/Emu/Cell/SPUThread.cpp
-index 855d95a44..8297cfcc6 100644
+index 855d95a44..89a50e062 100644
 --- a/rpcs3/Emu/Cell/SPUThread.cpp
 +++ b/rpcs3/Emu/Cell/SPUThread.cpp
 @@ -21,6 +21,8 @@
@@ -364,7 +364,7 @@ index 855d95a44..8297cfcc6 100644
  		return true;
  	}
  
-@@ -6238,43 +6438,351 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
+@@ -6238,43 +6438,362 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
  			ch_tag_upd = value;
  		}
  
@@ -518,12 +518,19 @@ index 855d95a44..8297cfcc6 100644
 +		// straight through to record_spu_mfc_getl_cmd as
 +		// 0x45/0x46, and the per-element snapshot reads EA
 +		// bytes (GET base direction).
++		// R8.4f-b — PUTLB (0x25) and PUTLF (0x26): symmetric
++		// inverse, same data path as PUTL with barrier/fence
++		// modifiers stripped at do_list_transfer.
 +		const u32 descriptor_lsa_clean = mfc_eal & 0x3fff8u;
 +		const bool getl_family =
 +			cmd_code == 0x44u   // GETL
 +			|| cmd_code == 0x45u // GETLB
 +			|| cmd_code == 0x46u; // GETLF
-+		const bool getl_or_putl = getl_family || (cmd_code == 0x24u);
++		const bool putl_family =
++			cmd_code == 0x24u   // PUTL
++			|| cmd_code == 0x25u // PUTLB
++			|| cmd_code == 0x26u; // PUTLF
++		const bool getl_or_putl = getl_family || putl_family;
 +		const bool capture_getl_pre = getl_or_putl
 +			&& mfc_size_at_dispatch > 0u
 +			&& mfc_size_at_dispatch % 8u == 0u
@@ -574,7 +581,11 @@ index 855d95a44..8297cfcc6 100644
 +				// per-element size out of R6.7 cap.
 +				try
 +				{
-+					const bool is_putl = (cmd_code == 0x24u);
++					// R8.4e: PUTL=0x24. R8.4f-b: PUTLB=0x25, PUTLF=0x26.
++					// All three take the LS-source branch.
++					const bool is_putl = (cmd_code == 0x24u)
++						|| (cmd_code == 0x25u)
++						|| (cmd_code == 0x26u);
 +					// is_getl_family for diagnostic logs (GETL/GETLB/GETLF
 +					// all hit the EA-source branch below).
 +					const u32 element_count = mfc_size_at_dispatch / 8u;
@@ -717,7 +728,7 @@ index 855d95a44..8297cfcc6 100644
  	}
  
  	case MFC_WrListStallAck:
-@@ -6432,6 +6940,15 @@ bool spu_thread::stop_and_signal(u32 code)
+@@ -6432,6 +6951,15 @@ bool spu_thread::stop_and_signal(u32 code)
  {
  	spu_log.trace("stop_and_signal(code=0x%x)", code);
  

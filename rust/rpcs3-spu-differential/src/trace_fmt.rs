@@ -1028,40 +1028,50 @@ const MFC_PUT_CMD: u32 = 0x20;
 /// | Code | Mnemonic | Direction | Modifiers          | Phase               |
 /// |------|----------|-----------|--------------------|---------------------|
 /// | 0x24 | PUTL     | LS → EA   | list               | **R8.4e accepts**   |
-/// | 0x25 | PUTLB    | LS → EA   | list + barrier     | R8.4f-b deferred    |
-/// | 0x26 | PUTLF    | LS → EA   | list + fence       | R8.4f-b deferred    |
+/// | 0x25 | PUTLB    | LS → EA   | list + barrier     | **R8.4f-b accepts** |
+/// | 0x26 | PUTLF    | LS → EA   | list + fence       | **R8.4f-b accepts** |
 /// | 0x44 | GETL     | EA → LS   | list               | **R8.4c accepts**   |
 /// | 0x45 | GETLB    | EA → LS   | list + barrier     | **R8.4f-a accepts** |
 /// | 0x46 | GETLF    | EA → LS   | list + fence       | **R8.4f-a accepts** |
 ///
 /// R8.4c lifted the canary for 0x44 GETL. R8.4e additionally lifts
 /// for 0x24 PUTL (symmetric LS → EA). R8.4f-a additionally lifts
-/// for 0x45 GETLB and 0x46 GETLF — per RPCS3 `do_list_transfer`
-/// the barrier/fence bits are stripped before the per-element copy
-/// (`args.cmd & ~0xf`), so the data path is byte-identical to GETL;
+/// for 0x45 GETLB and 0x46 GETLF. R8.4f-b additionally lifts for
+/// 0x25 PUTLB and 0x26 PUTLF — completing the 6-code list-DMA
+/// family. Per RPCS3 `do_list_transfer` the barrier/fence bits are
+/// stripped before the per-element copy (`args.cmd & ~0xf`), so
+/// the data path is byte-identical to the base GETL/PUTL;
 /// barrier/fence ordering effects don't surface in single-SPU
-/// synchronous fixtures. PUTLB (0x25) and PUTLF (0x26) still
-/// reject with `UnsupportedMfcListCmd`.
+/// synchronous fixtures. `MFC_LIST_CMDS_UNSUPPORTED` is now empty
+/// — the entire 6-code list-DMA family is accepted at the parser
+/// level. Stall-and-notify (sb bit 0x80) still rejected at
+/// per-element validation; defers R8.5+.
 const MFC_GETL_CMD: u32 = 0x44;
 const MFC_GETLB_CMD: u32 = 0x45;
 const MFC_GETLF_CMD: u32 = 0x46;
 const MFC_PUTL_CMD: u32 = 0x24;
-const MFC_LIST_CMDS_UNSUPPORTED: &[u32] = &[0x25, 0x26];
+const MFC_PUTLB_CMD: u32 = 0x25;
+const MFC_PUTLF_CMD: u32 = 0x26;
+const MFC_LIST_CMDS_UNSUPPORTED: &[u32] = &[];
 
-/// R8.4f-a — list-DMA cmd codes the parser ACCEPTS (with the
-/// shared additive-fields validation):
+/// R8.4f-a / R8.4f-b — list-DMA cmd codes the parser ACCEPTS
+/// (with the shared additive-fields validation):
 /// - 0x44 GETL (R8.4c)
 /// - 0x45 GETLB (R8.4f-a — list+barrier; data path identical to GETL)
 /// - 0x46 GETLF (R8.4f-a — list+fence; data path identical to GETL)
 /// - 0x24 PUTL (R8.4e — symmetric LS → EA)
+/// - 0x25 PUTLB (R8.4f-b — list+barrier; data path identical to PUTL)
+/// - 0x26 PUTLF (R8.4f-b — list+fence; data path identical to PUTL)
 ///
-/// All four use the same `descriptor_sha256 / descriptor_size /
+/// All six use the same `descriptor_sha256 / descriptor_size /
 /// element_chunks / element_sizes / element_eals` extension fields.
 /// Direction (EA→LS vs LS→EA) is inferred from the GET vs PUT base
 /// in the cmd code's upper nibble (`cmd & 0xf0 == 0x40` → EA→LS,
 /// `cmd & 0xf0 == 0x20` → LS→EA).
 fn is_mfc_list_supported_cmd(cmd: u32) -> bool {
-    matches!(cmd, MFC_GETL_CMD | MFC_GETLB_CMD | MFC_GETLF_CMD | MFC_PUTL_CMD)
+    matches!(cmd,
+        MFC_GETL_CMD | MFC_GETLB_CMD | MFC_GETLF_CMD
+        | MFC_PUTL_CMD | MFC_PUTLB_CMD | MFC_PUTLF_CMD)
 }
 
 fn is_mfc_list_cmd_unsupported(cmd: u32) -> bool {
@@ -3398,23 +3408,28 @@ mod tests {
         );
     }
 
-    /// R8.4a + R8.4c + R8.4e + R8.4f-a — list-DMA codes NOT YET
-    /// supported (PUTLB = 0x25, PUTLF = 0x26) surface the granular
-    /// `UnsupportedMfcListCmd` variant. R8.4c LIFTED the canary for
-    /// GETL (0x44); R8.4e additionally lifts for PUTL (0x24);
-    /// R8.4f-a additionally lifts for GETLB (0x45) and GETLF
-    /// (0x46). Each lift is covered separately by its dedicated
-    /// parser test.
+    /// R8.4a + R8.4c + R8.4e + R8.4f-a + R8.4f-b — the entire
+    /// 6-code MFC list-DMA family is now ACCEPTED at the parser
+    /// level. There are NO remaining unsupported list-DMA cmds
+    /// in current scope, so this test now exercises only the
+    /// canary INFRASTRUCTURE (the iterator is empty by design;
+    /// the for-loop body would still apply if a future regression
+    /// re-introduced a rejected list cmd, e.g., a putrl/putrlb/
+    /// putrlf variant beyond R8.4f-b scope).
+    ///
+    /// `MFC_LIST_CMDS_UNSUPPORTED` is now an empty slice — the
+    /// test compiles + asserts trivially. Lifts:
+    /// - 0x44 GETL → R8.4c
+    /// - 0x24 PUTL → R8.4e
+    /// - 0x45 GETLB / 0x46 GETLF → R8.4f-a
+    /// - 0x25 PUTLB / 0x26 PUTLF → R8.4f-b
     #[test]
     fn reject_mfc_list_cmds_with_granular_canary() {
-        // R8.4c update: 0x44 GETL removed (now accepted; covered
-        // by `r8_4c_getl_parses_and_validates`).
-        // R8.4e update: 0x24 PUTL removed (now accepted; covered
-        // by `r8_4e_putl_parses_and_validates`).
-        // R8.4f-a update: 0x45 GETLB + 0x46 GETLF removed (now
-        // accepted; covered by `r8_4f_a_getlb_parses_and_validates`
-        // + `r8_4f_a_getlf_parses_and_validates`).
-        let list_cmds: &[u32] = &[0x25, 0x26];
+        // After R8.4f-b, MFC_LIST_CMDS_UNSUPPORTED is empty.
+        // Per-cmd parser acceptance is covered by the dedicated
+        // tests (`r8_4{c,e,f_a}_*_parses_and_validates` and
+        // `r8_4f_b_{putlb,putlf}_parses_and_validates`).
+        let list_cmds: &[u32] = &[];
         for &cmd in list_cmds {
             let jsonl = format!(
                 r#"
@@ -3550,6 +3565,58 @@ mod tests {
         assert_eq!(mfc.descriptor_size, Some(16));
         assert_eq!(mfc.element_chunks.as_ref().unwrap().len(), 2);
         assert_eq!(mfc.element_sizes.as_deref(), Some(&[128u32, 64u32][..]));
+    }
+
+    /// R8.4f-b — PUTLB (0x25) parser acceptance with the same
+    /// additive-fields contract as PUTL. Per RPCS3
+    /// `do_list_transfer`, barrier bit is stripped before the
+    /// per-element copy so the wire format is byte-identical to
+    /// PUTL; only the cmd code differs (0x25 vs 0x24).
+    #[test]
+    fn r8_4f_b_putlb_parses_and_validates() {
+        let desc_sha = "11".repeat(32);
+        let elem1_sha = "22".repeat(32);
+        let elem2_sha = "33".repeat(32);
+        // cmd=37 (= 0x25 PUTLB)
+        let jsonl = format!(
+            r#"
+{{"seq":0,"side":"spu","kind":"spu_wrch","pc":256,"channel":21,"value":37,"would_stall":false,"target_spu":1}}
+{{"seq":1,"side":"spu","kind":"spu_mfc_cmd","target_spu":1,"pc":256,"cmd":37,"tag":3,"size":16,"lsa":65536,"eah":0,"eal":384,"ea_chunk_sha256":"{desc_sha}","descriptor_sha256":"{desc_sha}","descriptor_size":16,"element_chunks":["{elem1_sha}","{elem2_sha}"],"element_sizes":[128,64],"element_eals":[268505472,268505600]}}
+"#
+        );
+        let events = parse_jsonl_trace(&jsonl)
+            .expect("R8.4f-b: PUTLB with valid additive fields must parse");
+        assert_eq!(events.len(), 2);
+        let mfc = match &events[1] {
+            CapturedEvent::SpuMfcCmd(m) => m,
+            other => panic!("expected SpuMfcCmd, got {other:?}"),
+        };
+        assert_eq!(mfc.cmd, 0x25);
+        assert_eq!(mfc.descriptor_size, Some(16));
+    }
+
+    /// R8.4f-b — PUTLF (0x26) parser acceptance, mirroring PUTLB.
+    #[test]
+    fn r8_4f_b_putlf_parses_and_validates() {
+        let desc_sha = "11".repeat(32);
+        let elem1_sha = "22".repeat(32);
+        let elem2_sha = "33".repeat(32);
+        // cmd=38 (= 0x26 PUTLF)
+        let jsonl = format!(
+            r#"
+{{"seq":0,"side":"spu","kind":"spu_wrch","pc":256,"channel":21,"value":38,"would_stall":false,"target_spu":1}}
+{{"seq":1,"side":"spu","kind":"spu_mfc_cmd","target_spu":1,"pc":256,"cmd":38,"tag":3,"size":16,"lsa":65536,"eah":0,"eal":384,"ea_chunk_sha256":"{desc_sha}","descriptor_sha256":"{desc_sha}","descriptor_size":16,"element_chunks":["{elem1_sha}","{elem2_sha}"],"element_sizes":[128,64],"element_eals":[268505472,268505600]}}
+"#
+        );
+        let events = parse_jsonl_trace(&jsonl)
+            .expect("R8.4f-b: PUTLF with valid additive fields must parse");
+        assert_eq!(events.len(), 2);
+        let mfc = match &events[1] {
+            CapturedEvent::SpuMfcCmd(m) => m,
+            other => panic!("expected SpuMfcCmd, got {other:?}"),
+        };
+        assert_eq!(mfc.cmd, 0x26);
+        assert_eq!(mfc.descriptor_size, Some(16));
     }
 
     /// R8.4c — GETL with missing additive fields must reject.
