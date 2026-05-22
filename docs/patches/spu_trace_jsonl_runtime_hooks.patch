@@ -37,7 +37,7 @@ index 81bb6fd89..5c05315f6 100644
  	}
  
 diff --git a/rpcs3/Emu/Cell/SPUThread.cpp b/rpcs3/Emu/Cell/SPUThread.cpp
-index 855d95a44..dbc5e15fc 100644
+index 855d95a44..8297cfcc6 100644
 --- a/rpcs3/Emu/Cell/SPUThread.cpp
 +++ b/rpcs3/Emu/Cell/SPUThread.cpp
 @@ -21,6 +21,8 @@
@@ -364,7 +364,7 @@ index 855d95a44..dbc5e15fc 100644
  		return true;
  	}
  
-@@ -6238,43 +6438,332 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
+@@ -6238,43 +6438,351 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
  			ch_tag_upd = value;
  		}
  
@@ -509,8 +509,21 @@ index 855d95a44..dbc5e15fc 100644
 +		// source bytes at (mfc_lsa + cumulative_offset), while
 +		// GETL snapshots EA source bytes via vm::_ptr<u8>(ea).
 +		// Wire format / side-files / additive fields identical.
++		//
++		// R8.4f-a — GETLB (0x45) and GETLF (0x46): GETL + barrier
++		// or fence modifier. Per RPCS3 do_list_transfer the
++		// barrier/fence bits are stripped (args.cmd & ~0xf) so
++		// the per-element copy is byte-identical to GETL. We
++		// capture them via the same GETL path: cmd_code passes
++		// straight through to record_spu_mfc_getl_cmd as
++		// 0x45/0x46, and the per-element snapshot reads EA
++		// bytes (GET base direction).
 +		const u32 descriptor_lsa_clean = mfc_eal & 0x3fff8u;
-+		const bool getl_or_putl = (cmd_code == 0x44u) || (cmd_code == 0x24u);
++		const bool getl_family =
++			cmd_code == 0x44u   // GETL
++			|| cmd_code == 0x45u // GETLB
++			|| cmd_code == 0x46u; // GETLF
++		const bool getl_or_putl = getl_family || (cmd_code == 0x24u);
 +		const bool capture_getl_pre = getl_or_putl
 +			&& mfc_size_at_dispatch > 0u
 +			&& mfc_size_at_dispatch % 8u == 0u
@@ -551,6 +564,10 @@ index 855d95a44..dbc5e15fc 100644
 +				// R8.4b: GETL descriptor + per-element EA snapshots.
 +				// R8.4e: PUTL same shape, but per-element bytes are
 +				// LS-source (cumulative offset from mfc_lsa).
++				// R8.4f-a: GETLB (0x45) / GETLF (0x46) same shape as
++				// GETL — barrier/fence modifiers don't change the
++				// per-element data path; treat as EA-source like
++				// plain GETL.
 +				// All reads happen BEFORE process_mfc_cmd() to keep
 +				// captured bytes pristine. We bail (do NOT emit) on
 +				// any stall-and-notify bit (defer R8.5+) or any
@@ -558,6 +575,8 @@ index 855d95a44..dbc5e15fc 100644
 +				try
 +				{
 +					const bool is_putl = (cmd_code == 0x24u);
++					// is_getl_family for diagnostic logs (GETL/GETLB/GETLF
++					// all hit the EA-source branch below).
 +					const u32 element_count = mfc_size_at_dispatch / 8u;
 +					const u8* desc_src = this->ls + descriptor_lsa_clean;
 +					std::vector<u8> desc_snapshot(desc_src, desc_src + mfc_size_at_dispatch);
@@ -698,7 +717,7 @@ index 855d95a44..dbc5e15fc 100644
  	}
  
  	case MFC_WrListStallAck:
-@@ -6432,6 +6921,15 @@ bool spu_thread::stop_and_signal(u32 code)
+@@ -6432,6 +6940,15 @@ bool spu_thread::stop_and_signal(u32 code)
  {
  	spu_log.trace("stop_and_signal(code=0x%x)", code);
  

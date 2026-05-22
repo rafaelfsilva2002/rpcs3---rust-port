@@ -1025,21 +1025,44 @@ const MFC_PUT_CMD: u32 = 0x20;
 ///
 /// Codes per `rpcs3-upstream-clean/rpcs3/Emu/Cell/MFC.h:7-15`:
 ///
-/// | Code | Mnemonic | Direction | Modifiers          | Phase             |
-/// |------|----------|-----------|--------------------|-------------------|
-/// | 0x24 | PUTL     | LS → EA   | list               | **R8.4e accepts** |
-/// | 0x25 | PUTLB    | LS → EA   | list + barrier     | R8.4f deferred    |
-/// | 0x26 | PUTLF    | LS → EA   | list + fence       | R8.4f deferred    |
-/// | 0x44 | GETL     | EA → LS   | list               | **R8.4c accepts** |
-/// | 0x45 | GETLB    | EA → LS   | list + barrier     | R8.4f deferred    |
-/// | 0x46 | GETLF    | EA → LS   | list + fence       | R8.4f deferred    |
+/// | Code | Mnemonic | Direction | Modifiers          | Phase               |
+/// |------|----------|-----------|--------------------|---------------------|
+/// | 0x24 | PUTL     | LS → EA   | list               | **R8.4e accepts**   |
+/// | 0x25 | PUTLB    | LS → EA   | list + barrier     | R8.4f-b deferred    |
+/// | 0x26 | PUTLF    | LS → EA   | list + fence       | R8.4f-b deferred    |
+/// | 0x44 | GETL     | EA → LS   | list               | **R8.4c accepts**   |
+/// | 0x45 | GETLB    | EA → LS   | list + barrier     | **R8.4f-a accepts** |
+/// | 0x46 | GETLF    | EA → LS   | list + fence       | **R8.4f-a accepts** |
 ///
 /// R8.4c lifted the canary for 0x44 GETL. R8.4e additionally lifts
-/// for 0x24 PUTL (symmetric LS → EA). The other four codes (PUTLB,
-/// PUTLF, GETLB, GETLF) continue to reject with `UnsupportedMfcListCmd`.
+/// for 0x24 PUTL (symmetric LS → EA). R8.4f-a additionally lifts
+/// for 0x45 GETLB and 0x46 GETLF — per RPCS3 `do_list_transfer`
+/// the barrier/fence bits are stripped before the per-element copy
+/// (`args.cmd & ~0xf`), so the data path is byte-identical to GETL;
+/// barrier/fence ordering effects don't surface in single-SPU
+/// synchronous fixtures. PUTLB (0x25) and PUTLF (0x26) still
+/// reject with `UnsupportedMfcListCmd`.
 const MFC_GETL_CMD: u32 = 0x44;
+const MFC_GETLB_CMD: u32 = 0x45;
+const MFC_GETLF_CMD: u32 = 0x46;
 const MFC_PUTL_CMD: u32 = 0x24;
-const MFC_LIST_CMDS_UNSUPPORTED: &[u32] = &[0x25, 0x26, 0x45, 0x46];
+const MFC_LIST_CMDS_UNSUPPORTED: &[u32] = &[0x25, 0x26];
+
+/// R8.4f-a — list-DMA cmd codes the parser ACCEPTS (with the
+/// shared additive-fields validation):
+/// - 0x44 GETL (R8.4c)
+/// - 0x45 GETLB (R8.4f-a — list+barrier; data path identical to GETL)
+/// - 0x46 GETLF (R8.4f-a — list+fence; data path identical to GETL)
+/// - 0x24 PUTL (R8.4e — symmetric LS → EA)
+///
+/// All four use the same `descriptor_sha256 / descriptor_size /
+/// element_chunks / element_sizes / element_eals` extension fields.
+/// Direction (EA→LS vs LS→EA) is inferred from the GET vs PUT base
+/// in the cmd code's upper nibble (`cmd & 0xf0 == 0x40` → EA→LS,
+/// `cmd & 0xf0 == 0x20` → LS→EA).
+fn is_mfc_list_supported_cmd(cmd: u32) -> bool {
+    matches!(cmd, MFC_GETL_CMD | MFC_GETLB_CMD | MFC_GETLF_CMD | MFC_PUTL_CMD)
+}
 
 fn is_mfc_list_cmd_unsupported(cmd: u32) -> bool {
     MFC_LIST_CMDS_UNSUPPORTED.contains(&cmd)
@@ -1250,11 +1273,17 @@ fn validate_spu_mfc_cmd_event(e: &SpuMfcCmdEvent, line: usize) -> Result<(), Tra
     // R8.4e: PUTL (0x24) also accepted using the SAME additive-
     // fields validation as GETL (wire format is identical between
     // directions — only the byte-semantics differ at replay time).
-    // Other list-DMA codes (PUTLB/PUTLF/GETLB/GETLF) still surface
+    // R8.4f-a: GETLB (0x45) and GETLF (0x46) also accepted using
+    // the SAME additive-fields validation as GETL — per RPCS3
+    // `do_list_transfer` the barrier/fence bits are stripped before
+    // the per-element copy, so the data path is byte-identical to
+    // plain GETL. Barrier/fence ordering effects don't surface in
+    // single-SPU synchronous fixtures.
+    // Other list-DMA codes (PUTLB/PUTLF) still surface
     // `UnsupportedMfcListCmd`. Everything else (atomic, barrier,
     // sync, sndsig) still surfaces the generic `UnsupportedMfcCmd`.
     if e.cmd != MFC_GET_CMD && e.cmd != MFC_PUT_CMD
-        && e.cmd != MFC_GETL_CMD && e.cmd != MFC_PUTL_CMD
+        && !is_mfc_list_supported_cmd(e.cmd)
     {
         if is_mfc_list_cmd_unsupported(e.cmd) {
             return Err(TraceParseError::UnsupportedMfcListCmd {
@@ -1286,7 +1315,7 @@ fn validate_spu_mfc_cmd_event(e: &SpuMfcCmdEvent, line: usize) -> Result<(), Tra
     //
     // For GET/PUT (0x40 / 0x20), the additive fields MUST be
     // absent (writer convention — schema additive).
-    if e.cmd == MFC_GETL_CMD || e.cmd == MFC_PUTL_CMD {
+    if is_mfc_list_supported_cmd(e.cmd) {
         validate_getl_additive_fields(e, line)?;
     } else {
         // R8.4c — for non-list cmds, the additive list fields
@@ -1338,7 +1367,8 @@ fn validate_spu_mfc_cmd_event(e: &SpuMfcCmdEvent, line: usize) -> Result<(), Tra
     //
     // R8.4e — same fast-return for PUTL (0x24): the wire format
     // is identical, only direction differs at replay.
-    if e.cmd == MFC_GETL_CMD || e.cmd == MFC_PUTL_CMD {
+    // R8.4f-a — same fast-return for GETLB (0x45) / GETLF (0x46).
+    if is_mfc_list_supported_cmd(e.cmd) {
         // Validate ea_chunk_sha256 shape (writer overloads it to
         // the descriptor SHA for list cmds; we still require valid
         // 64-hex lowercase).
@@ -3368,19 +3398,23 @@ mod tests {
         );
     }
 
-    /// R8.4a + R8.4c + R8.4e — list-DMA codes NOT YET supported
-    /// (PUTLB/PUTLF = 0x25/0x26, GETLB/GETLF = 0x45/0x46) surface
-    /// the granular `UnsupportedMfcListCmd` variant. R8.4c LIFTED
-    /// the canary for GETL (0x44); R8.4e additionally lifts for
-    /// PUTL (0x24). Both lifts are covered separately by their
-    /// dedicated parser tests.
+    /// R8.4a + R8.4c + R8.4e + R8.4f-a — list-DMA codes NOT YET
+    /// supported (PUTLB = 0x25, PUTLF = 0x26) surface the granular
+    /// `UnsupportedMfcListCmd` variant. R8.4c LIFTED the canary for
+    /// GETL (0x44); R8.4e additionally lifts for PUTL (0x24);
+    /// R8.4f-a additionally lifts for GETLB (0x45) and GETLF
+    /// (0x46). Each lift is covered separately by its dedicated
+    /// parser test.
     #[test]
     fn reject_mfc_list_cmds_with_granular_canary() {
         // R8.4c update: 0x44 GETL removed (now accepted; covered
         // by `r8_4c_getl_parses_and_validates`).
         // R8.4e update: 0x24 PUTL removed (now accepted; covered
         // by `r8_4e_putl_parses_and_validates`).
-        let list_cmds: &[u32] = &[0x25, 0x26, 0x45, 0x46];
+        // R8.4f-a update: 0x45 GETLB + 0x46 GETLF removed (now
+        // accepted; covered by `r8_4f_a_getlb_parses_and_validates`
+        // + `r8_4f_a_getlf_parses_and_validates`).
+        let list_cmds: &[u32] = &[0x25, 0x26];
         for &cmd in list_cmds {
             let jsonl = format!(
                 r#"
@@ -3455,6 +3489,64 @@ mod tests {
             other => panic!("expected SpuMfcCmd, got {other:?}"),
         };
         assert_eq!(mfc.cmd, 0x24);
+        assert_eq!(mfc.descriptor_size, Some(16));
+        assert_eq!(mfc.element_chunks.as_ref().unwrap().len(), 2);
+        assert_eq!(mfc.element_sizes.as_deref(), Some(&[128u32, 64u32][..]));
+    }
+
+    /// R8.4f-a — GETLB (0x45) parser acceptance with the same
+    /// additive-fields contract as GETL. Per RPCS3
+    /// `do_list_transfer`, barrier bit is stripped before the
+    /// per-element copy so the wire format is byte-identical to
+    /// GETL; only the cmd code differs (0x45 vs 0x44).
+    #[test]
+    fn r8_4f_a_getlb_parses_and_validates() {
+        let desc_sha = "11".repeat(32);
+        let elem1_sha = "22".repeat(32);
+        let elem2_sha = "33".repeat(32);
+        // cmd=69 (= 0x45 GETLB)
+        let jsonl = format!(
+            r#"
+{{"seq":0,"side":"spu","kind":"spu_wrch","pc":256,"channel":21,"value":69,"would_stall":false,"target_spu":1}}
+{{"seq":1,"side":"spu","kind":"spu_mfc_cmd","target_spu":1,"pc":256,"cmd":69,"tag":3,"size":16,"lsa":65536,"eah":0,"eal":384,"ea_chunk_sha256":"{desc_sha}","descriptor_sha256":"{desc_sha}","descriptor_size":16,"element_chunks":["{elem1_sha}","{elem2_sha}"],"element_sizes":[128,64],"element_eals":[268505472,268505600]}}
+"#
+        );
+        let events = parse_jsonl_trace(&jsonl)
+            .expect("R8.4f-a: GETLB with valid additive fields must parse");
+        assert_eq!(events.len(), 2);
+        let mfc = match &events[1] {
+            CapturedEvent::SpuMfcCmd(m) => m,
+            other => panic!("expected SpuMfcCmd, got {other:?}"),
+        };
+        assert_eq!(mfc.cmd, 0x45);
+        assert_eq!(mfc.descriptor_size, Some(16));
+        assert_eq!(mfc.element_chunks.as_ref().unwrap().len(), 2);
+        assert_eq!(mfc.element_sizes.as_deref(), Some(&[128u32, 64u32][..]));
+    }
+
+    /// R8.4f-a — GETLF (0x46) parser acceptance, mirroring GETLB.
+    /// The fence bit (`MFC_FENCE_MASK = 0x02`) is also stripped
+    /// before the per-element copy in RPCS3.
+    #[test]
+    fn r8_4f_a_getlf_parses_and_validates() {
+        let desc_sha = "11".repeat(32);
+        let elem1_sha = "22".repeat(32);
+        let elem2_sha = "33".repeat(32);
+        // cmd=70 (= 0x46 GETLF)
+        let jsonl = format!(
+            r#"
+{{"seq":0,"side":"spu","kind":"spu_wrch","pc":256,"channel":21,"value":70,"would_stall":false,"target_spu":1}}
+{{"seq":1,"side":"spu","kind":"spu_mfc_cmd","target_spu":1,"pc":256,"cmd":70,"tag":3,"size":16,"lsa":65536,"eah":0,"eal":384,"ea_chunk_sha256":"{desc_sha}","descriptor_sha256":"{desc_sha}","descriptor_size":16,"element_chunks":["{elem1_sha}","{elem2_sha}"],"element_sizes":[128,64],"element_eals":[268505472,268505600]}}
+"#
+        );
+        let events = parse_jsonl_trace(&jsonl)
+            .expect("R8.4f-a: GETLF with valid additive fields must parse");
+        assert_eq!(events.len(), 2);
+        let mfc = match &events[1] {
+            CapturedEvent::SpuMfcCmd(m) => m,
+            other => panic!("expected SpuMfcCmd, got {other:?}"),
+        };
+        assert_eq!(mfc.cmd, 0x46);
         assert_eq!(mfc.descriptor_size, Some(16));
         assert_eq!(mfc.element_chunks.as_ref().unwrap().len(), 2);
         assert_eq!(mfc.element_sizes.as_deref(), Some(&[128u32, 64u32][..]));

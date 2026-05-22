@@ -49,10 +49,10 @@ index f863a2b91..d862b2287 100644
      target_precompile_headers(rpcs3_emu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../stdafx.h")
 diff --git a/rpcs3/Emu/Cell/SPURustBridge.cpp b/rpcs3/Emu/Cell/SPURustBridge.cpp
 new file mode 100644
-index 000000000..096a681a6
+index 000000000..d0aed99e3
 --- /dev/null
 +++ b/rpcs3/Emu/Cell/SPURustBridge.cpp
-@@ -0,0 +1,1241 @@
+@@ -0,0 +1,1243 @@
 +#include "stdafx.h"
 +#include "SPURustBridge.h"
 +
@@ -354,11 +354,13 @@ index 000000000..096a681a6
 +		}
 +
 +		spu_rust_bridge_log.success(
-+			"[Rust SPU bridge] R8.4d DMA GETL dispatched: cmd=0x44 "
++			"[Rust SPU bridge] R8.4d DMA GETL dispatched: "
 +			"descriptor_lsa=0x%x descriptor_size=%u element_count=%u "
 +			"lsa_dest=0x%x transferred_bytes=%u tag=%u on '%s'; real EA->LS "
 +			"path (vm::_ptr<u8> per element); tag-stat 0x%x queued for "
-+			"subsequent rdch ch24",
++			"subsequent rdch ch24 (cmd=0x44 GETL / 0x45 GETLB / 0x46 GETLF "
++			"all route here per R8.4f-a — barrier/fence stripped at "
++			"do_list_transfer)",
 +			descriptor_lsa, descriptor_size, element_count,
 +			lsa_dest_base, total_transferred, tag, name,
 +			1u << tag);
@@ -1227,11 +1229,11 @@ index 000000000..096a681a6
 +			if (popped > 0)
 +			{
 +				spu.ch_out_mbox.set_value(out_val);
+warning: in the working copy of 'rpcs3/Emu/Cell/SPURustBridge.h', LF will be replaced by CRLF the next time Git touches it
 +				if (popped > 1)
 +				{
 +					spu_rust_bridge_log.warning(
-+						"[Rust SPU bridge] try_delegate: %u OUT_MBOX valueswarning: in the working copy of 'rpcs3/Emu/Cell/SPURustBridge.h', LF will be replaced by CRLF the next time Git touches it
- "
++						"[Rust SPU bridge] try_delegate: %u OUT_MBOX values "
 +						"in Rust handle; RPCS3 channel is depth-1, kept latest "
 +						"(0x%x). Multi-write workloads need R6.4c+ to drain "
 +						"OUT_MBOX between writes.",

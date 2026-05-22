@@ -896,13 +896,20 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
                 let size = spu.channels.mfc_size as usize;
                 let tag = spu.channels.mfc_tag_id;
 
-                // R8.4d / R8.4e — GETL (0x44) and PUTL (0x24) share
-                // a validation envelope: mfc_eal is the LS offset
-                // of the descriptor list (not a data EA), mfc_size
-                // is the descriptor array size (= N * 8), mfc_lsa
-                // is the dest base (GETL) / src base (PUTL).
-                // Simple GET/PUT uses lsa+size as the data region.
-                if cmd == 0x44 || cmd == 0x24 {
+                // R8.4d / R8.4e / R8.4f-a — GETL (0x44), PUTL (0x24),
+                // GETLB (0x45), GETLF (0x46) all share a validation
+                // envelope: mfc_eal is the LS offset of the
+                // descriptor list (not a data EA), mfc_size is the
+                // descriptor array size (= N * 8), mfc_lsa is the
+                // dest base (GETL family) / src base (PUTL). Simple
+                // GET/PUT uses lsa+size as the data region.
+                //
+                // R8.4f-a — GETLB / GETLF are routed through the
+                // SAME GETL callback path (data direction EA → LS
+                // is identical; barrier/fence ordering bits are
+                // stripped by the bridge before per-element copy,
+                // matching RPCS3 `do_list_transfer`).
+                if cmd == 0x44 || cmd == 0x24 || cmd == 0x45 || cmd == 0x46 {
                     let is_putl = cmd == 0x24;
                     // Shared validation: eah=0, tag<32, size > 0
                     // and % 8 == 0 and ≤ 0x800 (256 elements);

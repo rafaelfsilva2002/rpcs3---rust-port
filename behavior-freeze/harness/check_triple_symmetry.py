@@ -23,10 +23,15 @@ ch24-poll / IMMEDIATE-probe fixtures. R8.4d adds list-GET (GETL)
 via the new `bridge_dma_getl_callback` (status = `0xdf1eea5a`).
 R8.4e adds list-PUT (PUTL) via `bridge_dma_putl_callback`
 (spu = `0xc0ffeeba`, ea_status = `0xa12fda7e`).
+R8.4f-a adds list-GET + barrier (GETLB, status = `0xdf1eea3b`)
+and list-GET + fence (GETLF, status = `0xdf1eea7f`) — both
+reuse the GETL bridge callback since per RPCS3 do_list_transfer
+the barrier/fence bits are stripped before the per-element copy.
 
-Eight fixtures supported via `--fixture
+Ten fixtures supported via `--fixture
 {get,put,get_multi,get_any,get_tag_poll,get_tag_immediate,
-get_list,put_list}` (default `get` for backwards compatibility).
+get_list,put_list,get_list_b,get_list_f}` (default `get` for
+backwards compatibility).
 
 This gate is the load-bearing R7.3 + R8.1 acceptance and is
 documented in `docs/PROJECT_STATUS.md` and
@@ -276,6 +281,48 @@ PUT_LIST_FIXTURE = FixtureSpec(
 )
 
 
+# R8.4f-a — GETLB (list + barrier; cmd=0x45) fixture (15th
+# oracle). Byte-identical to GETL data path; barrier bit is
+# stripped at RPCS3 `do_list_transfer`. Single-SPU fresh-tag
+# single-dispatch: the barrier persistence in `mfc_barrier` has
+# no observable effect. Bridge ON reuses the GETL callback.
+# Status = combined ^ 0xC0DEFABB = 0xDF1EEA3B (mask last byte
+# `0xBB` mnemonic: "Barrier").
+GET_LIST_B_FIXTURE = FixtureSpec(
+    name="single_spu_dma_getlb_v1",
+    rust_test_target="single_spu_dma_getlb_v1_replay",
+    canonical_tty_substr="[dma_getlb_v1] OK cause=0x1 status=0xdf1eea3b",
+    canonical_status_summary=(
+        "status = ((sum1 << 16) | sum2) ^ 0xC0DEFABB where "
+        "sum1 = 0x1FC0 (element 0 counting pattern, 128 B) and "
+        "sum2 = 0x1080 (element 1 constant 0x42, 64 B); "
+        "GETLB transferred_bytes = 192 = sum(ts) = 0xDF1EEA3B"
+    ),
+    delegation_log_marker="DMA GETL dispatched",
+    rust_log_intro="R8.4f-a DMA GETLB (routes via GETL callback)",
+)
+
+
+# R8.4f-a — GETLF (list + fence; cmd=0x46) fixture (16th
+# oracle). Same shape as GETLB but with fence (0x02) instead of
+# barrier (0x01). Both bits are stripped at do_list_transfer.
+# Status = combined ^ 0xC0DEFAFF = 0xDF1EEA7F (mask last byte
+# `0xFF` mnemonic: "Fence").
+GET_LIST_F_FIXTURE = FixtureSpec(
+    name="single_spu_dma_getlf_v1",
+    rust_test_target="single_spu_dma_getlf_v1_replay",
+    canonical_tty_substr="[dma_getlf_v1] OK cause=0x1 status=0xdf1eea7f",
+    canonical_status_summary=(
+        "status = ((sum1 << 16) | sum2) ^ 0xC0DEFAFF where "
+        "sum1 = 0x1FC0 (element 0 counting pattern, 128 B) and "
+        "sum2 = 0x1080 (element 1 constant 0x42, 64 B); "
+        "GETLF transferred_bytes = 192 = sum(ts) = 0xDF1EEA7F"
+    ),
+    delegation_log_marker="DMA GETL dispatched",
+    rust_log_intro="R8.4f-a DMA GETLF (routes via GETL callback)",
+)
+
+
 FIXTURES = {
     "get": GET_FIXTURE,
     "put": PUT_FIXTURE,
@@ -285,6 +332,8 @@ FIXTURES = {
     "get_tag_immediate": GET_TAG_IMMEDIATE_FIXTURE,
     "get_list": GET_LIST_FIXTURE,
     "put_list": PUT_LIST_FIXTURE,
+    "get_list_b": GET_LIST_B_FIXTURE,
+    "get_list_f": GET_LIST_F_FIXTURE,
 }
 
 
