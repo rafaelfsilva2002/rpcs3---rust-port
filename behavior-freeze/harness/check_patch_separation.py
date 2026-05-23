@@ -124,7 +124,7 @@ RUST_BRIDGE = PATCH_DIR / "spu_rust_bridge.patch"
 # MfcUnsupported fallback); replay oracle byte-identical (13th
 # oracle).
 RUST_BRIDGE_PINNED_SHA256 = (
-    "75e6ab2a5008fe2db4a628b9dca5886d97fbaa0796923eeb2573cdee585ba361"
+    "19a81b5452c44e720958805d034b7d19739a3ab256f9443503ee1dfcc4e89762"
 )
 
 # Hot-path source files that runtime hooks edit; scaffolding MUST NOT
