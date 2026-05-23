@@ -1118,9 +1118,14 @@ fn rust_spu_runtime_dma_put_callback_round_trip() {
     }
 }
 
-/// R8.1 — non-PUT cmd (e.g., a list variant 0x44 GETL) returns
-/// MfcUnsupported even with PUT callback installed (and no GET
-/// callback). R8.1 scope is GET (R7.2) + PUT (R8.1) ONLY.
+/// R8.1 — cmd outside the simple-DMA scope (originally 0x44 GETL
+/// here as a list-DMA canary) returns MfcUnsupported when only the
+/// simple-DMA callbacks (R7.2 GET / R8.1 PUT) are installed. As of
+/// R8.4d/R8.4e the bridge also installs dedicated GETL/PUTL
+/// callbacks, so a real production path with all 4 callbacks
+/// installed would dispatch 0x44 GETL successfully — this test
+/// asserts the rejection holds in the narrower R8.1-only callback
+/// configuration where the list callbacks are absent.
 #[test]
 fn rust_spu_runtime_dma_put_callback_refuses_non_put() {
     let _g = CALLBACK_TEST_MUTEX.lock().unwrap();

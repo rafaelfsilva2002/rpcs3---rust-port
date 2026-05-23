@@ -2193,41 +2193,120 @@ addressed pool dedup); TWO new `.spuimg`.
 
 ---
 
-## 9. R8+ recommended next scope
+## 9. R8+ recommended next scope (refreshed 2026-05-22 post R8.4f-b)
 
-R7 is the closed phase (see § 8 R7 closure summary below). The
-next-up phase is R8+, which covers the MFC features deliberately
-deferred from R7's GET-only scope. **Do not begin R8 work without
-re-reading the hard rules in § 8.** Recommended R8+ scope:
+> **Authoritative roadmap.** This section was originally written at R7
+> closure (2026-05-18) and predated the actual landed sequence
+> (R8.1 PUT → R8.2 multi-DMA GET → R8.3a/b/c TagStat modes →
+> R8.4 list-DMA family). The numbering below was rewritten to match
+> what has landed and the workstreams currently contemplated.
+> **Do not begin R8.5+ work without re-reading the hard rules in § 8
+> and § 20.7 of `SPU_DMA_MFC_R6_7_DESIGN.md`.**
 
-1. **R8.1 — MFC PUT (LS → EA writes).** Symmetric to R7.2's GET
-   but inverts the direction: SPU writes `wrch ch21 = 0x20 (PUT)`,
-   the bridge's runtime callback reads `mfc_size` bytes from the
-   Rust handle's LS at `mfc_lsa` and writes them to RPCS3 EA at
-   `mfc_eal` via `vm::_ptr<u8>` (matching the C++ executor's PUT
-   branch). Acceptance: a fresh CC0 fixture (`single_spu_dma_put_v1`
-   — to be authored) round-trips a counting buffer SPU → EA → PPU
-   readback and the lv2 group-exit status carries a canonical
-   marker that proves the PUT bytes landed.
-2. **R8.2 — DMA list commands** (GETL / PUTL / GETLB / PUTLB).
-   Per-list-element event sequencing in the JSONL writer +
-   parser, then runtime support. PSL1GHT-style list of
-   `(eal, size)` pairs in LS at the address pointed to by
-   `MFC_Cmd`'s `mfc_lsa`.
-3. **R8.3 — Atomic primitives** (GETLLAR / PUTLLC / PUTLLUC /
-   PUTQLLUC). LL/SC reservation tracking is its own work item —
-   the bridge needs a per-`raddr` reservation map shared between
-   the Rust executor and RPCS3's existing C++ atomic infrastructure.
-4. **R8.4 — MFC barriers / fence bits.** Defer until at least
-   two overlapping DMAs are observed in a CC0 fixture.
-5. **R8.5 — Multi-SPU DMA races on shared EA.** R6+R7 are
-   strictly single-SPU; the bridge's persistent-handle table is
-   keyed by `lv2_id`, so multi-SPU is a workstream of its own.
-6. **R8.6 — SPURS production support.** Out of any current scope
-   because SPURS captures contain commercial code; defer to a
-   separate CC0 multi-SPU fixture authored for the purpose.
+### 9.1 Recap of what landed (R8.1 → R8.4f-b)
 
-Same hard rules from § 8 apply throughout R8.
+| Phase | Scope | Oracle # | Closure date |
+|-------|-------|----------|--------------|
+| **R8.1** | MFC PUT (LS → EA) — symmetric inverse of R7 GET | 8th | 2026-05-19 |
+| **R8.2** | Multi-DMA GET (2 in-flight tags + ALL wait) | 9th | 2026-05-20 |
+| **R8.3a** | TagStat ANY-wait + ch24 drain-aggregate engine fix | 10th | 2026-05-20 |
+| **R8.3b** | Repeated RdTagStat polling + persistent `completed_tags` engine fix | 11th | 2026-05-20 |
+| **R8.3c** | TagStat IMMEDIATE + replay clear-on-read engine fix | 12th | 2026-05-20 |
+| **R8.4a** | Design + granular parser canary for list-DMA cmds | — | 2026-05-20 |
+| **R8.4b** | GETL writer extension + first real list-DMA capture (cmd 0x44) | (capture) | 2026-05-21 |
+| **R8.4c** | GETL replay state machine + 13th oracle promotion | 13th | 2026-05-21 |
+| **R8.4d** | Runtime bridge GETL callback + triple-symmetry | (delegation) | 2026-05-21 |
+| **R8.4e** | PUTL end-to-end (writer + replay + bridge in one cycle) | 14th | 2026-05-21 |
+| **R8.4f-a** | GETLB + GETLF via REUSE-GETL (barrier/fence variants) | 15th + 16th | 2026-05-21 |
+| **R8.4f-b** | PUTLB + PUTLF via REUSE-PUTL — **6-code list-DMA family complete** | 17th + 18th | 2026-05-21 |
+
+**Current state:** 18 replay-validated SPU oracles. Full 6-code
+MFC list-DMA family (GETL/GETLB/GETLF/PUTL/PUTLB/PUTLF) end-to-end
+supported across parser, replay state machine, and runtime bridge.
+`MFC_LIST_CMDS_UNSUPPORTED` parser slice is empty.
+
+### 9.2 Current workstream — R8.5 list-DMA stall-and-notify
+
+R8.5 covers the `sb & 0x80` stall-and-notify bit on list
+descriptor elements (the single semantic divergence R8.4 deferred).
+R8.5a research-only confirmed feasibility: the SPU↔MFC handshake
+uses `ch25 MFC_RdListStallStat` (read, returns bitmask of stalled
+tags) and `ch26 MFC_WrListStallAck` (write, takes a tag id). **No
+PPU handshake is required for the minimal CC0 fixture.** Full
+design in `SPU_DMA_MFC_R6_7_DESIGN.md` § 20.
+
+| Phase | Scope | Status |
+|-------|-------|--------|
+| **R8.5a** | Research-only feasibility study | ✅ **complete** (no commits — memory record `project_r8_5a_research_stall_and_notify`) |
+| **R8.5b** | C++ writer + Rust parser unlock for `sb & 0x80` | **next implementation slice** (no oracle promotion) |
+| R8.5c | Replay state machine handles stall/resume | DEFERRED (gates on real oracle) |
+| R8.5d | Runtime bridge ch25/ch26 cooperative re-entry + 19th oracle | DEFERRED |
+
+R8.5b is intentionally small: writer relaxes the `sb & 0x80` reject
+and emits new `spu_mfc_list_stall` + `spu_mfc_list_stall_ack`
+events; parser adds the event kinds + `sb_stall_notify` field; the
+R6.7 A.4 canary is lifted only for cmd=0x44 + sb=0x80. No fixture,
+no oracle promotion, no bridge work. The 18 existing oracles stay
+green.
+
+R8.5c/d defer indefinitely; gate only by real workload demand. The
+1-cycle ladder pattern (R8.4d → R8.4e → R8.4f-a → R8.4f-b) is
+**not expected to hold** through R8.5c/d because stall-and-notify
+adds real SPU↔MFC signalling that no prior list-DMA cycle exercised.
+
+### 9.3 Subsequent SPU scope (R8.6+)
+
+| Phase | Scope | Notes |
+|-------|-------|-------|
+| **R8.6** | Multi-SPU DMA races on shared EA | The bridge's persistent-handle table is keyed by `lv2_id`; multi-SPU is a separate workstream. **This was numbered R8.5 in the prior § 9; renumbered because R8.5 is now stall-and-notify.** |
+| **R8.7** | MFC atomic primitives (GETLLAR / PUTLLC / PUTLLUC / PUTQLLUC) | LL/SC reservation tracking — bridge needs a per-`raddr` reservation map shared with RPCS3's C++ atomic infrastructure |
+| **R8.8** | Sync commands (BARRIER / EIEIO / SYNC — cmd codes 0xC0 / 0xC8 / 0xCC) | Likely incremental |
+| **R8.9** | PUTRL family (atomic-REPLACE, cmd 0x34 / 0x35 / 0x36) | Semantic divergence vs PUT; may force a separate state machine path |
+| — | **SPURS production support** | OUT OF SCOPE. SPURS captures contain commercial code. Defer to a separate CC0 multi-SPU fixture authored for the purpose. **v4 / SPURS traces remain diagnostic-only forever.** |
+
+R8.6+ gate only on real workload demand or a CC0 fixture that
+forces the path.
+
+### 9.4 Strategic pivot candidate (post-R8.5b) — broader RPCS3 integration
+
+The SPU foundation is **MVP-complete at R8.4f-b**: 18 oracles
+covering mailbox / signal / loadstore / GET / PUT / multi-DMA /
+TagStat modes / full list-DMA family, with triple-symmetric
+acceptance (bridge OFF / bridge ON / replay) on 8 DMA fixtures.
+
+After R8.5b lands the stall-and-notify writer/parser unlock, the
+**strategic next pivot** is broader RPCS3 integration rather than
+deeper SPU depth:
+
+1. **LV2 / SPU group syscalls** — the kernel-side surface that
+   creates / dispatches / synchronizes SPU threads. Currently
+   scaffolded for headers only (no execution parity).
+2. **PPU minimal loader** — enough to drive an SPU-using
+   homebrew end-to-end through the Rust stack.
+3. **Loader / FS / VFS** — required for PPU work.
+
+R8.5c/d, R8.6, R8.7, R8.8, R8.9 should defer until a real workload
+demands them. Without a PPU+LV2 path that drives SPUs, those
+features can only be validated against synthetic CC0 fixtures —
+diminishing-returns risk is real.
+
+### 9.5 Hard rules carried forward to R8.5+
+
+Same hard rules from § 8 apply throughout R8.5+:
+
+- No fake JSONL, no fake DMA, no fake LS bytes, no fake
+  `RdTagStat`, no fake `RdListStallStat`, no fake
+  `WrListStallAck`.
+- No commercial trace promotion.
+- No manual JSONL editing after capture.
+- The **behavior-freeze contract remains active** — the
+  behavior-freeze infrastructure is complete and operational,
+  but every new artifact still passes the same gates
+  (`check_patch_separation.py`, `check_trace_fixtures.py`,
+  `check_triple_symmetry.py` where applicable).
+- v4 / SPURS stays diagnostic-only forever.
+- Behavior-freeze fixtures stay CC0-only; commercial SPU captures
+  never enter `behavior-freeze/`.
 
 ---
 

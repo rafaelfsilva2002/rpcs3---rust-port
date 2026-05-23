@@ -53,13 +53,17 @@ pub use dma_chunk::{
     DMA_LISTDESC_SIZE_MAX,
 };
 
-// R6.7 A.4 — MFC replay state machine for GET-only DMA. Standalone
-// infrastructure; consumes captured MFC events + applies `.dmachunk`
-// bytes to a caller-supplied LS buffer + computes the rdch ch24
-// (RdTagStat) oracle. ACEITO PARCIAL — wiring into the actual SPU
-// executor (Interpreter / Recompiler) requires Phase C support for
-// MFC channels in `rpcs3-spu-thread`'s `ch::` module; the transformer
-// continues to hard-reject MFC traces until that lands.
+// MFC replay state machine (originated R6.7 A.4; extended through
+// R8.4f-b). Consumes captured MFC events + applies `.dmachunk` bytes
+// to a caller-supplied LS buffer + computes the rdch ch24 (RdTagStat)
+// oracle. Phase C wiring CLOSED: integrated into both Interpreter and
+// Recompiler via `apply_mfc_dma_pre_replay` (R6.7 Phase C) + the
+// runtime bridge's 4 DMA callbacks (R7.2 GET / R8.1 PUT / R8.4d GETL
+// / R8.4e PUTL). Full coverage of GET / PUT / 6-code list-DMA family
+// (0x40 / 0x20 / 0x44-0x46 / 0x24-0x26). The transformer accepts all
+// captured MFC traces in the supported set; only stall-and-notify
+// (R8.5+), atomics (R8.7+), and PUTRL family (R8.9+) remain rejected.
+// See module banner in `mfc_replay.rs` for the current scope matrix.
 pub mod mfc_replay;
 pub use mfc_replay::{
     apply_mfc_dma_pre_replay, DmaPreReplayPlan, MfcInFlight, MfcReplayError, MfcReplayState,

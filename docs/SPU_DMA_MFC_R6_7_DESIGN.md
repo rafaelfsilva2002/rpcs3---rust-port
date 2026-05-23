@@ -1432,7 +1432,21 @@ correct for everything that gets captured.
 
 ---
 
-## 19. R8.4 — MFC GETL (list DMA, GET direction) roadmap
+## 19. R8.4 — MFC list-DMA family roadmap (CLOSED 2026-05-21 at R8.4f-b)
+
+> **STATUS: CLOSED.** Sections 19.1-19.6 below are preserved as
+> historical record of the original R8.4 planning shape. The actual
+> R8.4 phase ladder landed the full 6-code list-DMA family
+> (GETL/GETLB/GETLF + PUTL/PUTLB/PUTLF) in 6 sub-phases (R8.4a → R8.4b
+> → R8.4c → R8.4d → R8.4e → R8.4f-a → R8.4f-b). PUTL is no longer
+> deferred — it landed at R8.4e (2026-05-21). Barrier/fence variants
+> landed at R8.4f-a / R8.4f-b via the REUSE-base data path (per
+> `do_list_transfer` stripping `args.cmd & ~0xf`). All 18 oracles
+> remain replay byte-identical; bridge ON delegates all list-DMA
+> end-to-end. The stall-and-notify `sb & 0x80` bit remains deferred —
+> see § 20 for the R8.5 roadmap.
+
+### Historical R8.4 planning text (preserved unchanged below)
 
 R8.4 introduces MFC list-DMA support, scoped initially to
 GETL (cmd code 0x44) — the GET direction with a per-element
@@ -1624,3 +1638,172 @@ caught.
   oracle is fake-semantics territory.
 - Stall-and-notify (descriptor `sb` bit 0x80) deferred to
   R8.5+. R8.4 oracles MUST NOT exercise it.
+
+---
+
+## 20. R8.5 — MFC list-DMA stall-and-notify roadmap (added 2026-05-22)
+
+R8.5 covers the `sb & 0x80` stall-and-notify bit on list
+descriptor elements — the single semantic divergence R8.4
+explicitly deferred. R8.5a research-only confirmed
+feasibility (no implementation landed — memory record
+`project_r8_5a_research_stall_and_notify`). This section is
+the design plan for R8.5b and the deferred slices R8.5c/d.
+
+### 20.1 Cell BE reference model
+
+Verified by inspecting `rpcs3/Emu/Cell/SPUThread.cpp:2873-2890`
++ `MFC.h:5-36` + IBM Cell BE Architecture v1.02 § 12.5.
+
+**Stall semantics.** When the MFC walks a list-DMA descriptor
+array (cmd 0x44 / 0x45 / 0x46 / 0x24 / 0x25 / 0x26) and
+encounters an element with `sb & 0x80` set, it:
+
+1. Completes the per-element transfer (size `ts` bytes EA→LS
+   or LS→EA).
+2. **Stops dispatching further elements** for that tag.
+3. **Raises a per-tag stall bit** observable by the SPU via
+   `ch25 MFC_RdListStallStat`.
+4. **Does NOT raise the tag-stat completion** until the SPU
+   acknowledges and the list resumes through any remaining
+   elements.
+
+**Resume semantics.** The SPU acknowledges by writing the
+tag id to `ch26 MFC_WrListStallAck`. The MFC then:
+
+1. Clears the stall bit for that tag.
+2. Resumes the list dispatch from the post-stall element.
+3. On full list completion, raises the tag-stat normally
+   (same as non-stalled list).
+
+**Channel summary.**
+
+| Channel | Direction | Value semantics                                |
+|---------|-----------|------------------------------------------------|
+| ch25 `MFC_RdListStallStat` | SPU reads  | 32-bit bitmask of stalled tags             |
+| ch26 `MFC_WrListStallAck`  | SPU writes | tag id (NOT a bitmask — a single tag number) |
+
+The SPU↔MFC handshake is **self-contained — no PPU role** in
+the minimal CC0 fixture. The PPU only joins post-list to read
+the canonical `ea_status`, identical to other list-DMA oracles.
+
+### 20.2 R8.5a — research-only (complete)
+
+Output: this section. No commits, no patches, no fixtures.
+Memory record: `project_r8_5a_research_stall_and_notify`.
+
+### 20.3 R8.5b — writer/parser unlock (next implementation slice)
+
+Scope:
+
+- **C++ writer** (`SPUThread.cpp` + `SPUTraceJsonl.{h,cpp}`)
+  — relax `record_spu_mfc_getl_cmd` ch21 dispatcher to accept
+  descriptors with any element's `sb & 0x80` set (currently
+  the writer rejects). Capture descriptor bytes byte-identical
+  via the existing `.dmalistdesc` side-file scheme.
+- **C++ writer — emit new event kinds:**
+  - `spu_mfc_list_stall {tag, descriptor_element_index}` when
+    the MFC pauses the list.
+  - `spu_mfc_list_stall_ack {tag}` when the SPU writes ch26.
+- **Rust parser** (`trace_fmt.rs`) — add new event kinds
+  `MfcListStall` and `MfcListStallAck`. Add
+  `#[serde(default)] Option<bool> sb_stall_notify` per
+  descriptor element on `SpuMfcCmdEvent`.
+- **Rust parser canary** — update R6.7 A.4 canary
+  `process_wrch_rejects_unsupported_cmd_code` so cmd=0x44
+  with `sb & 0x80` is no longer hard-rejected. PUTL family
+  (0x24 / 0x25 / 0x26) stays rejected for stall-and-notify
+  until a later cycle.
+- **No oracle promotion in R8.5b.** The 18 existing oracles
+  stay green. The new event kinds parse but trigger no LS
+  or tag-stat state change in the replay state machine yet
+  (R8.5c handles that).
+
+**Expected SHA bumps:** `runtime_hooks` (SPUThread.cpp
+dispatcher change). `scaffolding` may bump if
+`SPUTraceJsonl.{h,cpp}` needs new event-kind constants.
+**`bridge` should NOT change** in R8.5b.
+
+**Acceptance gates for R8.5b:**
+
+- `check_patch_separation.py` green with new SHAs.
+- `check_trace_fixtures.py` green at 18 fixtures (no new
+  fixture in R8.5b).
+- `cargo test --workspace --lib --no-fail-fast` green.
+- Unit tests prove the parser accepts a synthetic JSONL that
+  carries `MfcListStall` + `MfcListStallAck` events. (No
+  fabricated real-capture JSONL — only synthetic round-trip
+  fixtures in `trace_fmt.rs` per R5.6 reference shape.)
+
+### 20.4 R8.5c — replay state machine (DEFERRED)
+
+Scope: `MfcReplayState::process_mfc_list_cmd` handles stall;
+new field `mfc_list_stall_mask: u32` persistent across reads
+(like R8.3b `completed_tags`); read on `ch25` returns the
+mask, write on `ch26` clears the matching bit. Match Cell BE
+semantics: ch26 is by-tag (write a tag id, not a bitmask).
+
+Defer rationale: no oracle exists yet. Implementing replay
+without a real CC0 fixture would be fake-semantics
+territory.
+
+### 20.5 R8.5d — runtime bridge ch25/ch26 (DEFERRED)
+
+Scope: extend `bridge_dma_getl_callback` so the per-element
+walk pauses when `sb & 0x80` is observed; expose ch25 read /
+ch26 write to RPCS3's existing C++ ch25/ch26 wiring (the C++
+executor already handles these channels — bridge just needs
+cooperative re-entry, similar to R6.4b persistent handle but
+per-list-element).
+
+Defer rationale: same as R8.5c — gates on a real oracle.
+
+### 20.6 R8.5 phase plan
+
+| Phase  | Scope                  | Deliverable                                                                                                                   | Engine changes                       |
+|--------|------------------------|-------------------------------------------------------------------------------------------------------------------------------|--------------------------------------|
+| **R8.5a** | Research-only         | Memory record + this section                                                                                                  | None                                 |
+| **R8.5b** | Writer + parser unlock | C++ writer accepts `sb=0x80`, emits stall events; Rust parser additive event kinds; canary relaxed for cmd=0x44                | C++ writer + Rust parser             |
+| R8.5c (deferred) | Replay state machine | `process_mfc_list_cmd` stall handling; new `mfc_list_stall_mask` on `SpuChannels`; pre-replay walks stall+ack pairs            | Rust core                            |
+| R8.5d (deferred) | Runtime bridge       | ch25/ch26 cooperative re-entry; FFI hook for stall observation; first stalling CC0 oracle (19th)                              | Rust core + C++ bridge + new fixture |
+
+### 20.7 Hard rules carried forward to R8.5+
+
+- The 18 oracles built so far MUST remain green at every
+  R8.5 phase boundary. Stall-and-notify is strictly additive.
+- No fake `MfcListStall` / no fake `MfcListStallAck` events
+  in real-capture JSONL.
+- No fake `RdListStallStat` value — must come from a real
+  ch25 read in a captured trace.
+- No fake `WrListStallAck` — must come from a real wrch ch26.
+- No fake partial-LS state at stall point — must match what
+  the C++ executor leaves in LS post-stall.
+- v4 / SPURS stays diagnostic-only forever.
+- The behavior-freeze contract remains active.
+
+### 20.8 Strategic note (2026-05-22 docs refresh)
+
+The SPU foundation is **MVP-complete at R8.4f-b**: 18
+replay-validated oracles covering mailbox / signal / loadstore
+/ GET / PUT / multi-DMA / TagStat modes (ANY/ALL/IMMEDIATE
+/repeated polling) / full 6-code list-DMA family + triple
+symmetry on 8 DMA fixtures.
+
+R8.5b is a small additive unlock — the writer/parser slice
+without an oracle. After R8.5b, the **strategic pivot
+candidate** is broader RPCS3 integration rather than deeper
+SPU depth:
+
+1. **LV2 / SPU group syscalls** (kernel-side SPU thread
+   creation / dispatch / sync; currently scaffolded for
+   headers only).
+2. **PPU minimal loader / FS / VFS** (enough to drive an
+   SPU-using homebrew end-to-end through the Rust stack).
+
+R8.5c / R8.5d (stall-and-notify replay + runtime delegation),
+R8.6 (multi-SPU), R8.7 (atomics), R8.8 (sync cmds), R8.9
+(PUTRL family) gate only on real workload demand. Without a
+PPU+LV2 path that drives SPUs, those features can only be
+validated against synthetic CC0 fixtures — diminishing-returns
+risk is real. See `PROJECT_STATUS.md` § 9.4 for the strategic
+pivot framing.

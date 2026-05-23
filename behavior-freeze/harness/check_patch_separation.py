@@ -66,18 +66,30 @@ RUNTIME_HOOKS = PATCH_DIR / "spu_trace_jsonl_runtime_hooks.patch"
 # if the file is absent, the gate stays green (R6.0 / pre-R6.1
 # states are valid).
 RUST_BRIDGE = PATCH_DIR / "spu_rust_bridge.patch"
-# R8.4e (2026-05-21) — superseded R8.4d sha
-# d2d531850f4743b240fb59573695ea247614d0aeecb8624726206937be52d2e5
-# Extends R8.4d's runtime DMA GETL with list-PUT (PUTL, cmd=0x24).
-# Symmetric inverse: same descriptor walk; each element copies
-# `ts` bytes FROM Rust LS at `lsa_src_base + cumulative_offset`
-# TO RPCS3 EA via `vm::_ptr<u8>(ea)`. The new
-# `bridge_dma_putl_callback` mirrors `bridge_dma_getl_callback`
-# but with the LS pointer as `const uint8_t*` (PUTL never mutates
-# LS). The 4th `rust_spu_set_dma_putl_callback` is installed
-# alongside GET/PUT/GETL in `try_delegate_execution`; refuse_mfc
-# gate now relaxes for ANY of the 4. PUTLB/PUTLF/GETLB/GETLF and
-# stall-and-notify still rejected (R8.4f / R8.5+).
+# R8.4f-b (2026-05-21) — current HEAD pin. R8.4f-a (GETLB/GETLF,
+# cmds 0x45/0x46) and R8.4f-b (PUTLB/PUTLF, cmds 0x25/0x26) REUSE
+# the R8.4e bridge SHA unchanged. Per RPCS3 `do_list_transfer`
+# (`SPUThread.cpp:2887`), barrier/fence bits are stripped before
+# per-element copy (`transfer.cmd = args.cmd & ~0xf`), so the
+# bridge's data path is byte-identical to GETL/PUTL — no bridge
+# function or callback added. With the R8.4f-b cycle the full
+# 6-code list-DMA family (GETL/GETLB/GETLF + PUTL/PUTLB/PUTLF)
+# delegates end-to-end. Stall-and-notify (`sb & 0x80`), atomic
+# primitives (GETLLAR / PUTLLC / PUTLLUC / PUTQLLUC), sync cmds
+# (BARRIER / EIEIO / SYNC), PUTRL atomic-REPLACE family, and
+# multi-SPU DMA races remain rejected (R8.5+ / R8.6+ / R8.7+).
+# History:
+# - R8.4e (2026-05-21) — superseded R8.4d sha
+#   d2d531850f4743b240fb59573695ea247614d0aeecb8624726206937be52d2e5.
+#   Extended R8.4d's runtime DMA GETL with list-PUT (PUTL, cmd=0x24).
+#   Symmetric inverse: same descriptor walk; each element copies
+#   `ts` bytes FROM Rust LS at `lsa_src_base + cumulative_offset`
+#   TO RPCS3 EA via `vm::_ptr<u8>(ea)`. The new
+#   `bridge_dma_putl_callback` mirrors `bridge_dma_getl_callback`
+#   but with the LS pointer as `const uint8_t*` (PUTL never mutates
+#   LS). The 4th `rust_spu_set_dma_putl_callback` is installed
+#   alongside GET/PUT/GETL in `try_delegate_execution`; refuse_mfc
+#   gate now relaxes for ANY of the 4.
 # Original R8.4d content (now superseded):
 #   Extends R8.1's runtime DMA GET + PUT dispatch with list-GET (GETL,
 #   cmd=0x44):

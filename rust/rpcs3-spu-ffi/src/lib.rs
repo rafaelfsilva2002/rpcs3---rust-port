@@ -1,9 +1,12 @@
-//! R6.0 — C-ABI bindings around the Rust SPU stack.
+//! C-ABI bindings around the Rust SPU stack.
 //!
-//! This crate exposes a minimal, panic-safe C-callable surface that
-//! the RPCS3 C++ side will use (in R6.1+) to delegate cooperative
-//! SPU thread execution to the Rust interpreter. R6.0 is purely
-//! Rust-side scaffolding — no C++ patch consumes this crate yet.
+//! Originated as R6.0 scaffolding; consumed by the RPCS3 C++ bridge
+//! (`rpcs3/Emu/Cell/SPURustBridge.cpp`) since R6.2 to delegate
+//! cooperative SPU thread execution to the Rust interpreter. As of
+//! R8.4f-b the surface covers: handle lifecycle, run/step outcomes,
+//! GPR/PC/LS I/O, persistent multi-round sessions (R6.4b), SNR
+//! forwarding (R6.3c), refuse-MFC gate + 4 DMA callbacks
+//! (R7.2 GET / R8.1 PUT / R8.4d GETL / R8.4e PUTL).
 //!
 //! # Conventions
 //!
@@ -16,9 +19,10 @@
 //! - GPRs are passed as 16-byte arrays in SPU big-endian byte order,
 //!   matching the on-disk wire format used by the trace writer +
 //!   replay engine. This decouples the FFI from host endianness.
-//! - Each handle is single-threaded. Multi-threaded SPU bridges are
-//!   R6.6 scope (one handle per cooperative SPU thread, lifetime
-//!   owned by the C++ `spu_thread`).
+//! - Each handle is single-threaded. Multi-threaded SPU bridges
+//!   landed in R6.6 (one handle per cooperative SPU thread, lifetime
+//!   owned by the C++ `spu_thread`, side-table keyed by `lv2_id`
+//!   for persistent re-entry).
 //!
 //! # Memory ownership
 //!

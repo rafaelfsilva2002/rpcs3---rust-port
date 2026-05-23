@@ -4,7 +4,33 @@ R6.7 A.5 first replay-validated DMA GET fixture. Single-SPU PSL1GHT
 homebrew that exercises the full MFC GET dispatch path (ch16-25)
 with a deterministic CC0 input/output pair.
 
-## Status
+## Current status
+
+**REPLAY-VALIDATED — 7th oracle (R6.7 A.5 LANDED 2026-05-03).**
+
+Built artifacts now present + committed:
+
+- `build/single_spu_dma_get_v1.self` (real PSL1GHT build via the
+  `rpcs3-ps3dev-toolchain:local` Docker image)
+- Trace JSONL in
+  `behavior-freeze/fixtures/spu/traces/single_spu_dma_get_v1.jsonl`
+- `.dmachunk` side-file in `behavior-freeze/fixtures/spu/dma/`
+- `.spuimg` side-file in `behavior-freeze/fixtures/spu/images/`
+- `.notes.md` companion documenting provenance + engine fixes
+
+Replay test `single_spu_dma_get_v1_replay` (formerly `#[ignore]`d)
+is enabled and green; the fixture is part of the R6 closure gate
+set and runs byte-identical across `InterpreterExecutor` and
+`RecompilerExecutor`. The runtime bridge delegates this fixture
+end-to-end (R7.2 — see `docs/PROJECT_STATUS.md` § 9.1 +
+`docs/SPU_DMA_MFC_R6_7_DESIGN.md` § 19 closure).
+
+The build-and-capture procedure below remains useful for re-capture
+or for authoring new DMA fixtures; the explicit "BLOCKED" status
+header that lived here at A.5 authoring time is preserved as
+historical context.
+
+## Status (historical pre-landing snapshot — 2026-05-02)
 
 **A.5 status as of 2026-05-02: BLOCKED on real-binary capture.**
 

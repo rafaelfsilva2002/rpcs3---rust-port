@@ -292,10 +292,14 @@ pub struct SpuMfcCmdEvent {
     // - `element_sizes`: per-element transfer size `ts` (N entries).
     // - `element_eals`: per-element source EA (N entries).
     //
-    // R8.4c will lift the parser canary and consume these via a
-    // new `MfcReplayState::process_mfc_list_cmd` path. R8.4b
-    // parses them but the replay/transform layers still reject
-    // list cmds with `UnsupportedMfcListCmd`.
+    // R8.4c lifted the parser canary for cmd=0x44 (GETL); R8.4e
+    // for cmd=0x24 (PUTL); R8.4f-a + R8.4f-b for 0x45/0x46
+    // (GETLB/GETLF) + 0x25/0x26 (PUTLB/PUTLF). As of R8.4f-b the
+    // full 6-code family is consumed via
+    // `MfcReplayState::process_mfc_list_cmd` (replay) and the
+    // runtime bridge's GETL/PUTL callbacks (R8.4d/R8.4e).
+    // `MFC_LIST_CMDS_UNSUPPORTED` is now an empty slice; the
+    // canary is reserved for future cmd codes outside this set.
     #[serde(default)]
     pub descriptor_sha256: Option<String>,
     #[serde(default)]
@@ -642,26 +646,30 @@ pub enum TraceParseError {
         reason: &'static str,
     },
     /// R6.7 A.2 + R8.1 — `spu_mfc_cmd.cmd` is not in the
-    /// supported subset. Currently accepted: `0x40` GET (R6.7 A.2)
-    /// and `0x20` PUT (R8.1). PUT-list / GET-list variants surface
-    /// as the more specific [`Self::UnsupportedMfcListCmd`]
-    /// (R8.4a). Atomic / barrier / fence-flagged variants and
-    /// any other code land here.
+    /// supported subset. Currently accepted (as of R8.4f-b):
+    /// `0x40` GET (R6.7 A.2) and `0x20` PUT (R8.1) for simple DMA;
+    /// `0x44`/`0x45`/`0x46` (GETL/GETLB/GETLF) and `0x24`/`0x25`/`0x26`
+    /// (PUTL/PUTLB/PUTLF) for list-DMA (R8.4c → R8.4f-b, full
+    /// 6-code family complete). Atomic / lock-line / PUTRL-family
+    /// variants and any unrecognized code land here.
     UnsupportedMfcCmd {
         line: usize,
         seq: u64,
         target_spu: u32,
         cmd: u32,
     },
-    /// R8.4a — `spu_mfc_cmd.cmd` is a recognized MFC list-DMA
-    /// command (PUTL/PUTLB/PUTLF = 0x24-0x26, GETL/GETLB/GETLF
-    /// = 0x44-0x46) but list-DMA is not yet supported by the
-    /// replay/runtime stack. Granular variant (vs the generic
-    /// [`Self::UnsupportedMfcCmd`]) so downstream tooling can
-    /// distinguish "out of scope for now" from "never seen
-    /// before". R8.4b/c/d will progressively implement the
-    /// GETL subset of these codes (PUTL list-form deferred).
-    /// See `docs/SPU_DMA_MFC_R6_7_DESIGN.md` § 19.
+    /// R8.4a — granular canary for list-DMA cmds. As of R8.4f-b
+    /// the full 6-code family (PUTL/PUTLB/PUTLF = 0x24-0x26 and
+    /// GETL/GETLB/GETLF = 0x44-0x46) is supported end-to-end;
+    /// `MFC_LIST_CMDS_UNSUPPORTED` is now an empty slice and this
+    /// variant is effectively unreachable for the current accepted
+    /// set. Kept as defensive infrastructure so future list cmd
+    /// codes (e.g. PUTRL atomic-REPLACE family, 0x34-0x36) can be
+    /// added back to `MFC_LIST_CMDS_UNSUPPORTED` with one edit and
+    /// surface a granular error here instead of the generic
+    /// [`Self::UnsupportedMfcCmd`].
+    /// See `docs/SPU_DMA_MFC_R6_7_DESIGN.md` § 19 (R8.4 history,
+    /// CLOSED) and § 20 (R8.5 stall-and-notify roadmap).
     UnsupportedMfcListCmd {
         line: usize,
         seq: u64,
@@ -794,7 +802,7 @@ impl std::fmt::Display for TraceParseError {
                 write!(f, "trace parse error: malformed MFC sequence at event index {wrch_event_index} for target_spu {target_spu} ({reason})")
             }
             Self::UnsupportedMfcCmd { line, seq, target_spu, cmd } => {
-                write!(f, "trace parse error at line {line} (seq {seq}, target_spu {target_spu}): unsupported MFC cmd code 0x{cmd:x} (parser accepts 0x40 GET and 0x20 PUT; list/atomic/barrier-flagged variants surface as more specific errors when known)")
+                write!(f, "trace parse error at line {line} (seq {seq}, target_spu {target_spu}): unsupported MFC cmd code 0x{cmd:x} (as of R8.4f-b the parser accepts 0x40 GET / 0x20 PUT for simple DMA and 0x44/0x45/0x46 GETL/GETLB/GETLF + 0x24/0x25/0x26 PUTL/PUTLB/PUTLF for list-DMA; atomic / lock-line / PUTRL-family / sync variants surface here)")
             }
             Self::UnsupportedMfcListCmd { line, seq, target_spu, cmd } => {
                 let mnemonic = match *cmd {
@@ -806,7 +814,7 @@ impl std::fmt::Display for TraceParseError {
                     0x46 => "GETLF",
                     _ => "list",
                 };
-                write!(f, "trace parse error at line {line} (seq {seq}, target_spu {target_spu}): MFC list-DMA cmd 0x{cmd:x} ({mnemonic}) not yet supported (R8.4a parser canary; R8.4b/c/d will implement GETL replay/runtime; PUTL deferred to R8.5+); see docs/SPU_DMA_MFC_R6_7_DESIGN.md § 19")
+                write!(f, "trace parse error at line {line} (seq {seq}, target_spu {target_spu}): MFC list-DMA cmd 0x{cmd:x} ({mnemonic}) is in the granular canary set but not in the currently-accepted MFC_LIST_CMDS_UNSUPPORTED slice (as of R8.4f-b the full 6-code family is supported and the slice is empty); this variant is reserved for future list cmds added back to the unsupported slice — see docs/SPU_DMA_MFC_R6_7_DESIGN.md § 19 (R8.4 history) and § 20 (R8.5 roadmap)")
             }
             Self::UnsupportedMfcEah { line, seq, target_spu, eah } => {
                 write!(f, "trace parse error at line {line} (seq {seq}, target_spu {target_spu}): MFC eah 0x{eah:x} != 0 (R6.7 A.2 PS3 user-space PSL1GHT scope only — eah must be 0)")

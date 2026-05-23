@@ -56,8 +56,10 @@ snapshot LS bytes when cmd=0x20 PUT, so the writer now records
 `spu_mfc_cmd` for both GET and PUT with a content-addressed
 `.dmachunk` carrying the source bytes at dispatch time).
 
-Bridge patch sha at R8.1 closure: `<bumped from R7.2 to R8.1
-final — see check_patch_separation.py>`.
+Bridge patch sha at R8.1 closure: `0afda1c69…` (superseded by
+later R8.x cycles — current HEAD pin is `106ddede…` per R8.4f-b;
+see `behavior-freeze/harness/check_patch_separation.py` for the
+authoritative current value and the bump history).
 
 `bin/rpcs3.exe` for the capture:
 - size 64 MB

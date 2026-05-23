@@ -270,15 +270,24 @@ pub mod ch {
     pub const SPU_WRDEC: u32 = 7;
     /// Read decrementer.
     pub const SPU_RDDEC: u32 = 8;
-    // R6.7 C.1 — MFC param + cmd + tag-stat channels for replay-mode
-    // GET-only DMA support. The C++ side (`rpcs3/Emu/Cell/SPUThread.cpp`)
-    // implements full MFC semantics; here we only model the subset
-    // needed to let a captured GET trace replay byte-identical via a
-    // pre-applied `MfcReplayState` (see crate `rpcs3-spu-differential`'s
-    // `mfc_replay::apply_mfc_dma_pre_replay`). Runtime-mode MFC (a
-    // live game dispatching real DMA) is out of scope — wrch ch21 in
-    // runtime mode is a no-op here, and rdch ch24 stalls if the
-    // replay pre-population didn't seed a value.
+    // MFC channels — full GET / PUT / 6-code list-DMA family.
+    // Originated R6.7 C.1 as replay-mode GET-only; runtime-mode
+    // delegation added in R7.2 (GET callback), R8.1 (PUT callback),
+    // R8.4d (GETL callback), R8.4e (PUTL callback). The C++ side
+    // (`rpcs3/Emu/Cell/SPUThread.cpp`) implements the full Cell BE
+    // MFC semantics; here we model the channel state slots backing
+    // wrch ch16-23 and rdch ch24-25. Two paths populate
+    // `mfc_tag_stat_queue`:
+    //   - **Replay path** — pre-applied `MfcReplayState` walks the
+    //     captured event stream before the SPU starts running (see
+    //     `mfc_replay::apply_mfc_dma_pre_replay` in
+    //     `rpcs3-spu-differential`).
+    //   - **Runtime path** — bridge callbacks dispatch real DMA via
+    //     RPCS3 `vm::_ptr<u8>` and push `1 << tag` after each
+    //     successful element/list completion.
+    // Cmds outside the supported set (atomics / sync / PUTRL family /
+    // stall-and-notify lists) surface as `MfcUnsupported` so the
+    // bridge falls back honestly to the C++ executor.
     pub const MFC_LSA: u32 = 16;
     pub const MFC_EAH: u32 = 17;
     pub const MFC_EAL: u32 = 18;
@@ -322,16 +331,23 @@ pub struct SpuChannels {
     /// Outgoing interrupt mailbox (SPU → PPU, with IRQ).
     pub out_intr_mbox: Option<u32>,
 
-    // R6.7 C.2 — MFC channel state. These fields back wrch ch16-23 and
-    // rdch ch24-25 so a captured GET trace can replay end-to-end through
-    // the SPU executor. They are populated either by the SPU's own
-    // wrch instructions (the ch16-20, 22, 23 cases) OR by a pre-replay
-    // helper (`mfc_replay::apply_mfc_dma_pre_replay` in crate
-    // `rpcs3-spu-differential`) that walks the captured event stream
-    // before the SPU starts running.
-    /// MFC LSA (ch16). Set by `wrch ch16`. The R6.7 C.3 design
-    /// pre-applies the GET DMA at this LS offset before the SPU runs,
-    /// so subsequent `wrch ch21` (MFC_Cmd) is a no-op.
+    // MFC channel state. These fields back wrch ch16-23 and rdch
+    // ch24-25 across the full MFC family (GET / PUT / 6-code list-DMA).
+    // Originated R6.7 C.2 as replay-only GET; extended through R8.4f-b
+    // for the full family + runtime delegation. Three population
+    // paths:
+    //   - SPU wrch instructions (ch16-20, 22, 23 directly).
+    //   - **Pre-replay** — `mfc_replay::apply_mfc_dma_pre_replay`
+    //     (in crate `rpcs3-spu-differential`) walks the captured
+    //     event stream before the SPU starts running and seeds LS +
+    //     `mfc_tag_stat_queue`.
+    //   - **Runtime callbacks** — the bridge's 4 DMA callbacks
+    //     (R7.2 GET / R8.1 PUT / R8.4d GETL / R8.4e PUTL) dispatch
+    //     real EA↔LS copies via RPCS3 `vm::_ptr<u8>` when the SPU
+    //     writes ch21 in runtime mode.
+    /// MFC LSA (ch16). Set by `wrch ch16`. Reads back what was
+    /// written (no MFC dispatch happens at ch16 — dispatch happens
+    /// at ch21 in both replay and runtime modes).
     pub mfc_lsa: u32,
     /// MFC EAH (ch17). Always 0 in PSL1GHT user-space scope.
     pub mfc_eah: u32,
@@ -372,12 +388,14 @@ pub struct SpuChannels {
     /// (draining [`Self::mfc_tag_stat_queue`] entries) and NEVER
     /// cleared automatically. Multiple ch24 reads in the same
     /// session observe the same completed bits AND-filtered per
-    /// the current `mfc_wr_tag_mask`. A future R8.4+ feature that
+    /// the current `mfc_wr_tag_mask`. A future R8.5+ feature that
     /// needs to clear specific bits (e.g. tag-mask-update with
     /// `MFC_WR_TAG_UPDATE_IMMEDIATE` flushing) would gain a
     /// dedicated write path; R8.3b only adds the persistence
     /// invariant required by the repeated-poll oracle
-    /// `single_spu_dma_tag_poll_v1`.
+    /// `single_spu_dma_tag_poll_v1`. R8.3c confirmed IMMEDIATE
+    /// mode does NOT clear `completed_tags` (overlapping-mask
+    /// oracle `single_spu_dma_tag_immediate_v1`).
     pub completed_tags: u32,
 
     // R7.1 — honest fallback flag for MFC/DMA channels in runtime
@@ -907,14 +925,24 @@ impl SpuChannels {
             MFC_TAG_ID => { self.mfc_tag_id = value; Ok(()) }
             MFC_WR_TAG_MASK => { self.mfc_wr_tag_mask = value; Ok(()) }
             MFC_WR_TAG_UPDATE => { self.mfc_wr_tag_update = value; Ok(()) }
-            // R6.7 C.3 — wrch ch21 (MFC_Cmd). In replay mode the DMA
-            // has ALREADY been pre-applied to LS by
-            // `apply_mfc_dma_pre_replay`, so the actual cmd dispatch
-            // is a no-op here — we just acknowledge the write so the
-            // SPU's wrch instruction completes and PC advances.
-            // Runtime-mode MFC (live game) is out of R6.7 scope; a
-            // future C.D phase would dispatch via FFI back to RPCS3
-            // vm:: accessors here.
+            // wrch ch21 (MFC_Cmd) — dispatch surface.
+            // **Replay mode** (R6.7 C.3): the DMA has ALREADY been
+            // pre-applied to LS by
+            // `mfc_replay::apply_mfc_dma_pre_replay` (in crate
+            // `rpcs3-spu-differential`) before the SPU started; the
+            // wrch acknowledges so the SPU's instruction completes
+            // and PC advances.
+            // **Runtime mode** (R7.2 / R8.1 / R8.4d / R8.4e): the FFI
+            // bridge in `rpcs3-spu-ffi` intercepts the wrch BEFORE
+            // delegating to `SpuChannels::write` and invokes the
+            // installed DMA callback (GET 0x40 / PUT 0x20 / GETL 0x44
+            // / PUTL 0x24 + REUSE-base variants 0x45/0x46/0x25/0x26
+            // for barrier/fence — `do_list_transfer` strips the
+            // bottom 4 bits). On success the callback queues
+            // `1 << tag` into `mfc_tag_stat_queue` so the subsequent
+            // `rdch ch24` observes the completion. This branch
+            // (the executor-side ch21 handler) sees only the
+            // post-callback acknowledgement.
             MFC_CMD => Ok(()),
             _ => Err(ChannelStatus::BadChannel),
         }

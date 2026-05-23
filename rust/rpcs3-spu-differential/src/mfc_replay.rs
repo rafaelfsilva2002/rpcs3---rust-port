@@ -1,41 +1,53 @@
-//! R6.7 A.4 — MFC replay state machine for GET-only DMA.
+//! MFC replay state machine — full GET / PUT / 6-code list-DMA support.
 //!
-//! Wire-format reference: `docs/SPU_DMA_MFC_R6_7_DESIGN.md` § 6
-//! ("Replay state machine"). This module ports § 6.1's `MfcReplayState`
-//! data model + § 6.2's event dispatch rules into Rust.
+//! Originally landed in R6.7 A.4 as a GET-only state machine; progressively
+//! extended through R8.4f-b (current HEAD) to cover the full MFC family
+//! relevant to single-SPU CC0 fixtures. Wire-format reference:
+//! `docs/SPU_DMA_MFC_R6_7_DESIGN.md` § 6 (replay state machine baseline) +
+//! § 19 (R8.4 list-DMA history, CLOSED) + § 20 (R8.5 stall-and-notify
+//! roadmap, current).
 //!
-//! ## Scope of this module (A.4)
+//! ## Currently in scope (as of R8.4f-b)
 //!
-//! - The `MfcReplayState` data type with pending-cmd fields, tag-mask /
-//!   tag-update state, and in-flight + completed-tag tracking.
-//! - Event-by-event walk methods that consume captured MFC events:
-//!   `process_wrch` (ch16-23), `process_mfc_cmd` (loads `.dmachunk`
-//!   from A.3 and copies bytes into a caller-supplied `ls` buffer),
-//!   `process_mfc_dma_complete`, `process_rdch_tagstat`.
-//! - Strict validation per design § 4.3: cmd must be 0x40, eah must be
-//!   0, sizes must be in scope, ordering must hold, tag-stat oracle
-//!   must match the captured value.
-//! - Comprehensive unit tests covering all happy-path and error-path
-//!   transitions.
+//! - **Simple DMA**: GET (cmd 0x40, R6.7 A.4) + PUT (cmd 0x20, R8.1).
+//! - **List-DMA**: GETL/GETLB/GETLF (0x44/0x45/0x46) + PUTL/PUTLB/PUTLF
+//!   (0x24/0x25/0x26). All 6 codes share `process_mfc_list_cmd` (R8.4c
+//!   for GETL replay; R8.4e for PUTL; R8.4f-a/b for barrier/fence
+//!   variants via REUSE-base data path — `do_list_transfer` strips
+//!   `args.cmd & ~0xf`).
+//! - **TagStat modes**: Immediate / Any / All wait + repeated polling +
+//!   overlapping masks. Persistent `completed_tags` (R8.3b) mirrors
+//!   Cell BE / C++ runtime semantics.
+//! - **The `MfcReplayState` data type** with pending-cmd fields,
+//!   tag-mask / tag-update state, in-flight + completed-tag tracking.
+//! - **Event walk methods**: `process_wrch` (ch16-23),
+//!   `process_mfc_cmd` (simple cmds, AssertNow on LS),
+//!   `process_mfc_cmd_pre_replay` (PUT defers LS assert post-replay),
+//!   `process_mfc_list_cmd` (list cmds — descriptor walk + per-element
+//!   `.dmachunk` load), `process_mfc_dma_complete`, `process_rdch_tagstat`.
+//! - **Strict validation** per design § 4.3 / § 19.3: cmd in accepted set,
+//!   eah == 0, sizes in scope, ordering, tag-stat oracle match,
+//!   descriptor SHAs match, per-element chunks resolve via A.3 loader.
+//! - **Executor wiring complete** via Phase C (R6.7) + Phase D
+//!   (R7.2 / R8.1 / R8.4d / R8.4e callbacks). Both Interpreter and
+//!   Recompiler consume the state machine via
+//!   `apply_mfc_dma_pre_replay`. Runtime bridge (`SPURustBridge.cpp`)
+//!   delegates GET / PUT / GETL / PUTL end-to-end via 4 FFI callbacks.
 //!
-//! ## NOT in scope at this phase
+//! ## Out of scope (deferred R8.5+ / R8.6+)
 //!
-//! - **Integration into the SPU executor.** The Rust SPU thread
-//!   (`rpcs3-spu-thread`) doesn't yet handle MFC channels (16-25)
-//!   in its `ch::` module. Wiring `MfcReplayState` into the
-//!   interpreter / recompiler so a captured DMA trace replays
-//!   end-to-end requires the Phase C work (C.1-C.4 in the design
-//!   doc § 8). A.4 lands the state machine as standalone
-//!   infrastructure; the transformer continues to hard-reject
-//!   MFC traces with `TraceTransformError::UnsupportedDmaInTrace`
-//!   until C lands.
-//!
-//! - **Bridge runtime DMA.** Phase D scope; explicitly out of A.4.
-//!
-//! - **PUT, list, atomic primitives.** GET (cmd 0x40) only. The state
-//!   machine refuses any other cmd code with `UnsupportedMfcCmd`.
-//!
-//! - **EAH != 0.** PSL1GHT 32-bit user space only. `UnsupportedMfcEah`
+//! - **Stall-and-notify** (descriptor `sb & 0x80`, ch25
+//!   `MFC_RdListStallStat` + ch26 `MFC_WrListStallAck`). R8.5b will
+//!   land writer + parser unlock; R8.5c will add state-machine
+//!   handshake. See `docs/SPU_DMA_MFC_R6_7_DESIGN.md` § 20.
+//! - **Atomic primitives** (GETLLAR / PUTLLC / PUTLLUC / PUTQLLUC) —
+//!   LL/SC reservation tracking is its own work item (R8.7+).
+//! - **Sync commands** (BARRIER / EIEIO / SYNC, 0xC0 / 0xC8 / 0xCC) — R8.8+.
+//! - **PUTRL atomic-REPLACE family** (0x34-0x36) — R8.9+; semantic
+//!   divergence vs plain PUT.
+//! - **Multi-SPU DMA races on shared EA** — R8.6+ (persistent-handle
+//!   table currently keyed by `lv2_id`, single-SPU only).
+//! - **EAH != 0** — PSL1GHT 32-bit user-space only. `UnsupportedMfcEah`
 //!   on any non-zero high half.
 //!
 //! ## Design notes

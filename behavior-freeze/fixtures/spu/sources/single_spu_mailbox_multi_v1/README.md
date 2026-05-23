@@ -1,5 +1,20 @@
 # single_spu_mailbox_multi_v1 — R6.4b stall-bound oracle fixture
 
+**Current status:** REPLAY-VALIDATED — 5th oracle (R6.4b-replay
+LANDED 2026-04-29; runtime bridge acceptance R6.5 LANDED
+2026-04-30). The real `.self` was built via the
+`rpcs3-ps3dev-toolchain:local` Docker image (landed in
+R6.4b-toolchain) and captured via the R5.9c + R5.9e.3 SPU trace
+writer, producing the canonical 5-event JSONL with
+`OUT_MBOX = 0x453` proving both rounds were consumed. Both
+Interpreter and Recompiler agree byte-identical; bridge ON
+delegates end-to-end with `stall_iters=1` via R6.4b persistent
+handle + `pop_wait`. The historical R6.4b-pre status block (FFI
+synthetic gate as acceptance proxy) is preserved below as
+context.
+
+## Historical build notes (R6.4b-pre snapshot, pre-toolchain availability)
+
 **Status (R6.4b-pre):** sources authored; `.self` not yet built
 because the PSL1GHT toolchain is unavailable in the current
 development environment. Equivalent acceptance gate landed as a

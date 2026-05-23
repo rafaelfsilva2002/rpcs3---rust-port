@@ -111,11 +111,18 @@ future re-capture produces a different `.dmalistdesc` SHA,
 investigate whether the linker layout drifted or the source
 changed.
 
-## R8.4f-b deferred
+## Follow-on phases
 
-PUTLB (cmd=0x25) and PUTLF (cmd=0x26) — symmetric inverse
-(LS→EA with barrier/fence). Same pattern as R8.4f-a:
-reuse PUTL data path, lift canary for 0x25/0x26.
+**R8.4f-b LANDED 2026-05-21.** PUTLB (cmd=0x25) and PUTLF
+(cmd=0x26) — symmetric inverse (LS→EA with barrier/fence) —
+landed in the same cycle as this fixture's sibling
+`single_spu_dma_putlb_v1` (17th oracle) and
+`single_spu_dma_putlf_v1` (18th oracle). Same REUSE pattern
+as R8.4f-a: lifted canary for 0x25/0x26, reused PUTL data path.
+`MFC_LIST_CMDS_UNSUPPORTED` is now empty; full 6-code list-DMA
+family complete.
 
-R8.5+ deferred: stall-and-notify bit 0x80 (needs SPU→PPU
-signaling), 3+ element fixtures, descriptor edge cases.
+**R8.5+ still deferred:** stall-and-notify bit 0x80 (needs
+SPU↔MFC ch25/ch26 handshake — see `docs/SPU_DMA_MFC_R6_7_DESIGN.md`
+§ 20 for the R8.5 roadmap), 3+ element fixtures, descriptor
+edge cases. Multi-SPU defers to R8.6+; atomics to R8.7+.
