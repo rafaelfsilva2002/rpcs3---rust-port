@@ -37,7 +37,7 @@ index 81bb6fd89..5c05315f6 100644
  	}
  
 diff --git a/rpcs3/Emu/Cell/SPUThread.cpp b/rpcs3/Emu/Cell/SPUThread.cpp
-index 855d95a44..89a50e062 100644
+index 855d95a44..581ca756c 100644
 --- a/rpcs3/Emu/Cell/SPUThread.cpp
 +++ b/rpcs3/Emu/Cell/SPUThread.cpp
 @@ -21,6 +21,8 @@
@@ -295,7 +295,33 @@ index 855d95a44..89a50e062 100644
  			return out;
  		}
  
-@@ -6167,6 +6319,25 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
+@@ -5456,6 +5608,25 @@ s64 spu_thread::get_ch_value(u32 ch)
+ 		if (u32 out; ch_stall_stat.try_read(out))
+ 		{
+ 			ch_stall_stat.set_value(0, false);
++
++			// R8.5b — Schema A: ch25 RdListStallStat read observable
++			// via the existing spu_rdch event type (no new EventKind).
++			// The captured value is the rotl(1, tag) stall-mask
++			// bitmask returned to the SPU. Replay reconstructs the
++			// (tag, element_index) pair via descriptor walk + the
++			// natural seq ordering against the matching ch26 ack.
++			// Fast-path only (the slow `read_channel` fallback below
++			// runs through the generic R5.8 A.3 trace hook that
++			// already covers stall-park-wake-resume).
++			{
++				auto& tracer = rpcs3::spu_trace::TraceWriter::instance();
++				if (tracer.enabled())
++				{
++					tracer.record_spu_rdch(trace_target_spu, trace_pc, ch,
++						std::optional<u32>(out), /*would_stall=*/false);
++				}
++			}
++
+ 			return out;
+ 		}
+ 
+@@ -6167,6 +6338,25 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
  
  	case SPU_WrOutMbox:
  	{
@@ -321,7 +347,7 @@ index 855d95a44..89a50e062 100644
  		if (state & cpu_flag::pending)
  		{
  			do_mfc();
-@@ -6182,6 +6353,26 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
+@@ -6182,6 +6372,26 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
  			return false;
  		}
  
@@ -348,7 +374,7 @@ index 855d95a44..89a50e062 100644
  		check_state();
  		return true;
  	}
-@@ -6206,6 +6397,15 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
+@@ -6206,6 +6416,15 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
  			}
  		}
  
@@ -364,7 +390,7 @@ index 855d95a44..89a50e062 100644
  		return true;
  	}
  
-@@ -6238,43 +6438,362 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
+@@ -6238,47 +6457,416 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
  			ch_tag_upd = value;
  		}
  
@@ -616,14 +642,19 @@ index 855d95a44..89a50e062 100644
 +							| (static_cast<u32>(d[5]) << 16)
 +							| (static_cast<u32>(d[6]) << 8)
 +							|  static_cast<u32>(d[7]);
-+						if (sb & 0x80u)
-+						{
-+							std::fprintf(stderr,
-+								"[spu_trace] %sL capture skipped: element %u has stall-and-notify bit set (deferred R8.5+)\n",
-+								is_putl ? "PUT" : "GET", i);
-+							elements_ok = false;
-+							break;
-+						}
++						// R8.5b — sb&0x80 (stall-and-notify) is NO LONGER a
++						// capture reject. The descriptor is captured byte-
++						// identical including the sb bit; ch25
++						// `MFC_RdListStallStat` reads and ch26
++						// `MFC_WrListStallAck` writes appear as ordinary
++						// spu_rdch/spu_wrch events in the trace (Schema A —
++						// no new EventKind). Replay's stall-handshake state
++						// machine lands in R8.5c; the parser already accepts
++						// the trace shape. The `sb` is intentionally not
++						// read here — it lives in the descriptor snapshot
++						// (desc_snapshot) and is implicit in the per-element
++						// chunks emitted below.
++						(void)sb;
 +						if (ts_be == 0u || ts_be > 0x4000u)
 +						{
 +							std::fprintf(stderr,
@@ -706,10 +737,24 @@ index 855d95a44..89a50e062 100644
 +			}
 +			else if (capture_getl_pre)
 +			{
-+				// R8.4b: transferred_bytes for GETL is the sum of
-+				// per-element ts (descriptor parsed above). Re-parse
-+				// the descriptor here defensively rather than passing
-+				// the sum across the process_mfc_cmd() boundary.
++				// R8.4b: transferred_bytes for list-DMA is sum of
++				// per-element ts (re-parse defensively rather than
++				// threading the sum across the process_mfc_cmd()
++				// boundary).
++				//
++				// R8.5b: if the list stalled mid-walk (an `sb & 0x80`
++				// element was hit inside do_list_transfer), the cmd
++				// is re-enqueued with `tag | 0x80` and `ch_stall_mask`
++				// has the bit set. process_mfc_cmd returned true (the
++				// cmd was successfully queued) but the actual transfer
++				// is INCOMPLETE. We MUST NOT emit `mfc_dma_complete`
++				// here — that would produce a trace where the
++				// completion event precedes the SPU's ch25 read +
++				// ch26 ack of the same tag. The deferred emission
++				// happens in `case MFC_WrListStallAck` (below), once
++				// `do_mfc(true)` resumes the list and `ch_stall_mask`
++				// shows the bit cleared (list completed across all
++				// remaining elements).
 +				u32 total_transferred = 0;
 +				const u8* desc_src = this->ls + descriptor_lsa_clean;
 +				const u32 element_count = mfc_size_at_dispatch / 8u;
@@ -719,8 +764,23 @@ index 855d95a44..89a50e062 100644
 +					const u16 ts_be = static_cast<u16>((d[2] << 8) | d[3]);
 +					total_transferred += ts_be;
 +				}
-+				trace_tracer_mfc.record_mfc_dma_complete(
-+					trace_target_spu_mfc, mfc_tag, total_transferred);
++				const u32 our_tag_bit = std::rotl<u32>(1, mfc_tag);
++				const bool stalled_inline = (ch_stall_mask & our_tag_bit) != 0u;
++				if (stalled_inline && mfc_tag < 32u)
++				{
++					// List stalled: defer the emission until the ack
++					// handler completes the list. mfc_tag is in [0, 31].
++					m_pending_list_dma_complete[mfc_tag] =
++						std::make_pair(trace_target_spu_mfc, total_transferred);
++				}
++				else
++				{
++					// List completed inline (no stall): emit now
++					// (matches prior R8.4 behavior for non-stalling
++					// list-DMA — exactly one mfc_dma_complete per cmd).
++					trace_tracer_mfc.record_mfc_dma_complete(
++						trace_target_spu_mfc, mfc_tag, total_transferred);
++				}
 +			}
 +		}
 +
@@ -728,7 +788,58 @@ index 855d95a44..89a50e062 100644
  	}
  
  	case MFC_WrListStallAck:
-@@ -6432,6 +6951,15 @@ bool spu_thread::stop_and_signal(u32 code)
+ 	{
++		// R8.5b — Schema A: ch26 WrListStallAck write observable via
++		// the existing spu_wrch event type. The written value is the
++		// tag id (5 bits) the SPU is acking. Emit BEFORE the ack work
++		// so the trace seq reflects SPU-visible ordering (the wrch
++		// instruction completes before any side-effect on the queue).
++		// Use member access (lv2_id, pc) directly — the function-scope
++		// trace_*_w aliases live inside `case SPU_WrOutMbox`'s block
++		// and are not visible here.
++		{
++			auto& tracer = rpcs3::spu_trace::TraceWriter::instance();
++			if (tracer.enabled())
++			{
++				tracer.record_spu_wrch(lv2_id, pc, ch, value, /*would_stall=*/false);
++			}
++		}
++
+ 		value &= 0x1f;
+ 
+ 		// Reset stall status for specified tag
+@@ -6300,6 +6888,30 @@ bool spu_thread::set_ch_value(u32 ch, u32 value)
+ 			do_mfc(true);
+ 		}
+ 
++		// R8.5b — after `do_mfc(true)` resumes the queued list-DMA,
++		// check whether it actually completed (= ch_stall_mask bit
++		// cleared AND we have a pending mfc_dma_complete for this
++		// tag from the original dispatch). Emit the deferred
++		// completion now. If the list RE-stalled (still in mfc_queue
++		// with tag|0x80, ch_stall_mask bit set again), keep the
++		// pending state untouched — the next ack will retry. This
++		// preserves the "exactly one mfc_dma_complete per cmd"
++		// invariant across multi-stall lists.
++		if (value < 32u && m_pending_list_dma_complete[value].has_value())
++		{
++			const bool still_stalled = (ch_stall_mask & tag_mask) != 0u;
++			if (!still_stalled)
++			{
++				auto& tracer = rpcs3::spu_trace::TraceWriter::instance();
++				if (tracer.enabled())
++				{
++					const auto pending = *m_pending_list_dma_complete[value];
++					tracer.record_mfc_dma_complete(pending.first, value, pending.second);
++				}
++				m_pending_list_dma_complete[value].reset();
++			}
++		}
++
+ 		return true;
+ 	}
+ 
+@@ -6432,6 +7044,15 @@ bool spu_thread::stop_and_signal(u32 code)
  {
  	spu_log.trace("stop_and_signal(code=0x%x)", code);
  
@@ -744,6 +855,42 @@ index 855d95a44..89a50e062 100644
  	auto set_status_npc = [&]()
  	{
  		status_npc.atomic_op([&](status_npc_sync_var& state)
+diff --git a/rpcs3/Emu/Cell/SPUThread.h b/rpcs3/Emu/Cell/SPUThread.h
+index eb4e936c3..569b0e902 100644
+--- a/rpcs3/Emu/Cell/SPUThread.h
++++ b/rpcs3/Emu/Cell/SPUThread.h
+@@ -15,6 +15,9 @@
+ #include "Loader/ELF.h"
+ 
+ #include <span>
++#include <array>
++#include <optional>
++#include <utility>
+ 
+ LOG_CHANNEL(spu_log, "SPU");
+ 
+@@ -722,6 +725,21 @@ public:
+ 	spu_channel ch_stall_stat;
+ 	spu_channel ch_atomic_stat;
+ 
++	// R8.5b — Schema A list-DMA stall-and-notify deferred completion.
++	// When a list-DMA cmd (GETL/GETLB/GETLF/PUTL/PUTLB/PUTLF) stalls
++	// mid-walk on an `sb & 0x80` descriptor element, the cmd is
++	// re-enqueued (tag |= 0x80) and process_mfc_cmd returns true.
++	// The trace's `mfc_dma_complete` event MUST NOT fire at that
++	// moment — the transfer is incomplete. We defer the emission by
++	// saving (trace_target_spu, total_transferred_bytes) keyed by tag,
++	// then emit at `case MFC_WrListStallAck` once `do_mfc(true)` has
++	// resumed the list AND `ch_stall_mask` shows the bit is cleared
++	// (i.e. the list finally completed). One slot per tag (0..31) is
++	// sufficient because Cell BE prohibits two in-flight stalled
++	// cmds on the same tag. Used only when the trace writer is enabled.
++	std::array<std::optional<std::pair<std::uint32_t, std::uint32_t>>, 32>
++		m_pending_list_dma_complete{};
++
+ 	spu_channel_4_t ch_in_mbox{};
+ 
+ 	spu_channel ch_out_mbox;
 diff --git a/rpcs3/Emu/Cell/lv2/sys_spu.cpp b/rpcs3/Emu/Cell/lv2/sys_spu.cpp
 index 263d87120..68cda38eb 100644
 --- a/rpcs3/Emu/Cell/lv2/sys_spu.cpp

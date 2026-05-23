@@ -296,6 +296,28 @@ pub enum MfcReplayError {
         lsa_base: u32,
         cumulative_size: u32,
     },
+    /// R8.5b — list-DMA descriptor element has `sb & 0x80`
+    /// (stall-and-notify) set. Schema A: the parser layer
+    /// accepts descriptors with stall bits AS-IS (no reject in
+    /// `validate_getl_additive_fields`); the writer captures
+    /// them; ch25 `MFC_RdListStallStat` reads and ch26
+    /// `MFC_WrListStallAck` writes appear as ordinary
+    /// `spu_rdch` / `spu_wrch` events in the trace. The replay
+    /// state machine, however, cannot yet drive the SPU↔MFC
+    /// handshake: stopping LS copy at the stall element,
+    /// matching the next ch25 read against the rotl(1, tag)
+    /// mask, matching the next ch26 write against `tag`, and
+    /// resuming the descriptor walk. That logic lands in
+    /// R8.5c. Until then, applying a captured stall-and-notify
+    /// trace returns this error explicitly so callers can
+    /// distinguish "writer captured a stall fixture, but
+    /// replay's state machine handshake is deferred" from
+    /// "broken descriptor". See
+    /// `docs/SPU_DMA_MFC_R6_7_DESIGN.md` § 20.
+    StallNotifyReplayNotImplemented {
+        tag: u32,
+        element_index: u32,
+    },
 }
 
 impl std::fmt::Display for MfcReplayError {
@@ -387,6 +409,9 @@ impl std::fmt::Display for MfcReplayError {
             }
             Self::GetlDestinationOutOfRange { lsa_base, cumulative_size } => {
                 write!(f, "MFC replay error (R8.4c GETL): cumulative destination lsa_base=0x{lsa_base:x} + sum(ts)={cumulative_size} exceeds 256 KiB local store")
+            }
+            Self::StallNotifyReplayNotImplemented { tag, element_index } => {
+                write!(f, "MFC replay error (R8.5b stall-and-notify): list-DMA descriptor element {element_index} has sb&0x80 (stall-and-notify) for tag {tag}; the writer captures stall-bit descriptors and ch25/ch26 events naturally via wrch/rdch, but the replay state machine handshake (drain LS copy at stall, match ch25 RdListStallStat read against rotl(1, tag), match ch26 WrListStallAck write against tag, resume from saved descriptor position) is not yet implemented — defers to R8.5c. See docs/SPU_DMA_MFC_R6_7_DESIGN.md § 20")
             }
         }
     }
@@ -1008,9 +1033,16 @@ impl MfcReplayState {
             ]);
 
             if sb & 0x80 != 0 {
-                return Err(MfcReplayError::GetlDescriptorElementInvalid {
-                    index: i as u32,
-                    reason: "stall-and-notify bit (sb & 0x80) set — R8.5+ scope, out of R8.4c",
+                // R8.5b — Schema A: parser accepts stall-bit
+                // descriptors as-is; the state machine handshake
+                // (ch25 read / ch26 write / resume from saved
+                // descriptor position) is deferred to R8.5c.
+                // Return an explicit variant so callers can
+                // distinguish "deferred handshake" from "broken
+                // descriptor".
+                return Err(MfcReplayError::StallNotifyReplayNotImplemented {
+                    tag: event.tag,
+                    element_index: i as u32,
                 });
             }
             if ts_be == 0 || ts_be as u32 > MFC_DMA_SIZE_MAX {

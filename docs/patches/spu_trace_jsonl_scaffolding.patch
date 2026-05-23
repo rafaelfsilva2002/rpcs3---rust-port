@@ -1099,10 +1099,10 @@ index 000000000..31ff88f12
 +} // namespace rpcs3::spu_trace
 diff --git a/rpcs3/Emu/Cell/SPUTraceJsonl.h b/rpcs3/Emu/Cell/SPUTraceJsonl.h
 new file mode 100644
-index 000000000..95a9af2e6
+index 000000000..7df158c5a
 --- /dev/null
 +++ b/rpcs3/Emu/Cell/SPUTraceJsonl.h
-@@ -0,0 +1,338 @@
+@@ -0,0 +1,354 @@
 +// R5.8 A.3 — SPU PPU↔SPU trace JSONL writer.
 +//
 +// Self-contained, gated, disabled-by-default trace emitter that produces
@@ -1286,10 +1286,15 @@ index 000000000..95a9af2e6
 +	// with the same SHA already exists with matching size), and emits
 +	// the JSONL line referencing the SHA.
 +	//
-+	// Scope (R6.7 A.1): GET only (cmd code 0x40). The runtime hook is
-+	// responsible for filtering: it MUST NOT call this for non-GET
-+	// codes (PUT/list/atomic) — those surface as bare `spu_wrch ch21`
-+	// and the parser rejects them with `UnsupportedMfcCmd`.
++	// Scope (current as of R8.5b): SIMPLE DMA only — cmd 0x40 GET
++	// (R6.7 A.1) and 0x20 PUT (R8.1). The runtime hook is responsible
++	// for filtering: it MUST NOT call this for list-DMA codes
++	// (0x44/0x45/0x46 GETL/GETLB/GETLF or 0x24/0x25/0x26 PUTL/PUTLB/
++	// PUTLF) — those have their own recorder
++	// `record_spu_mfc_getl_cmd` below, which captures the descriptor
++	// array + per-element chunks. Atomic / lock-line / PUTRL-family /
++	// sync cmds surface as bare `spu_wrch ch21` and the parser
++	// rejects them with `UnsupportedMfcCmd`.
 +	//
 +	// Side-file write contract: same as `record_spu_image` — the JSONL
 +	// line is emitted ONLY if the side-file landed on disk with the
@@ -1343,8 +1348,19 @@ index 000000000..95a9af2e6
 +	// remains identical across all 6 list-DMA cmd codes;
 +	// replay/runtime infers direction (EA → LS vs LS → EA) from
 +	// the cmd code's GET (0x40) or PUT (0x20) base.
-+	// Stall-and-notify (descriptor `sb` bit 0x80) defers to
-+	// R8.5+; caller MUST refuse capture if any element has it.
++	// Stall-and-notify (descriptor `sb` bit 0x80): R8.5b lifts the
++	// prior capture-refuse rule. Descriptors with stall bits are now
++	// captured byte-identical (the sb byte lives in
++	// `descriptor_bytes` naturally) and the SPU↔MFC handshake
++	// (ch25 `MFC_RdListStallStat` reads, ch26 `MFC_WrListStallAck`
++	// writes) appears as ordinary `spu_rdch` / `spu_wrch` events in
++	// the trace — Schema A reuses the existing event types. The
++	// caller (SPUThread.cpp ch21 dispatcher) no longer rejects
++	// elements with sb&0x80; the cumulative `mfc_dma_complete`
++	// emission is deferred to the ack handler (see SPUThread.cpp
++	// `case MFC_WrListStallAck` and `m_pending_list_dma_complete`).
++	// Replay's stall-handshake state machine lands in R8.5c; the
++	// parser already accepts the trace shape.
 +	void record_spu_mfc_getl_cmd(std::uint32_t target_spu, std::uint32_t pc,
 +		std::uint32_t cmd, std::uint32_t tag,
 +		std::uint32_t descriptor_size,
