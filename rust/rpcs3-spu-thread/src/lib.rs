@@ -511,6 +511,19 @@ pub struct SpuChannels {
     /// loads the captured `.dmalistdesc` + per-element
     /// `.dmachunk` from disk — no callback needed.
     pub dma_getl_callback: Option<DmaGetlCallback>,
+    /// R8.5d — runtime list-DMA stall-acknowledge callback (see
+    /// [`DmaListStallAckCallback`] for the semantic). Installed by
+    /// the C++ bridge (`SPURustBridge.cpp`) alongside
+    /// [`Self::dma_getl_callback`] / [`Self::dma_putl_callback`]
+    /// when the bridge is configured to handle stall-and-notify
+    /// list-DMA natively (i.e. NOT fall back to C++ on
+    /// `sb & 0x80`). Defaults to `None` for backward compatibility
+    /// with R8.4d/e callbacks that DID fall back honestly on stall.
+    /// Invoked from [`Self::write`] when the SPU writes ch26
+    /// [`ch::MFC_WR_LIST_STALL_ACK`]; not invoked in replay mode
+    /// (replay handshake lives in
+    /// `rpcs3-spu-differential::mfc_replay`).
+    pub dma_list_stall_ack_callback: Option<DmaListStallAckCallback>,
     /// R8.4e — optional runtime DMA PUTL (list-DMA LS→EA)
     /// callback installed by the C++ bridge. Symmetric inverse
     /// of [`Self::dma_getl_callback`]: the descriptor still
@@ -677,6 +690,64 @@ pub struct DmaPutlCallback {
 // The raw pointer ergonomics are deliberate: we keep zero borrowed
 // state across the FFI boundary.
 
+/// R8.5d — return code from list-DMA callbacks
+/// ([`DmaGetlCallback`] / [`DmaPutlCallback`] /
+/// [`DmaListStallAckCallback`]) indicating the list-DMA paused on a
+/// descriptor element with `sb & 0x80` (stall-and-notify). The
+/// callback transferred the stalled element BEFORE returning this
+/// code (per Cell BE spec § 12.5 — "transfer-then-stall"). The
+/// Rust interpreter responds by OR-setting `1 << tag` into
+/// [`SpuChannels::mfc_list_stall_mask`] and continuing SPU
+/// execution; the SPU's next instructions will read ch25
+/// ([`ch::MFC_RD_LIST_STALL_STAT`]) and write ch26
+/// ([`ch::MFC_WR_LIST_STALL_ACK`]) to ack the stall. The ack
+/// triggers [`DmaListStallAckCallback`] which resumes the bridge-
+/// side walk from the saved post-stall element.
+///
+/// Distinct from `0` (full completion → queue tag-stat) and from
+/// `-1` (validation failure → MfcUnsupported / honest fallback).
+pub const RUST_SPU_DMA_LIST_STALL_PENDING: i32 = -2;
+
+/// R8.5d — function pointer + opaque context for the runtime
+/// list-DMA stall-acknowledge callback. Invoked when the SPU
+/// writes ch26 [`ch::MFC_WR_LIST_STALL_ACK`] with a tag id
+/// (low 5 bits of the written value). The C++ bridge handler:
+///
+/// 1. Looks up the persistent partial-walk state saved for this
+///    tag at the prior stall point (mirror of R6.4b's
+///    `BridgeSession` side-table, but keyed by `(lv2_id, tag)`
+///    and storing per-element progress).
+/// 2. Resumes the descriptor walk from the saved
+///    `next_element_index`, transferring remaining elements via
+///    `vm::_ptr<u8>(ea)` (GETL: EA→LS; PUTL: LS→EA).
+/// 3. On full completion: returns `0` (interpreter queues
+///    `1 << tag` into [`SpuChannels::mfc_tag_stat_queue`]).
+/// 4. On another `sb & 0x80` hit mid-resume: transfers the
+///    stalled element, saves new partial state, returns
+///    [`RUST_SPU_DMA_LIST_STALL_PENDING`] (interpreter re-sets
+///    [`SpuChannels::mfc_list_stall_mask`] for this tag — the
+///    SPU will read ch25 + write ch26 again).
+/// 5. On error / no pending walk for this tag: returns `-1`.
+///
+/// The interpreter invokes this callback FROM
+/// [`SpuChannels::write`] for ch26 AFTER clearing the matching
+/// `mfc_list_stall_mask` bit (the R8.5c Stage A behavior). The
+/// callback's return code may re-set the bit (case 4) or queue
+/// a tag-stat (case 3) — see the [`SpuChannels::write`]
+/// MFC_WR_LIST_STALL_ACK arm for the exact wiring.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmaListStallAckCallback {
+    /// C ABI function pointer. Signature:
+    ///   `int32_t cb(void* user_data, uint32_t tag)`
+    /// where `tag` is `value & 0x1f` from the ch26 wrch.
+    pub func: unsafe extern "C" fn(
+        user_data: *mut core::ffi::c_void,
+        tag: u32,
+    ) -> i32,
+    pub user_data: *mut core::ffi::c_void,
+}
+
 /// R7.1 — predicate identifying MFC / DMA channels (the channel
 /// range the runtime bridge currently refuses to execute Rust-side).
 /// Covers the wrch param channels (ch16-23) plus the rdch tag-stat
@@ -811,6 +882,7 @@ impl SpuChannels {
             && self.dma_put_callback.is_none()
             && self.dma_getl_callback.is_none()
             && self.dma_putl_callback.is_none()
+            && self.dma_list_stall_ack_callback.is_none()
         {
             return Err(ChannelStatus::MfcRefused);
         }
@@ -934,6 +1006,7 @@ impl SpuChannels {
             && self.dma_put_callback.is_none()
             && self.dma_getl_callback.is_none()
             && self.dma_putl_callback.is_none()
+            && self.dma_list_stall_ack_callback.is_none()
         {
             return Err(ChannelStatus::MfcRefused);
         }
@@ -984,6 +1057,35 @@ impl SpuChannels {
                 let tag = value & 0x1f;
                 let bit = 1u32.rotate_left(tag);
                 self.mfc_list_stall_mask &= !bit;
+                // R8.5d — if the runtime bridge installed a stall-
+                // acknowledge callback, invoke it now to resume the
+                // bridge-side partial walk. The callback may:
+                //   - return 0: list fully completed; queue the
+                //     tag-stat so the next ch24 read returns
+                //     `1 << tag`.
+                //   - return RUST_SPU_DMA_LIST_STALL_PENDING (-2):
+                //     resume hit another sb&0x80 mid-walk; re-set
+                //     the stall mask for this tag (the SPU will
+                //     read ch25 + write ch26 again).
+                //   - return anything else (typically -1): error /
+                //     no pending walk; we do NOT queue a tag-stat
+                //     and do NOT re-raise the stall. The SPU will
+                //     eventually time out via the C++ executor
+                //     (R7.1 honest fallback) if it's still waiting
+                //     for completion. NOT returning an error from
+                //     this write handler preserves the SPU-visible
+                //     "ack always succeeds" semantic.
+                if let Some(cb) = self.dma_list_stall_ack_callback {
+                    let rc = unsafe { (cb.func)(cb.user_data, tag) };
+                    if rc == 0 {
+                        self.mfc_tag_stat_queue.push_back(bit);
+                    } else if rc == RUST_SPU_DMA_LIST_STALL_PENDING {
+                        self.mfc_list_stall_mask |= bit;
+                    }
+                    // Other rc values: silent (interpreter-side
+                    // observability is via the next ch24 read
+                    // stalling forever if no tag-stat was queued).
+                }
                 Ok(())
             }
             // wrch ch21 (MFC_Cmd) — dispatch surface.
@@ -1021,6 +1123,7 @@ impl SpuChannels {
             && self.dma_put_callback.is_none()
             && self.dma_getl_callback.is_none()
             && self.dma_putl_callback.is_none()
+            && self.dma_list_stall_ack_callback.is_none()
         {
             return Err(ChannelStatus::MfcRefused);
         }
@@ -1842,6 +1945,113 @@ mod tests {
         t.channels.mfc_list_stall_mask = 0x08;
         t.channels.write(ch::MFC_WR_LIST_STALL_ACK, 35).unwrap();
         assert_eq!(t.channels.mfc_list_stall_mask, 0);
+    }
+
+    /// R8.5d — verify the ch26 write handler invokes the
+    /// `dma_list_stall_ack_callback` when installed, dispatching
+    /// on the return code (0 = queue tag-stat, -2 = re-stall, -1 =
+    /// silent). Uses a thread-local AtomicU32 to count invocations
+    /// and a scripted return-code sequence to drive the three
+    /// branches.
+    mod r8_5d_ack_cb {
+        use super::*;
+        use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+        use std::sync::Mutex;
+
+        static ACK_CALLS: AtomicU32 = AtomicU32::new(0);
+        static ACK_LAST_TAG: AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
+        static ACK_RC: AtomicI32 = AtomicI32::new(0);
+        // Serialize the 3 tests — they share the static counters
+        // above, and cargo test runs tests in parallel by default.
+        static TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+        extern "C" fn ack_callback(_user_data: *mut core::ffi::c_void, tag: u32) -> i32 {
+            ACK_CALLS.fetch_add(1, Ordering::SeqCst);
+            ACK_LAST_TAG.store(tag, Ordering::SeqCst);
+            ACK_RC.load(Ordering::SeqCst)
+        }
+
+        fn reset() {
+            ACK_CALLS.store(0, Ordering::SeqCst);
+            ACK_LAST_TAG.store(0xFFFF_FFFF, Ordering::SeqCst);
+            ACK_RC.store(0, Ordering::SeqCst);
+        }
+
+        #[test]
+        fn ack_callback_rc0_queues_tag_stat() {
+            let _g = TEST_MUTEX.lock().unwrap();
+            reset();
+            ACK_RC.store(0, Ordering::SeqCst);
+            let mut t = SpuThread::new(0);
+            t.channels.mfc_list_stall_mask = 0x08; // tag 3 stalled
+            t.channels.dma_list_stall_ack_callback = Some(DmaListStallAckCallback {
+                func: ack_callback,
+                user_data: core::ptr::null_mut(),
+            });
+            t.channels.write(ch::MFC_WR_LIST_STALL_ACK, 3).unwrap();
+            assert_eq!(ACK_CALLS.load(Ordering::SeqCst), 1, "callback invoked once");
+            assert_eq!(ACK_LAST_TAG.load(Ordering::SeqCst), 3, "tag forwarded");
+            // Mask cleared, tag-stat queued.
+            assert_eq!(t.channels.mfc_list_stall_mask, 0);
+            assert_eq!(
+                t.channels.mfc_tag_stat_queue.pop_front(),
+                Some(1u32 << 3),
+                "rc=0 → tag-stat queued"
+            );
+        }
+
+        #[test]
+        fn ack_callback_rc_stall_pending_re_raises_mask() {
+            let _g = TEST_MUTEX.lock().unwrap();
+            reset();
+            ACK_RC.store(RUST_SPU_DMA_LIST_STALL_PENDING, Ordering::SeqCst);
+            let mut t = SpuThread::new(0);
+            t.channels.mfc_list_stall_mask = 0x10; // tag 4 stalled
+            t.channels.dma_list_stall_ack_callback = Some(DmaListStallAckCallback {
+                func: ack_callback,
+                user_data: core::ptr::null_mut(),
+            });
+            t.channels.write(ch::MFC_WR_LIST_STALL_ACK, 4).unwrap();
+            assert_eq!(ACK_CALLS.load(Ordering::SeqCst), 1);
+            // Mask was cleared by the handler then re-set by the
+            // rc=-2 branch → still 0x10.
+            assert_eq!(t.channels.mfc_list_stall_mask, 0x10, "stall re-raised");
+            // No tag-stat queued.
+            assert!(t.channels.mfc_tag_stat_queue.is_empty());
+        }
+
+        #[test]
+        fn ack_callback_error_rc_silent_no_queue_no_remask() {
+            let _g = TEST_MUTEX.lock().unwrap();
+            reset();
+            ACK_RC.store(-1, Ordering::SeqCst);
+            let mut t = SpuThread::new(0);
+            t.channels.mfc_list_stall_mask = 0x20; // tag 5 stalled
+            t.channels.dma_list_stall_ack_callback = Some(DmaListStallAckCallback {
+                func: ack_callback,
+                user_data: core::ptr::null_mut(),
+            });
+            // Write must still succeed (preserves SPU-visible
+            // "ack always succeeds" semantic).
+            t.channels.write(ch::MFC_WR_LIST_STALL_ACK, 5).unwrap();
+            assert_eq!(ACK_CALLS.load(Ordering::SeqCst), 1);
+            // Bit cleared by the pre-callback step, NOT re-set.
+            assert_eq!(t.channels.mfc_list_stall_mask, 0);
+            // No tag-stat queued.
+            assert!(t.channels.mfc_tag_stat_queue.is_empty());
+        }
+
+        #[test]
+        fn ack_without_callback_is_R8_5c_pure_rust_behavior() {
+            // R8.5c baseline: when NO callback is installed, ch26
+            // just clears the bit; no queue mutation.
+            let mut t = SpuThread::new(0);
+            t.channels.mfc_list_stall_mask = 0x40; // tag 6 stalled
+            assert!(t.channels.dma_list_stall_ack_callback.is_none());
+            t.channels.write(ch::MFC_WR_LIST_STALL_ACK, 6).unwrap();
+            assert_eq!(t.channels.mfc_list_stall_mask, 0);
+            assert!(t.channels.mfc_tag_stat_queue.is_empty());
+        }
     }
 
     #[test]

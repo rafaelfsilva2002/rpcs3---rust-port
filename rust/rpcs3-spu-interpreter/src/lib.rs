@@ -960,6 +960,21 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
                                     spu.pc = pc.wrapping_add(4);
                                     return Ok(StepOutcome::Continue);
                                 }
+                                // R8.5d — callback transferred up to
+                                // (and including) an sb&0x80 element,
+                                // saved partial state, and signalled
+                                // stall pending. Set mfc_list_stall_mask
+                                // for the tag (the SPU will read ch25
+                                // next and ack via ch26, which then
+                                // re-invokes the bridge's stall-ack
+                                // callback to resume the walk). Do NOT
+                                // queue tag-stat; the list is
+                                // incomplete.
+                                if rc == rpcs3_spu_thread::RUST_SPU_DMA_LIST_STALL_PENDING {
+                                    spu.channels.mfc_list_stall_mask |= 1u32.rotate_left(tag);
+                                    spu.pc = pc.wrapping_add(4);
+                                    return Ok(StepOutcome::Continue);
+                                }
                             }
                         } else if let Some(cb) = spu.channels.dma_getl_callback {
                             // R8.4d GETL: callback reads the
@@ -989,11 +1004,21 @@ pub fn step(spu: &mut SpuThread) -> Result<StepOutcome, Error> {
                                 spu.pc = pc.wrapping_add(4);
                                 return Ok(StepOutcome::Continue);
                             }
+                            // R8.5d — GETL family: same stall-pending
+                            // semantic as the PUTL branch above. See
+                            // that comment block for the protocol.
+                            if rc == rpcs3_spu_thread::RUST_SPU_DMA_LIST_STALL_PENDING {
+                                spu.channels.mfc_list_stall_mask |= 1u32.rotate_left(tag);
+                                spu.pc = pc.wrapping_add(4);
+                                return Ok(StepOutcome::Continue);
+                            }
                         }
                     }
                     // List validation failed OR callback missing OR
-                    // callback returned non-zero — fall through to
-                    // MfcUnsupported.
+                    // callback returned an unrecognized non-zero code
+                    // (i.e. anything other than 0 or
+                    // RUST_SPU_DMA_LIST_STALL_PENDING) — fall through
+                    // to MfcUnsupported.
                     return Ok(StepOutcome::MfcUnsupported {
                         channel,
                         is_write: true,

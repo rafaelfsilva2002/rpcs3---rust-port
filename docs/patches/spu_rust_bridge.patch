@@ -48,10 +48,10 @@ index f863a2b91..d862b2287 100644
      target_precompile_headers(rpcs3_emu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../stdafx.h")
 diff --git a/rpcs3/Emu/Cell/SPURustBridge.cpp b/rpcs3/Emu/Cell/SPURustBridge.cpp
 new file mode 100644
-index 000000000..85f699ac3
+index 000000000..0d8377520
 --- /dev/null
 +++ b/rpcs3/Emu/Cell/SPURustBridge.cpp
-@@ -0,0 +1,1245 @@
+@@ -0,0 +1,1535 @@
 +#include "stdafx.h"
 +#include "SPURustBridge.h"
 +
@@ -151,6 +151,57 @@ index 000000000..85f699ac3
 +	}
 +
 +#ifdef RPCS3_HAS_SPU_RUST_BRIDGE
++	// R8.5d — saved partial-walk state for a list-DMA GETL that
++	// paused mid-walk on an `sb & 0x80` descriptor element. Per
++	// Cell BE spec § 12.5 the stalled element IS transferred BEFORE
++	// the stall is raised — `next_element_index` therefore points
++	// at the element AFTER the stalled one, so
++	// `bridge_dma_list_stall_ack_callback`'s resume MUST NOT
++	// re-transfer it.
++	//
++	// `descriptor_bytes` is a snapshot of the in-LS descriptor
++	// taken at dispatch time. Held by the partial state so the
++	// resume doesn't have to re-read SPU LS (the LS may be mutated
++	// by the SPU's code between dispatch and ack).
++	//
++	// `dest_ls_ptr` points into the Rust handle's LS at
++	// `lsa_dest_base`. Valid for the lifetime of the BridgeSession
++	// (the Rust handle owns the LS; the session owns the handle).
++	//
++	// Defined here at the top of the ifdef block so the bridge_dma_*
++	// callbacks below can both refer to it AND so the BridgeSession
++	// struct (defined later) can embed `unordered_map<u32,
++	// GetlPartialState>` for the side-table storage. The
++	// save/take HELPER functions (which access the BridgeSession
++	// side-table) are forward-declared here and defined after the
++	// BridgeSession block.
++	struct GetlPartialState
++	{
++		u32 tag;
++		u32 descriptor_lsa;
++		u32 descriptor_size;
++		u32 lsa_dest_base;
++		uint8_t* dest_ls_ptr;
++		u32 element_count;
++		u32 next_element_index;
++		u32 cumulative_offset;
++		std::vector<uint8_t> descriptor_bytes;
++	};
++
++	// Forward declarations — bodies live after the BridgeSession
++	// struct below (which is where the side-table mutex / map are
++	// defined; the helpers' bodies need to see them).
++
++	// Save partial state under the lock. Returns 0 on success,
++	// -1 if no BridgeSession exists for `spu->lv2_id` (the
++	// caller should refuse the stall and surface honest fallback).
++	static int32_t bridge_save_getl_partial(class spu_thread* spu, GetlPartialState&& state);
++
++	// Atomically take-and-erase partial state for `(spu->lv2_id,
++	// tag)`. Returns 0 + populates `out` on success, -1 if no
++	// session or no partial for tag.
++	static int32_t bridge_take_getl_partial(class spu_thread* spu, uint32_t tag, GetlPartialState& out);
++
 +	// Encode a 128-bit GPR (RPCS3 v128, native LE in memory) as a
 +	// 16-byte big-endian buffer matching the Rust FFI's contract:
 +	// `bytes[0]` = preferred-slot MSB.
@@ -312,14 +363,6 @@ index 000000000..85f699ac3
 +				| (static_cast<uint32_t>(d[6]) << 8)
 +				|  static_cast<uint32_t>(d[7]);
 +
-+			if (sb & 0x80)
-+			{
-+				spu_rust_bridge_log.warning(
-+					"[Rust SPU bridge] bridge_dma_getl_callback: element %u has "
-+					"stall-and-notify bit set on '%s'; refusing GETL (R8.5+ scope)",
-+					i, name);
-+				return -1;
-+			}
 +			if (ts == 0 || ts > 0x4000)
 +			{
 +				spu_rust_bridge_log.warning(
@@ -347,9 +390,60 @@ index 000000000..85f699ac3
 +					i, ea, name);
 +				return -1;
 +			}
++			// R8.5c spec § 12.5: transfer the element FIRST, THEN
++			// check for stall-and-notify. This applies to the
++			// stalled element too — it MUST be in LS before the
++			// SPU sees the stall.
 +			std::memcpy(dest_ls_ptr + cumulative_offset, src, ts);
 +			cumulative_offset += ts;
 +			total_transferred += ts;
++
++			// R8.5d — if this element carries `sb & 0x80`, save
++			// partial-walk state in the BridgeSession and signal
++			// the Rust interpreter that a stall is pending. The
++			// SPU's next instructions read ch25 (returns 1<<tag
++			// from `mfc_list_stall_mask`, then clears it) and
++			// write ch26 (ack) — which re-enters via
++			// `bridge_dma_list_stall_ack_callback` to resume
++			// from element i+1.
++			if (sb & 0x80)
++			{
++				// R8.5d — Cell BE transfer-then-stall semantic: the
++				// element was already copied above. Save partial-walk
++				// state via the helper (which acquires the side-table
++				// lock + accesses BridgeSession internals); the SPU's
++				// next ch26 write invokes
++				// `bridge_dma_list_stall_ack_callback` which resumes
++				// from `next_element_index = i + 1`.
++				GetlPartialState partial;
++				partial.tag = tag;
++				partial.descriptor_lsa = descriptor_lsa;
++				partial.descriptor_size = descriptor_size;
++				partial.lsa_dest_base = lsa_dest_base;
++				partial.dest_ls_ptr = dest_ls_ptr;
++				partial.element_count = element_count;
++				partial.next_element_index = i + 1;
++				partial.cumulative_offset = cumulative_offset;
++				partial.descriptor_bytes.assign(
++					descriptor_ls_ptr,
++					descriptor_ls_ptr + descriptor_size);
++				if (bridge_save_getl_partial(spu, std::move(partial)) != 0)
++				{
++					spu_rust_bridge_log.warning(
++						"[Rust SPU bridge] bridge_dma_getl_callback: element %u "
++						"has sb&0x80 on '%s' but no BridgeSession to save partial "
++						"state; refusing GETL (R8.5d invariant: stalled walks "
++						"require a session for resume tracking)",
++						i, name);
++					return -1;
++				}
++				spu_rust_bridge_log.success(
++					"[Rust SPU bridge] R8.5d DMA GETL stall: element %u sb&0x80 "
++					"hit on '%s'; transferred %u bytes (including stalled "
++					"element); next_element_index=%u tag=%u; awaiting ch26 ack",
++					i, name, cumulative_offset, i + 1, tag);
++				return -2; // RUST_SPU_DMA_LIST_STALL_PENDING
++			}
 +		}
 +
 +		spu_rust_bridge_log.success(
@@ -363,6 +457,132 @@ index 000000000..85f699ac3
 +			descriptor_lsa, descriptor_size, element_count,
 +			lsa_dest_base, total_transferred, tag, name,
 +			1u << tag);
++		return 0;
++	}
++
++	// R8.5d — list-DMA stall acknowledge callback. Invoked when the
++	// SPU writes ch26 (`MFC_WrListStallAck`) with a tag id. Looks up
++	// the saved partial-walk state for `(lv2_id, tag)` and resumes
++	// the descriptor walk from `next_element_index`. Returns:
++	//   - 0 on full completion (interpreter queues 1<<tag for ch24).
++	//   - -2 (RUST_SPU_DMA_LIST_STALL_PENDING) on another sb&0x80
++	//     hit during resume (interpreter re-raises stall mask).
++	//   - -1 on error / no pending walk for this tag.
++	//
++	// Currently handles GETL only (R8.5d staged GETL-only). PUTL
++	// stall ack defers to a later sub-phase (R8.5d-b or R8.5e).
++	static int32_t bridge_dma_list_stall_ack_callback(void* user_data, uint32_t tag)
++	{
++		spu_thread* spu = static_cast<spu_thread*>(user_data);
++		const char* name = spu ? spu->get_name().c_str() : "<unknown>";
++		if (!spu)
++		{
++			spu_rust_bridge_log.warning(
++				"[Rust SPU bridge] bridge_dma_list_stall_ack_callback: null spu "
++				"on tag=%u; refusing ack", tag);
++			return -1;
++		}
++		// R8.5d — take-and-erase partial walk state via the helper
++		// (which acquires the side-table lock + accesses
++		// BridgeSession internals). On failure (no session or no
++		// partial for this tag) the helper returns -1 and `partial`
++		// is left default-constructed.
++		GetlPartialState partial;
++		if (bridge_take_getl_partial(spu, tag, partial) != 0)
++		{
++			spu_rust_bridge_log.warning(
++				"[Rust SPU bridge] bridge_dma_list_stall_ack_callback: no "
++				"partial walk for lv2_id=%u tag=%u on '%s'; refusing ack "
++				"(SPU may have completed without a pending stall, or acked "
++				"a tag that wasn't stalled)",
++				spu->lv2_id, tag, name);
++			return -1;
++		}
++
++		// Resume descriptor walk from partial.next_element_index.
++		// Loop body is structurally identical to the initial walk
++		// in bridge_dma_getl_callback above.
++		uint32_t cumulative_offset = partial.cumulative_offset;
++		const uint32_t element_count = partial.element_count;
++		const uint8_t* desc = partial.descriptor_bytes.data();
++		for (uint32_t i = partial.next_element_index; i < element_count; ++i)
++		{
++			const uint8_t* d = desc + i * 8;
++			const uint8_t sb = d[0];
++			const uint16_t ts = static_cast<uint16_t>((d[2] << 8) | d[3]);
++			const uint32_t ea = (static_cast<uint32_t>(d[4]) << 24)
++				| (static_cast<uint32_t>(d[5]) << 16)
++				| (static_cast<uint32_t>(d[6]) << 8)
++				|  static_cast<uint32_t>(d[7]);
++
++			if (ts == 0 || ts > 0x4000)
++			{
++				spu_rust_bridge_log.warning(
++					"[Rust SPU bridge] bridge_dma_list_stall_ack_callback: "
++					"resume element %u ts=%u out of (0, 0x4000] on '%s'; "
++					"aborting resume (partial walk dropped)",
++					i, ts, name);
++				return -1;
++			}
++			if (static_cast<uint64_t>(partial.lsa_dest_base) + cumulative_offset + ts > 0x40000ull)
++			{
++				spu_rust_bridge_log.warning(
++					"[Rust SPU bridge] bridge_dma_list_stall_ack_callback: "
++					"resume element %u cumulative LS overflow on '%s'; "
++					"aborting",
++					i, name);
++				return -1;
++			}
++			const uint8_t* src = vm::_ptr<const uint8_t>(ea);
++			if (!src)
++			{
++				spu_rust_bridge_log.warning(
++					"[Rust SPU bridge] bridge_dma_list_stall_ack_callback: "
++					"resume element %u vm::_ptr<u8>(0x%x) null on '%s'",
++					i, ea, name);
++				return -1;
++			}
++			std::memcpy(partial.dest_ls_ptr + cumulative_offset, src, ts);
++			cumulative_offset += ts;
++
++			if (sb & 0x80)
++			{
++				// Another stall mid-resume. Save updated partial
++				// (next_element_index advances, cumulative_offset
++				// updated) and return -2 so the SPU reads ch25 +
++				// writes ch26 again.
++				partial.next_element_index = i + 1;
++				partial.cumulative_offset = cumulative_offset;
++				if (bridge_save_getl_partial(spu, std::move(partial)) != 0)
++				{
++					// Session vanished mid-resume — defensive; this
++					// shouldn't happen since we just succeeded a take
++					// from the same session moments ago, but bail
++					// gracefully.
++					spu_rust_bridge_log.warning(
++						"[Rust SPU bridge] bridge_dma_list_stall_ack_callback: "
++						"session vanished mid-resume on '%s' element %u "
++						"tag=%u; dropping partial",
++						name, i, tag);
++					return -1;
++				}
++				spu_rust_bridge_log.success(
++					"[Rust SPU bridge] R8.5d DMA GETL stall (resume): element %u "
++					"sb&0x80 on '%s'; cumulative=%u bytes; next_element_index=%u "
++					"tag=%u; awaiting another ch26 ack",
++					i, name, cumulative_offset, i + 1, tag);
++				return -2;
++			}
++		}
++
++		// Full completion — partial walk drained. The Rust
++		// interpreter's ch26 write handler will queue 1<<tag into
++		// `mfc_tag_stat_queue` on rc=0, so the SPU's next ch24
++		// read sees the completion.
++		spu_rust_bridge_log.success(
++			"[Rust SPU bridge] R8.5d DMA GETL completion: tag=%u resume drained "
++			"on '%s'; total cumulative=%u bytes (all elements transferred)",
++			tag, name, cumulative_offset);
 +		return 0;
 +	}
 +
@@ -587,6 +807,12 @@ index 000000000..85f699ac3
 +		u32 stall_iterations;       // count of StallRead→pop_wait→resume cycles (R6.4b)
 +		u32 stall_write_iterations; // count of StallWrite→drain→resume cycles (R6.5b)
 +		u32 total_steps;            // accumulated step count across iterations
++		// R8.5d — pending list-DMA GETL partial walks keyed by tag.
++		// Set by `bridge_dma_getl_callback` on first stall hit;
++		// consumed/cleared by `bridge_dma_list_stall_ack_callback`
++		// on full completion (or replaced on another stall mid-
++		// resume). Sparse: only stalled tags have entries.
++		std::unordered_map<u32, GetlPartialState> getl_partials;
 +	};
 +
 +	struct BridgeSessionDeleter
@@ -625,7 +851,8 @@ index 000000000..85f699ac3
 +			handle, lv2_id, /*in_mbox_consumed=*/0u,
 +			/*snr1=*/false, /*snr2=*/false,
 +			/*stall_iters=*/0u, /*stall_write_iters=*/0u,
-+			/*total_steps=*/0u});
++			/*total_steps=*/0u,
++			/*getl_partials=*/{}});
 +		BridgeSession* raw = s.get();
 +		s_sessions[lv2_id] = std::move(s);
 +		return raw;
@@ -636,6 +863,50 @@ index 000000000..85f699ac3
 +	{
 +		std::lock_guard<std::mutex> lk(s_sessions_mutex);
 +		s_sessions.erase(lv2_id);
++	}
++
++	// R8.5d — helper bodies (forward-declared at top of this ifdef
++	// block). Defined here so they can access BridgeSession +
++	// s_sessions_mutex + s_sessions; called from
++	// bridge_dma_getl_callback (save path) and
++	// bridge_dma_list_stall_ack_callback (take path).
++	static int32_t bridge_save_getl_partial(class spu_thread* spu, GetlPartialState&& state)
++	{
++		if (!spu)
++		{
++			return -1;
++		}
++		std::lock_guard<std::mutex> lk(s_sessions_mutex);
++		auto it = s_sessions.find(spu->lv2_id);
++		if (it == s_sessions.end() || !it->second)
++		{
++			return -1;
++		}
++		const u32 tag = state.tag;
++		it->second->getl_partials[tag] = std::move(state);
++		return 0;
++	}
++
++	static int32_t bridge_take_getl_partial(class spu_thread* spu, uint32_t tag, GetlPartialState& out)
++	{
++		if (!spu)
++		{
++			return -1;
++		}
++		std::lock_guard<std::mutex> lk(s_sessions_mutex);
++		auto it = s_sessions.find(spu->lv2_id);
++		if (it == s_sessions.end() || !it->second)
++		{
++			return -1;
++		}
++		auto partials_it = it->second->getl_partials.find(tag);
++		if (partials_it == it->second->getl_partials.end())
++		{
++			return -1;
++		}
++		out = std::move(partials_it->second);
++		it->second->getl_partials.erase(partials_it);
++		return 0;
 +	}
 +#endif
 +
@@ -760,6 +1031,25 @@ index 000000000..85f699ac3
 +				"[Rust SPU bridge] try_delegate: rust_spu_set_dma_putl_callback failed "
 +				"on '%s'; falling back to C++ executor (R8.4e PUTL path unavailable).",
 +				spu.get_name());
++			rust_spu_drop(h);
++			return false;
++		}
++
++		// R8.5d — install the list-DMA stall-acknowledge callback.
++		// Invoked from the Rust interpreter's ch26 write handler
++		// (MFC_WrListStallAck) to resume a partial walk saved by
++		// bridge_dma_getl_callback when it hit sb&0x80. GETL-only
++		// in R8.5d staged scope (PUTL stall ack defers to R8.5e).
++		// Bridge ON delegation for non-stalling lists is unchanged;
++		// stalling lists now stay on the Rust side instead of
++		// falling back honestly to C++ (R7.1 path no longer fires
++		// for sb&0x80 GETL).
++		if (rust_spu_set_dma_list_stall_ack_callback(h, &bridge_dma_list_stall_ack_callback, &spu) != 0)
++		{
++			spu_rust_bridge_log.warning(
++				"[Rust SPU bridge] try_delegate: rust_spu_set_dma_list_stall_ack_callback "
++				"failed on '%s'; falling back to C++ executor (R8.5d GETL-stall path "
++				"unavailable).", spu.get_name());
 +			rust_spu_drop(h);
 +			return false;
 +		}

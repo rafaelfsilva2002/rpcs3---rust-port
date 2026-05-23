@@ -320,6 +320,40 @@ int32_t rust_spu_set_dma_putl_callback(rust_spu_t *h,
                                        void *user_data);
 
 /**
+ * R8.5d — C ABI signature for the runtime list-DMA
+ * stall-acknowledge callback. The Rust interpreter invokes this
+ * callback when the SPU writes ch26 (`MFC_WrListStallAck`) with
+ * a tag id, AFTER clearing the matching bit in
+ * `mfc_list_stall_mask`. The C++ bridge handler:
+ *
+ * 1. Looks up the saved partial-walk state for `(lv2_id, tag)`
+ *    (mirror of R6.4b BridgeSession side-table, keyed per-tag).
+ * 2. Resumes the descriptor walk from the saved
+ *    `next_element_index`, transferring remaining elements via
+ *    `vm::_ptr<u8>(ea)` (GETL: EA→LS). GETL-only in R8.5d staged
+ *    scope.
+ * 3. Returns:
+ *    - `0` on full completion (interpreter queues `1 << tag`).
+ *    - `-2` (RUST_SPU_DMA_LIST_STALL_PENDING) on another sb&0x80
+ *      hit during resume (interpreter re-raises stall mask).
+ *    - `-1` on error / no pending walk for this tag.
+ */
+typedef int32_t (*rust_spu_dma_list_stall_ack_cb_t)(void *user_data,
+                                                    uint32_t tag);
+
+/**
+ * R8.5d — install (or clear) the runtime list-DMA stall-acknowledge
+ * callback. Pass `func = NULL` to clear. Installing this callback
+ * relaxes the `refuse_mfc` gate on ch16-25 alongside the existing
+ * GET/PUT/GETL/PUTL callbacks.
+ *
+ * Returns 0 on success, -1 if `h` is null, -100 on panic.
+ */
+int32_t rust_spu_set_dma_list_stall_ack_callback(rust_spu_t *h,
+                                                 rust_spu_dma_list_stall_ack_cb_t func,
+                                                 void *user_data);
+
+/**
  * Run up to `max_steps` instructions. Returns the outcome that
  * caused the run to halt:
  *

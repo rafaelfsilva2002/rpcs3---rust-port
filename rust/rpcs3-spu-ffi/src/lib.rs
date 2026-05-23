@@ -582,6 +582,81 @@ pub unsafe extern "C" fn rust_spu_set_dma_putl_callback(
 }
 
 // =====================================================================
+// R8.5d — list-DMA stall-and-notify acknowledge callback
+// =====================================================================
+
+/// R8.5d — C ABI signature for the runtime list-DMA
+/// stall-acknowledge callback. Matches
+/// [`rpcs3_spu_thread::DmaListStallAckCallback::func`].
+///
+/// The Rust interpreter invokes this callback when the SPU writes
+/// ch26 (`MFC_WrListStallAck`) with a tag id, AFTER clearing the
+/// matching bit in
+/// [`rpcs3_spu_thread::SpuChannels::mfc_list_stall_mask`]. The C++
+/// bridge handler:
+///
+/// 1. Looks up the saved partial-walk state for `(lv2_id, tag)`
+///    (mirror of R6.4b's `BridgeSession` side-table, keyed
+///    per-tag and storing per-element progress).
+/// 2. Resumes the descriptor walk from the saved
+///    `next_element_index`, transferring remaining elements
+///    (GETL family: EA→LS via `vm::_ptr<u8>(ea)` + memcpy;
+///    PUTL family: LS→EA).
+/// 3. Returns:
+///    - `0` on full completion (interpreter queues `1 << tag`
+///      into `mfc_tag_stat_queue` so the SPU's next ch24 read
+///      returns the tag-stat).
+///    - [`rpcs3_spu_thread::RUST_SPU_DMA_LIST_STALL_PENDING`]
+///      (`-2`) on another sb&0x80 hit mid-walk (interpreter
+///      re-sets `mfc_list_stall_mask |= 1 << tag` — the SPU
+///      will read ch25 + write ch26 again to ack the new
+///      stall).
+///    - `-1` on error / no pending walk for this tag.
+///
+/// The bridge MUST have saved the partial-walk state at the
+/// prior `bridge_dma_getl_callback` /
+/// `bridge_dma_putl_callback` invocation that returned `-2`.
+/// Without such state this callback returns `-1`.
+pub type DmaListStallAckCallbackFn = unsafe extern "C" fn(
+    user_data: *mut core::ffi::c_void,
+    tag: u32,
+) -> i32;
+
+/// R8.5d — install (or clear) the runtime list-DMA stall-acknowledge
+/// callback on the handle. Pass `func = NULL` to clear an existing
+/// callback. Installing this callback also relaxes the `refuse_mfc`
+/// gate on ch16-25 (it counts alongside the GET/PUT/GETL/PUTL
+/// callbacks per the existing gate semantics).
+///
+/// Returns 0 on success, -1 if `h` is null, -100 on panic.
+///
+/// # Safety
+///
+/// Same contract as the other dma_set_* functions: the
+/// (`func`, `user_data`) pair must outlive every
+/// `rust_spu_run_until_event` call on this handle.
+#[no_mangle]
+pub unsafe extern "C" fn rust_spu_set_dma_list_stall_ack_callback(
+    h: *mut RustSpu,
+    func: Option<DmaListStallAckCallbackFn>,
+    user_data: *mut core::ffi::c_void,
+) -> i32 {
+    guard(
+        || {
+            let Some(h) = handle_mut(h) else { return -1 };
+            h.spu.channels.dma_list_stall_ack_callback = func.map(|f| {
+                rpcs3_spu_thread::DmaListStallAckCallback {
+                    func: f,
+                    user_data,
+                }
+            });
+            0
+        },
+        -100,
+    )
+}
+
+// =====================================================================
 // Run / step
 // =====================================================================
 
