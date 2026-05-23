@@ -297,7 +297,21 @@ pub mod ch {
     pub const MFC_WR_TAG_MASK: u32 = 22;
     pub const MFC_WR_TAG_UPDATE: u32 = 23;
     pub const MFC_RD_TAG_STAT: u32 = 24;
-    pub const MFC_RD_TAG_MASK: u32 = 25;
+    // R8.5c — ch25 is `MFC_RdListStallStat` per Cell BE
+    // (`SPUThread.h:75`). The previous Rust-side constant misnamed
+    // ch25 as `MFC_RD_TAG_MASK` (which is actually ch12 per Cell BE);
+    // the constant was unused by any oracle so the misnaming was
+    // latent until R8.5b unlocked the writer/parser surface for
+    // stall-and-notify. Reading ch25 returns the persistent
+    // `mfc_list_stall_mask` (a bitmask of stalled tags) and clears
+    // the register destructively, matching the C++ semantic at
+    // `rpcs3/Emu/Cell/SPUThread.cpp` `case MFC_RdListStallStat`.
+    pub const MFC_RD_LIST_STALL_STAT: u32 = 25;
+    // R8.5c — ch26 is `MFC_WrListStallAck` per Cell BE. The SPU
+    // writes a tag id (5 bits) to acknowledge a stalled list-DMA
+    // for that tag, allowing the MFC to resume the list walk.
+    // Mirrors the C++ semantic at `case MFC_WrListStallAck`.
+    pub const MFC_WR_LIST_STALL_ACK: u32 = 26;
     /// Read event mask.
     pub const SPU_RDEVENTMASK: u32 = 22;
     /// Read machine status.
@@ -382,6 +396,20 @@ pub struct SpuChannels {
     /// persistent register surviving across reads. See R8.3b
     /// closure note.
     pub mfc_tag_stat_queue: std::collections::VecDeque<u32>,
+
+    /// R8.5c — list-DMA stall-and-notify register, mirror of the
+    /// C++ `ch_stall_mask` at `rpcs3/Emu/Cell/SPUThread.cpp` (the
+    /// underlying register fed into ch25 `MFC_RdListStallStat`).
+    /// When a list-DMA cmd hits a descriptor element with
+    /// `sb & 0x80`, the executor OR-sets `1 << tag` into this mask.
+    /// The SPU reads ch25 (`MFC_RD_LIST_STALL_STAT`) — destructive
+    /// read returns the current mask and clears the register to 0.
+    /// The SPU writes ch26 (`MFC_WR_LIST_STALL_ACK`) with a tag id
+    /// to clear `1 << tag` — releasing the stall so the list walk
+    /// can resume (R8.5c+ in the replay state machine; runtime
+    /// bridge handshake defers to R8.5d). NEVER cleared by any
+    /// other channel op.
+    pub mfc_list_stall_mask: u32,
 
     /// R8.3b — persistent `completed_tags` register, mirrors the
     /// Cell BE / C++ runtime semantic. OR-set by each ch24 read
@@ -866,9 +894,23 @@ impl SpuChannels {
                 }
                 Ok(self.completed_tags & self.mfc_wr_tag_mask)
             }
-            // R6.7 C.4 — RdTagMask (ch25): stateless read of the
-            // current tag-mask register.
-            ch::MFC_RD_TAG_MASK => Ok(self.mfc_wr_tag_mask),
+            // R8.5c — RdListStallStat (ch25): destructive read.
+            // Returns the current `mfc_list_stall_mask` (bitmask of
+            // tags whose list-DMA is currently stalled on an `sb`
+            // element waiting for ack via ch26) and CLEARS the
+            // register to 0. Matches the C++ semantic at
+            // `rpcs3/Emu/Cell/SPUThread.cpp` `case
+            // MFC_RdListStallStat` (`ch_stall_stat.try_read(out)` +
+            // `set_value(0, false)`). The prior Rust constant
+            // `MFC_RD_TAG_MASK = 25` was misnamed (real Cell BE
+            // `MFC_RdTagMask` is ch12); the misnamed handler
+            // returning `mfc_wr_tag_mask` was never exercised by
+            // any oracle and has been removed in R8.5c.
+            ch::MFC_RD_LIST_STALL_STAT => {
+                let out = self.mfc_list_stall_mask;
+                self.mfc_list_stall_mask = 0;
+                Ok(out)
+            }
             _ => Err(ChannelStatus::BadChannel),
         }
     }
@@ -925,6 +967,25 @@ impl SpuChannels {
             MFC_TAG_ID => { self.mfc_tag_id = value; Ok(()) }
             MFC_WR_TAG_MASK => { self.mfc_wr_tag_mask = value; Ok(()) }
             MFC_WR_TAG_UPDATE => { self.mfc_wr_tag_update = value; Ok(()) }
+            // R8.5c — WrListStallAck (ch26): SPU writes a tag id
+            // (5 bits) to acknowledge a stalled list-DMA on that
+            // tag. Clears the matching bit in `mfc_list_stall_mask`,
+            // releasing the stall so the list walk can resume.
+            // Matches the C++ semantic at
+            // `rpcs3/Emu/Cell/SPUThread.cpp` `case
+            // MFC_WrListStallAck` (`value &= 0x1f` +
+            // `ch_stall_mask &= ~tag_mask`). The C++ side ALSO calls
+            // `do_mfc(true)` to resume the queued list cmd — that
+            // resume is handled by the replay state machine in
+            // `mfc_replay::process_spu_wrch_list_stall_ack` (which
+            // walks the descriptor from the saved post-stall
+            // index); the runtime bridge resume is R8.5d scope.
+            MFC_WR_LIST_STALL_ACK => {
+                let tag = value & 0x1f;
+                let bit = 1u32.rotate_left(tag);
+                self.mfc_list_stall_mask &= !bit;
+                Ok(())
+            }
             // wrch ch21 (MFC_Cmd) — dispatch surface.
             // **Replay mode** (R6.7 C.3): the DMA has ALREADY been
             // pre-applied to LS by
@@ -983,10 +1044,18 @@ impl SpuChannels {
             // to serve different roles in the read vs write
             // direction.
             MFC_LSA | MFC_EAH | MFC_EAL | MFC_SIZE | MFC_TAG_ID | MFC_CMD => 1,
-            // R6.7 C.4 — RdTagStat readable count = queue depth;
-            // RdTagMask is always readable (count = 1).
+            // R6.7 C.4 — RdTagStat readable count = queue depth.
+            // R8.5c — RdListStallStat: count = 1 (the register is
+            // always readable; reading destructively returns + clears
+            // the persistent mask). The C++ side reports the same:
+            // `case MFC_RdListStallStat: result =
+            // ch_stall_stat.get_count(); break;` returns 1.
+            // R8.5c — WrListStallAck: count = 1 (always writable;
+            // single-shot tag acknowledge, matches C++ `case
+            // MFC_WrListStallAck: return 1;`).
             MFC_RD_TAG_STAT => self.mfc_tag_stat_queue.len() as u32,
-            MFC_RD_TAG_MASK => 1,
+            MFC_RD_LIST_STALL_STAT => 1,
+            MFC_WR_LIST_STALL_ACK => 1,
             _ => return Err(ChannelStatus::BadChannel),
         };
         Ok(count)
@@ -1729,12 +1798,50 @@ mod tests {
     }
 
     #[test]
-    fn mfc_rdtagmask_mirrors_wr_tag_mask_register() {
+    fn mfc_rdlistsstallstat_returns_persistent_then_clears() {
+        // R8.5c — ch25 `MFC_RdListStallStat`: destructive read of
+        // the persistent `mfc_list_stall_mask` register. Replaces
+        // the pre-R8.5c misnamed handler that returned
+        // `mfc_wr_tag_mask` (the misnaming was latent; no oracle
+        // exercised ch25 before R8.5b).
         let mut t = SpuThread::new(0);
-        t.channels.mfc_wr_tag_mask = 0x1234;
-        // Stateless read — calling twice returns the same value.
-        assert_eq!(t.channels.read(ch::MFC_RD_TAG_MASK), Ok(0x1234));
-        assert_eq!(t.channels.read(ch::MFC_RD_TAG_MASK), Ok(0x1234));
+        // No stall set → read returns 0 + leaves register at 0.
+        assert_eq!(t.channels.read(ch::MFC_RD_LIST_STALL_STAT), Ok(0));
+        assert_eq!(t.channels.mfc_list_stall_mask, 0);
+        // Executor stalled tag 3 (rotl(1, 3) = 0x08).
+        t.channels.mfc_list_stall_mask = 0x08;
+        assert_eq!(t.channels.read(ch::MFC_RD_LIST_STALL_STAT), Ok(0x08));
+        // Destructive: register cleared after read.
+        assert_eq!(t.channels.mfc_list_stall_mask, 0);
+        // Second read with empty register returns 0 (matches C++
+        // try_read returning the current value after set_value(0)).
+        assert_eq!(t.channels.read(ch::MFC_RD_LIST_STALL_STAT), Ok(0));
+    }
+
+    #[test]
+    fn mfc_wrliststallack_clears_tag_bit() {
+        // R8.5c — ch26 `MFC_WrListStallAck`: SPU writes a tag id
+        // (5 bits) to clear `1 << tag` in `mfc_list_stall_mask`.
+        let mut t = SpuThread::new(0);
+        // Two tags stalled: 3 (0x08) and 5 (0x20) = 0x28.
+        t.channels.mfc_list_stall_mask = 0x28;
+        // Ack tag 3 → clear 0x08, leaving 0x20.
+        t.channels.write(ch::MFC_WR_LIST_STALL_ACK, 3).unwrap();
+        assert_eq!(t.channels.mfc_list_stall_mask, 0x20);
+        // Ack tag 5 → clear 0x20, leaving 0.
+        t.channels.write(ch::MFC_WR_LIST_STALL_ACK, 5).unwrap();
+        assert_eq!(t.channels.mfc_list_stall_mask, 0);
+        // Ack of non-stalled tag is a no-op (mask & !bit is
+        // idempotent when bit was already 0). Mirrors C++ where
+        // `case MFC_WrListStallAck` falls through if `ch_stall_mask
+        // & tag_mask` was 0.
+        t.channels.write(ch::MFC_WR_LIST_STALL_ACK, 7).unwrap();
+        assert_eq!(t.channels.mfc_list_stall_mask, 0);
+        // value & 0x1f: high bits are ignored. Tag 35 = 35 & 0x1f
+        // = 3.
+        t.channels.mfc_list_stall_mask = 0x08;
+        t.channels.write(ch::MFC_WR_LIST_STALL_ACK, 35).unwrap();
+        assert_eq!(t.channels.mfc_list_stall_mask, 0);
     }
 
     #[test]
@@ -1752,7 +1859,12 @@ mod tests {
         t.channels.mfc_tag_stat_queue.push_back(0xAA);
         t.channels.mfc_tag_stat_queue.push_back(0xBB);
         assert_eq!(t.channels.count(ch::MFC_RD_TAG_STAT), Ok(2));
-        // RdTagMask: always 1 (stateless).
-        assert_eq!(t.channels.count(ch::MFC_RD_TAG_MASK), Ok(1));
+        // R8.5c — RdListStallStat: always 1 (matches C++
+        // `ch_stall_stat.get_count()` returning 1 when the
+        // single-slot register has any value).
+        assert_eq!(t.channels.count(ch::MFC_RD_LIST_STALL_STAT), Ok(1));
+        // R8.5c — WrListStallAck: always 1 (always writable;
+        // single-shot tag ack).
+        assert_eq!(t.channels.count(ch::MFC_WR_LIST_STALL_ACK), Ok(1));
     }
 }

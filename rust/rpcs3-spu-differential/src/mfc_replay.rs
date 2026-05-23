@@ -296,27 +296,48 @@ pub enum MfcReplayError {
         lsa_base: u32,
         cumulative_size: u32,
     },
-    /// R8.5b — list-DMA descriptor element has `sb & 0x80`
-    /// (stall-and-notify) set. Schema A: the parser layer
-    /// accepts descriptors with stall bits AS-IS (no reject in
-    /// `validate_getl_additive_fields`); the writer captures
-    /// them; ch25 `MFC_RdListStallStat` reads and ch26
-    /// `MFC_WrListStallAck` writes appear as ordinary
-    /// `spu_rdch` / `spu_wrch` events in the trace. The replay
-    /// state machine, however, cannot yet drive the SPU↔MFC
-    /// handshake: stopping LS copy at the stall element,
-    /// matching the next ch25 read against the rotl(1, tag)
-    /// mask, matching the next ch26 write against `tag`, and
-    /// resuming the descriptor walk. That logic lands in
-    /// R8.5c. Until then, applying a captured stall-and-notify
-    /// trace returns this error explicitly so callers can
-    /// distinguish "writer captured a stall fixture, but
-    /// replay's state machine handshake is deferred" from
-    /// "broken descriptor". See
-    /// `docs/SPU_DMA_MFC_R6_7_DESIGN.md` § 20.
-    StallNotifyReplayNotImplemented {
+    /// R8.5c — ch25 `MFC_RdListStallStat` read returned a value
+    /// that doesn't match the replay state machine's expected
+    /// `list_stall_mask`. The expected value is built by OR-
+    /// setting `1 << tag` for each list-DMA cmd that stalled
+    /// mid-walk on an `sb & 0x80` element. The captured value
+    /// comes from the SPU's actual ch25 read in the trace.
+    /// Divergence means the writer + replay are not in sync on
+    /// which tags stalled — usually a broken trace or a missing
+    /// dispatch event.
+    StallStatValueMismatch {
+        expected: u32,
+        captured: u32,
+    },
+    /// R8.5c — ch26 `MFC_WrListStallAck` write supplied a tag
+    /// id (5 bits) that doesn't match the currently-pending
+    /// stalled list-DMA's tag. The C++ MFC ack semantic clears
+    /// the matching bit in `ch_stall_mask`; if no list with
+    /// that tag is stalled, the ack is a no-op there but in
+    /// replay this is a hard error because we have a single
+    /// pending partial walk and acking the wrong tag would
+    /// leave it stuck.
+    StallAckTagMismatch {
+        expected_tag: u32,
+        captured_tag: u32,
+    },
+    /// R8.5c — ch26 `MFC_WrListStallAck` arrived but there is
+    /// NO pending stalled list-DMA. Either the trace has an
+    /// extra ack event with no corresponding stall, or the
+    /// dispatch event that should have stalled was skipped /
+    /// reordered.
+    StallAckWithoutPendingStall {
         tag: u32,
-        element_index: u32,
+    },
+    /// R8.5c — `mfc_dma_complete` event arrived for a tag whose
+    /// list-DMA is still stalled mid-walk (the replay's
+    /// `partial_list_dma` is `Some`). Per the Cell BE list-DMA
+    /// contract the completion is atomic — it MUST NOT fire
+    /// until the list fully completes (all elements transferred
+    /// across all stall/ack cycles). A premature completion
+    /// event indicates a broken capture or trace ordering bug.
+    MfcDmaCompleteWhileStalled {
+        tag: u32,
     },
 }
 
@@ -410,8 +431,17 @@ impl std::fmt::Display for MfcReplayError {
             Self::GetlDestinationOutOfRange { lsa_base, cumulative_size } => {
                 write!(f, "MFC replay error (R8.4c GETL): cumulative destination lsa_base=0x{lsa_base:x} + sum(ts)={cumulative_size} exceeds 256 KiB local store")
             }
-            Self::StallNotifyReplayNotImplemented { tag, element_index } => {
-                write!(f, "MFC replay error (R8.5b stall-and-notify): list-DMA descriptor element {element_index} has sb&0x80 (stall-and-notify) for tag {tag}; the writer captures stall-bit descriptors and ch25/ch26 events naturally via wrch/rdch, but the replay state machine handshake (drain LS copy at stall, match ch25 RdListStallStat read against rotl(1, tag), match ch26 WrListStallAck write against tag, resume from saved descriptor position) is not yet implemented — defers to R8.5c. See docs/SPU_DMA_MFC_R6_7_DESIGN.md § 20")
+            Self::StallStatValueMismatch { expected, captured } => {
+                write!(f, "MFC replay error (R8.5c stall-and-notify): captured ch25 MFC_RdListStallStat value 0x{captured:x} != expected list_stall_mask 0x{expected:x}; writer + replay disagree on which tags stalled — likely a broken trace or missing dispatch event")
+            }
+            Self::StallAckTagMismatch { expected_tag, captured_tag } => {
+                write!(f, "MFC replay error (R8.5c stall-and-notify): captured ch26 MFC_WrListStallAck tag {captured_tag} != pending stalled list-DMA tag {expected_tag}; replay carries a single in-flight stalled list per session in R8.5c scope")
+            }
+            Self::StallAckWithoutPendingStall { tag } => {
+                write!(f, "MFC replay error (R8.5c stall-and-notify): captured ch26 MFC_WrListStallAck tag {tag} but no list-DMA is currently stalled in replay state; trace likely has an extra ack or a missing dispatch")
+            }
+            Self::MfcDmaCompleteWhileStalled { tag } => {
+                write!(f, "MFC replay error (R8.5c stall-and-notify): captured mfc_dma_complete for tag {tag} arrived while the list is still stalled mid-walk (partial_list_dma is Some); per Cell BE list-DMA contract the completion is atomic and MUST NOT fire until all stalls are ack'd and the list fully completes")
             }
         }
     }
@@ -465,6 +495,84 @@ pub struct MfcReplayState {
     in_flight: BTreeMap<u32, MfcInFlight>,
     /// Bitmask of completed-but-not-yet-observed-via-ch24 tags.
     completed_tags: u32,
+    /// R8.5c — persistent stall-and-notify register, mirror of the
+    /// executor's `mfc_list_stall_mask` (which mirrors the C++
+    /// `ch_stall_mask`). Set by [`Self::process_mfc_list_cmd`] when
+    /// a descriptor element with `sb & 0x80` is hit (AFTER that
+    /// element is transferred — per Cell BE spec § 12.5). Read +
+    /// CLEARED destructively by
+    /// [`Self::process_spu_rdch_list_stall_stat`].
+    list_stall_mask: u32,
+    /// R8.5c — saved walk progress for a list-DMA cmd that is
+    /// currently stalled mid-walk. `Some(...)` between the dispatch
+    /// that hit the stall and the matching ch26 `WrListStallAck`
+    /// that resumes (and possibly completes) the walk. Only one
+    /// in-flight stalled list at a time in R8.5c scope; per-tag
+    /// concurrent stalls defer to R8.5d+ (real CC0 fixture demand).
+    partial_list_dma: Option<ListDmaPartialProgress>,
+}
+
+/// R8.5c — saved progress for a list-DMA cmd that paused on an
+/// `sb & 0x80` element. Carries enough state for
+/// [`MfcReplayState::process_spu_wrch_list_stall_ack`] to resume
+/// the descriptor walk from `next_element_index` without re-reading
+/// the captured trace event (the descriptor side-file is already
+/// loaded and validated; the per-element chunk SHAs are already
+/// cross-checked).
+///
+/// Per the Cell BE stall semantic: the element with `sb & 0x80` IS
+/// transferred before the stall is raised. So `cumulative_lsa` /
+/// `cumulative_sum` here include the stalled element's bytes;
+/// `next_element_index` points at the element AFTER the stalled
+/// one. The ack handler resumes from that index — it never re-
+/// transfers the stalled element.
+#[derive(Debug, Clone)]
+pub struct ListDmaPartialProgress {
+    /// MFC cmd code (0x44/0x45/0x46 = GETL family;
+    /// 0x24/0x25/0x26 = PUTL family).
+    pub cmd: u32,
+    /// MFC tag (0..31).
+    pub tag: u32,
+    /// True for PUTL family (LS read, no LS write). Mirrors the
+    /// `is_putl` flag computed at dispatch.
+    pub is_putl: bool,
+    /// Captured event's `lsa` field (the base destination LS for
+    /// GETL or base source LS for PUTL). Used at completion to
+    /// build the `MfcInFlight` record.
+    pub event_lsa: u32,
+    /// Captured event's `eah` field. Always 0 in PSL1GHT scope.
+    pub event_eah: u32,
+    /// Captured event's `eal` field (the descriptor's LS pointer).
+    pub event_eal: u32,
+    /// Captured `descriptor_sha256` (stored as `chunk_sha256` in
+    /// the resulting `MfcInFlight` record per R8.4c convention).
+    pub descriptor_sha256: String,
+    /// Full descriptor bytes (N * 8) loaded at dispatch time. Kept
+    /// for resume so the ack handler doesn't need to re-resolve
+    /// the side-file.
+    pub descriptor_bytes: Vec<u8>,
+    /// Per-element chunk SHA strings (already cross-validated
+    /// against descriptor at dispatch).
+    pub element_chunks: Vec<String>,
+    /// Per-element ts (already cross-validated).
+    pub element_sizes: Vec<u32>,
+    /// Per-element ea (already cross-validated).
+    pub element_eals: Vec<u32>,
+    /// Element count (= descriptor_bytes.len() / 8).
+    pub element_count: usize,
+    /// Resume point — index of the FIRST element NOT yet
+    /// transferred. The stalled element (at `next_element_index -
+    /// 1`) WAS transferred per Cell BE; the ack handler must not
+    /// re-transfer it.
+    pub next_element_index: usize,
+    /// Current cumulative destination LS for the next element to
+    /// transfer.
+    pub cumulative_lsa: u32,
+    /// Sum of all `ts` transferred so far (across all elements
+    /// 0..next_element_index). Used at completion as
+    /// `MfcInFlight.size` so the matching `mfc_dma_complete`'s
+    /// `transferred_bytes` check holds atomically.
+    pub cumulative_sum: u32,
 }
 
 impl MfcReplayState {
@@ -484,7 +592,25 @@ impl MfcReplayState {
             awaiting_mfc_cmd_event: false,
             in_flight: BTreeMap::new(),
             completed_tags: 0,
+            list_stall_mask: 0,
+            partial_list_dma: None,
         }
+    }
+
+    /// R8.5c — read-only access to the current list-DMA stall mask.
+    /// Useful for tests and diagnostics. Mirrors the executor's
+    /// `mfc_list_stall_mask` register.
+    #[must_use]
+    pub fn list_stall_mask(&self) -> u32 {
+        self.list_stall_mask
+    }
+
+    /// R8.5c — read-only access to the saved partial-walk progress
+    /// for a currently-stalled list-DMA. `Some(...)` between the
+    /// dispatch that hit the stall and the ack that resumes it.
+    #[must_use]
+    pub fn partial_list_dma(&self) -> Option<&ListDmaPartialProgress> {
+        self.partial_list_dma.as_ref()
     }
 
     /// Non-mutating access to the current pending packet. Useful for
@@ -1021,6 +1147,13 @@ impl MfcReplayState {
             });
         }
 
+        // R8.5c — track stall hit. Walk elements left-to-right;
+        // for each, transfer first, THEN check sb (Cell BE spec
+        // § 12.5: the stalled element IS transferred before the
+        // stall is raised). If sb&0x80, save partial state and
+        // exit the loop (no in_flight insert until full
+        // completion via the ack handler).
+        let mut stalled_at: Option<usize> = None;
         for i in 0..element_count {
             let base = i * 8;
             let sb = desc_bytes[base];
@@ -1032,19 +1165,6 @@ impl MfcReplayState {
                 desc_bytes[base + 7],
             ]);
 
-            if sb & 0x80 != 0 {
-                // R8.5b — Schema A: parser accepts stall-bit
-                // descriptors as-is; the state machine handshake
-                // (ch25 read / ch26 write / resume from saved
-                // descriptor position) is deferred to R8.5c.
-                // Return an explicit variant so callers can
-                // distinguish "deferred handshake" from "broken
-                // descriptor".
-                return Err(MfcReplayError::StallNotifyReplayNotImplemented {
-                    tag: event.tag,
-                    element_index: i as u32,
-                });
-            }
             if ts_be == 0 || ts_be as u32 > MFC_DMA_SIZE_MAX {
                 return Err(MfcReplayError::GetlDescriptorElementInvalid {
                     index: i as u32,
@@ -1124,10 +1244,54 @@ impl MfcReplayState {
             // 0x100C0] gets element 1 = 64 B).
             cumulative_lsa = lsa_end;
             cumulative_sum = cumulative_sum.saturating_add(ts_be as u32);
+
+            // R8.5c — stall check AFTER transfer. Per Cell BE
+            // spec § 12.5: if sb&0x80 is set on an element, the
+            // MFC stalls the list AFTER completing the transfer
+            // of that element (the SPU sees the bytes in
+            // LS / the bytes land in EA before the stall is
+            // raised). Save partial state at next_element_index
+            // = i+1 so the ack handler resumes from the NEXT
+            // element — never re-transferring the stalled one.
+            if sb & 0x80 != 0 {
+                stalled_at = Some(i);
+                break;
+            }
         }
 
-        // Register in-flight; the matching `mfc_dma_complete`
-        // event promotes it. The `size` field stored here is the
+        // R8.5c — branch on stall outcome.
+        if let Some(stalled_index) = stalled_at {
+            // The element at `stalled_index` WAS transferred
+            // above. Save partial walk progress so the matching
+            // ch26 ack can resume from `stalled_index + 1`.
+            // List stall mask gets `1 << tag` OR'd in — mirrors
+            // the C++ `ch_stall_mask |= rotl(1, tag)` set inside
+            // `do_list_transfer` when sb&0x80 hits.
+            self.partial_list_dma = Some(ListDmaPartialProgress {
+                cmd: event.cmd,
+                tag: event.tag,
+                is_putl,
+                event_lsa: event.lsa,
+                event_eah: event.eah,
+                event_eal: event.eal,
+                descriptor_sha256: desc_sha.to_owned(),
+                descriptor_bytes: desc_bytes,
+                element_chunks: elements.to_vec(),
+                element_sizes: sizes.to_vec(),
+                element_eals: eals.to_vec(),
+                element_count,
+                next_element_index: stalled_index + 1,
+                cumulative_lsa,
+                cumulative_sum,
+            });
+            self.list_stall_mask |= 1u32.rotate_left(event.tag);
+            self.pending.clear();
+            return Ok(());
+        }
+
+        // No stall hit — full list completed inline. Register
+        // in-flight; the matching `mfc_dma_complete` event
+        // promotes it. The `size` field stored here is the
         // SUM of all element ts (not the descriptor bytes), so
         // the dma_complete event's `transferred_bytes == size`
         // check matches the Cell BE atomic-list-completion
@@ -1148,15 +1312,239 @@ impl MfcReplayState {
         Ok(())
     }
 
+    /// R8.5c — process a captured `spu_rdch ch25` event
+    /// (`MFC_RdListStallStat`). The captured value is the
+    /// SPU-observed stall mask returned by RPCS3 at the moment
+    /// of the read. Replay validates that this matches the
+    /// state machine's expected [`Self::list_stall_mask`] — if
+    /// it does, the register is cleared destructively (mirroring
+    /// the C++ `case MFC_RdListStallStat`'s `set_value(0)`); on
+    /// mismatch the state is NOT mutated and a
+    /// [`MfcReplayError::StallStatValueMismatch`] is returned so
+    /// the caller can surface trace/state divergence early.
+    pub fn process_spu_rdch_list_stall_stat(
+        &mut self,
+        captured_value: u32,
+    ) -> Result<u32, MfcReplayError> {
+        if captured_value != self.list_stall_mask {
+            return Err(MfcReplayError::StallStatValueMismatch {
+                expected: self.list_stall_mask,
+                captured: captured_value,
+            });
+        }
+        let out = self.list_stall_mask;
+        self.list_stall_mask = 0;
+        Ok(out)
+    }
+
+    /// R8.5c — process a captured `spu_wrch ch26` event
+    /// (`MFC_WrListStallAck`). Validates that a stalled list-DMA
+    /// is currently pending in [`Self::partial_list_dma`] AND
+    /// that the captured tag (low 5 bits of `captured_value`)
+    /// matches the pending tag. On validation success, resumes
+    /// the descriptor walk from
+    /// `partial_list_dma.next_element_index`, copying remaining
+    /// elements into `ls` (for GETL family; PUTL family skips
+    /// the LS write). If another `sb & 0x80` is hit mid-resume,
+    /// the partial state is updated to the new stall point and
+    /// `list_stall_mask` is set again. If the resume reaches the
+    /// end of the descriptor, the partial state is cleared, the
+    /// list is registered as in-flight, and the matching
+    /// `mfc_dma_complete` event will promote it normally.
+    ///
+    /// The C++ ack semantic ALSO clears `ch_stall_mask & rotl(1,
+    /// tag)` — but that already happens unconditionally on every
+    /// successful ack here (we clear via the `process_spu_rdch_*`
+    /// path's destructive read OR via `list_stall_mask &=
+    /// !rotl(1, tag)` after a successful resume). For replay,
+    /// the order is dispatch → stall → ch25 read (clears mask) →
+    /// ch26 ack (this method resumes walk), so the mask is
+    /// already 0 when this method runs in normal flow. We still
+    /// clear defensively in case the trace omitted the ch25 read.
+    pub fn process_spu_wrch_list_stall_ack(
+        &mut self,
+        captured_value: u32,
+        ls: &mut [u8],
+    ) -> Result<(), MfcReplayError> {
+        let captured_tag = captured_value & 0x1f;
+
+        // Validate ls buffer shape early (matches the discipline
+        // in process_mfc_list_cmd).
+        if ls.len() != SPU_LS_SIZE {
+            return Err(MfcReplayError::BadLsBufferSize {
+                actual: ls.len(),
+                expected: SPU_LS_SIZE,
+            });
+        }
+
+        let partial = self
+            .partial_list_dma
+            .as_ref()
+            .ok_or(MfcReplayError::StallAckWithoutPendingStall {
+                tag: captured_tag,
+            })?;
+
+        if partial.tag != captured_tag {
+            return Err(MfcReplayError::StallAckTagMismatch {
+                expected_tag: partial.tag,
+                captured_tag,
+            });
+        }
+
+        // Defensive clear (no-op in the typical flow where ch25
+        // read already cleared the mask).
+        self.list_stall_mask &= !(1u32.rotate_left(captured_tag));
+
+        // Move-out the partial so we can mutate self for the
+        // potential re-stall save below. The fields we touch
+        // (tag, is_putl, descriptor + chunks, next_element_index,
+        // cumulative state) are all owned/cheap-clone.
+        let mut p = self
+            .partial_list_dma
+            .take()
+            .expect("partial_list_dma checked Some above");
+
+        // Resume the descriptor walk from p.next_element_index.
+        // Loop body is structurally identical to the initial
+        // walk in process_mfc_list_cmd, but state comes from `p`
+        // (the saved partial) instead of the event.
+        let mut cumulative_lsa = p.cumulative_lsa;
+        let mut cumulative_sum = p.cumulative_sum;
+        let mut stalled_at: Option<usize> = None;
+
+        for i in p.next_element_index..p.element_count {
+            let base = i * 8;
+            let sb = p.descriptor_bytes[base];
+            let ts_be = u16::from_be_bytes([
+                p.descriptor_bytes[base + 2],
+                p.descriptor_bytes[base + 3],
+            ]);
+            let ea_be = u32::from_be_bytes([
+                p.descriptor_bytes[base + 4],
+                p.descriptor_bytes[base + 5],
+                p.descriptor_bytes[base + 6],
+                p.descriptor_bytes[base + 7],
+            ]);
+
+            // Defensive re-validation (the first walk already
+            // checked these; on resume, the inputs are the same
+            // owned descriptor bytes, so this should never fail
+            // — but cheap to assert).
+            if ts_be == 0 || ts_be as u32 > MFC_DMA_SIZE_MAX {
+                return Err(MfcReplayError::GetlDescriptorElementInvalid {
+                    index: i as u32,
+                    reason: "element ts out of (0, 0x4000] (resume)",
+                });
+            }
+            if ts_be as u32 != p.element_sizes[i] {
+                return Err(MfcReplayError::GetlDescriptorElementInvalid {
+                    index: i as u32,
+                    reason: "descriptor ts disagrees with element_sizes (resume)",
+                });
+            }
+            if ea_be != p.element_eals[i] {
+                return Err(MfcReplayError::GetlDescriptorElementInvalid {
+                    index: i as u32,
+                    reason: "descriptor ea disagrees with element_eals (resume)",
+                });
+            }
+
+            let lsa_end = cumulative_lsa
+                .checked_add(ts_be as u32)
+                .ok_or(MfcReplayError::GetlDestinationOutOfRange {
+                    lsa_base: p.event_lsa,
+                    cumulative_size: cumulative_sum.saturating_add(ts_be as u32),
+                })?;
+            if lsa_end as usize > SPU_LS_SIZE {
+                return Err(MfcReplayError::GetlDestinationOutOfRange {
+                    lsa_base: p.event_lsa,
+                    cumulative_size: cumulative_sum + ts_be as u32,
+                });
+            }
+
+            let chunk_bytes = resolve_dma_chunk_side_file(
+                &self.trace_path,
+                &self.canonical_dma_dir,
+                &p.element_chunks[i],
+                Some(ts_be as usize),
+            )
+            .map_err(MfcReplayError::DmaChunkLoad)?;
+            debug_assert_eq!(chunk_bytes.len(), ts_be as usize);
+
+            if !p.is_putl {
+                let lo = cumulative_lsa as usize;
+                let hi = lsa_end as usize;
+                ls[lo..hi].copy_from_slice(&chunk_bytes);
+            }
+            let _ = chunk_bytes;
+
+            cumulative_lsa = lsa_end;
+            cumulative_sum = cumulative_sum.saturating_add(ts_be as u32);
+
+            if sb & 0x80 != 0 {
+                stalled_at = Some(i);
+                break;
+            }
+        }
+
+        if let Some(stalled_index) = stalled_at {
+            // Hit another stall during resume. Update partial
+            // (next_index advances), set list_stall_mask again
+            // (the SPU will read ch25 again, ack again, etc.).
+            p.next_element_index = stalled_index + 1;
+            p.cumulative_lsa = cumulative_lsa;
+            p.cumulative_sum = cumulative_sum;
+            self.list_stall_mask |= 1u32.rotate_left(p.tag);
+            self.partial_list_dma = Some(p);
+            return Ok(());
+        }
+
+        // Resume reached the end without another stall — the
+        // list-DMA is finally complete. Register in-flight; the
+        // matching mfc_dma_complete event will promote it.
+        let ea = ((p.event_eah as u64) << 32) | (p.event_eal as u64);
+        self.in_flight.insert(
+            p.tag,
+            MfcInFlight {
+                cmd: p.cmd,
+                size: cumulative_sum,
+                lsa: p.event_lsa,
+                ea,
+                chunk_sha256: p.descriptor_sha256.clone(),
+            },
+        );
+        // partial_list_dma already taken; drop p here.
+        let _ = p;
+        Ok(())
+    }
+
     /// Process a captured `mfc_dma_complete` event. Validates that the
     /// tag is in flight and that `transferred_bytes` matches the
     /// dispatched `size`, then promotes the tag to completed.
+    ///
+    /// R8.5c — if the replay state machine has a pending stalled
+    /// list-DMA in [`Self::partial_list_dma`], a completion event
+    /// is premature per the Cell BE list-DMA atomic-completion
+    /// contract — the list cannot complete while still stalled
+    /// mid-walk. Returns [`MfcReplayError::MfcDmaCompleteWhileStalled`]
+    /// without mutating state so the caller can surface the
+    /// trace/state ordering bug.
     pub fn process_mfc_dma_complete(
         &mut self,
         event: &MfcDmaCompleteEvent,
     ) -> Result<(), MfcReplayError> {
         if event.tag > MFC_TAG_MAX {
             return Err(MfcReplayError::BadMfcTag { tag: event.tag });
+        }
+
+        // R8.5c — refuse completion while any list is mid-stall.
+        // Cell BE list-DMA completion is atomic; per spec § 12.5
+        // the tag-stat fires only after ALL stalls are ack'd and
+        // the list fully drains.
+        if self.partial_list_dma.is_some() {
+            return Err(MfcReplayError::MfcDmaCompleteWhileStalled {
+                tag: event.tag,
+            });
         }
 
         let in_flight = self
@@ -1369,13 +1757,28 @@ pub fn apply_mfc_dma_pre_replay(
                 debug_assert_eq!(oracle, captured_value);
                 tag_stat_queue.push_back(captured_value);
             }
+            // R8.5c — Schema A: ch25 `MFC_RdListStallStat` reads
+            // and ch26 `MFC_WrListStallAck` writes appear as
+            // ordinary spu_rdch / spu_wrch events in the trace
+            // (no new EventKind). Route them to the state
+            // machine's stall-handshake methods. The ch26 ack
+            // may resume a stalled list-DMA's descriptor walk —
+            // hence `&mut ls` is passed (GETL family copies
+            // remaining elements into LS).
+            CapturedEvent::SpuRdch(r) if r.channel == 25 => {
+                let captured_value = r.value.unwrap_or(0);
+                state.process_spu_rdch_list_stall_stat(captured_value)?;
+            }
+            CapturedEvent::SpuWrch(w) if w.channel == 26 => {
+                state.process_spu_wrch_list_stall_ack(w.value, &mut ls)?;
+            }
             _ => {
                 // Other captured events (PPU push/pop, SNR signals,
                 // park/wake/stop/final_state, spu_image, non-MFC
-                // wrches, non-ch24 rdches) are NOT consumed here —
-                // they pass through to the trace transformer's
-                // existing path. The pre-replay plan only handles
-                // the MFC subset.
+                // wrches, non-ch24/25/26 rdches) are NOT consumed
+                // here — they pass through to the trace
+                // transformer's existing path. The pre-replay plan
+                // only handles the MFC subset.
             }
         }
     }
@@ -2138,5 +2541,502 @@ mod tests {
         let r10 = result.final_state.gpr[10];
         let r10_lane0 = (r10 >> 96) as u32;
         assert_eq!(r10_lane0, mask, "r10 must hold the popped tag-stat value");
+    }
+
+    // ====================================================================
+    // R8.5c — list-DMA stall-and-notify handshake tests.
+    //
+    // These exercise the replay state machine handshake landed in R8.5c
+    // WITHOUT a real CC0 fixture. Each test builds a synthetic descriptor
+    // (one or more elements, some carrying sb&0x80), writes side-files to
+    // a per-test tempdir, drives the state machine methods directly
+    // (process_mfc_list_cmd → process_spu_rdch_list_stall_stat →
+    // process_spu_wrch_list_stall_ack → process_mfc_dma_complete), and
+    // asserts the post-condition (LS contents, list_stall_mask, partial
+    // state, completed_tags).
+    // ====================================================================
+
+    /// Build a list-DMA descriptor (N * 8 bytes BE) from per-element
+    /// (sb, ts, ea) tuples. Layout per Cell BE / RPCS3
+    /// `SPUThread.cpp:2798-2804`:
+    ///   [0]: sb (u8 — bit 0x80 = stall-and-notify)
+    ///   [1]: pad (u8 = 0)
+    ///   [2..3]: ts (BE u16)
+    ///   [4..7]: ea (BE u32)
+    fn build_descriptor(elements: &[(u8, u16, u32)]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(elements.len() * 8);
+        for &(sb, ts, ea) in elements {
+            bytes.push(sb);
+            bytes.push(0); // pad
+            bytes.extend_from_slice(&ts.to_be_bytes());
+            bytes.extend_from_slice(&ea.to_be_bytes());
+        }
+        bytes
+    }
+
+    /// SHA-256 lowercase hex of a byte slice.
+    fn descriptor_sha(bytes: &[u8]) -> String {
+        let mut h = Sha256::new();
+        h.update(bytes);
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Write `bytes` to `<tmp>/<trace_name>.dma/<sha>.dmalistdesc`,
+    /// returning the resolved trace_path + canonical_dir (mirror of
+    /// `setup_per_trace_chunk` for descriptor side-files).
+    fn setup_per_trace_listdesc(
+        tmp: &TempDir,
+        trace_name: &str,
+        sha: &str,
+        bytes: &[u8],
+    ) -> (PathBuf, PathBuf) {
+        let trace_path = tmp.path().join(trace_name);
+        let mut dir_str = trace_path.as_os_str().to_owned();
+        dir_str.push(".dma");
+        let dma_dir = PathBuf::from(dir_str);
+        std::fs::create_dir_all(&dma_dir).unwrap();
+        let listdesc_path = dma_dir.join(format!("{sha}.dmalistdesc"));
+        std::fs::write(&listdesc_path, bytes).unwrap();
+        let canonical = tmp.path().join("canonical_dma");
+        std::fs::create_dir_all(&canonical).unwrap();
+        (trace_path, canonical)
+    }
+
+    /// Helper: configure the MfcReplayState's pending packet via the
+    /// canonical wrch ch16-20 sequence. The caller has already set
+    /// `event_lsa` / `event_size` etc.; this just drives the
+    /// state.pending state into a complete shape so
+    /// `process_mfc_list_cmd` doesn't error on the pending cross-check.
+    fn arm_pending_for_list_cmd(
+        state: &mut MfcReplayState,
+        lsa: u32,
+        eal: u32,
+        size: u32,
+        tag: u32,
+    ) {
+        state.process_wrch(ch::MFC_LSA, lsa).unwrap();
+        state.process_wrch(ch::MFC_EAH, 0).unwrap();
+        state.process_wrch(ch::MFC_EAL, eal).unwrap();
+        state.process_wrch(ch::MFC_SIZE, size).unwrap();
+        state.process_wrch(ch::MFC_TAG_ID, tag).unwrap();
+        // ch21 wrch arms awaiting_mfc_cmd_event for GETL (cmd 0x44).
+        state.process_wrch(ch::MFC_CMD, 0x44).unwrap();
+    }
+
+    /// R8.5c happy path — single stall, single ack. Descriptor has
+    /// 3 elements where element 1 carries `sb & 0x80`. Verifies:
+    ///   - process_mfc_list_cmd dispatches: copies E0 + E1 into LS;
+    ///     E2 NOT copied; partial saved with next_index=2;
+    ///     list_stall_mask = 1<<tag.
+    ///   - process_spu_rdch_list_stall_stat consumes the mask;
+    ///     register cleared.
+    ///   - process_spu_wrch_list_stall_ack resumes: copies E2;
+    ///     partial cleared; in_flight inserted.
+    ///   - process_mfc_dma_complete promotes; completed_tags set.
+    #[test]
+    fn replay_stall_then_ack_resumes_descriptor_walk() {
+        let tmp = TempDir::new().unwrap();
+        // E0: 64 B counting (no stall). E1: 32 B counting (sb=0x80).
+        // E2: 16 B counting (no stall).
+        let (e0_bytes, e0_sha) = synthetic_chunk(64);
+        let (e1_bytes, e1_sha) = synthetic_chunk(32);
+        let (e2_bytes, e2_sha) = synthetic_chunk(16);
+        // Descriptor: sb=0 for E0; sb=0x80 for E1; sb=0 for E2.
+        let desc_bytes = build_descriptor(&[
+            (0x00, 64, 0xD0001000),
+            (0x80, 32, 0xD0002000),
+            (0x00, 16, 0xD0003000),
+        ]);
+        let desc_sha = descriptor_sha(&desc_bytes);
+
+        // Per-trace pool: descriptor + 3 element chunks.
+        let (trace_path, canonical) =
+            setup_per_trace_listdesc(&tmp, "stall_handshake.jsonl", &desc_sha, &desc_bytes);
+        for (sha, bytes) in
+            [(&e0_sha, &e0_bytes), (&e1_sha, &e1_bytes), (&e2_sha, &e2_bytes)]
+        {
+            let chunk_path = trace_path.with_extension("jsonl.dma").join(format!("{sha}.dmachunk"));
+            // The `.with_extension(.."jsonl.dma")` trick doesn't compose
+            // cleanly when the original path already ends in .jsonl;
+            // explicit dir join keeps the layout matching
+            // `setup_per_trace_chunk`.
+            let mut dir_str = trace_path.as_os_str().to_owned();
+            dir_str.push(".dma");
+            let dir = PathBuf::from(dir_str);
+            let chunk_path = dir.join(format!("{sha}.dmachunk"));
+            std::fs::write(&chunk_path, bytes).unwrap();
+        }
+
+        let mut state = MfcReplayState::new(&trace_path, &canonical);
+        let mut ls = vec![0u8; SPU_LS_SIZE];
+
+        // Dispatch: arm pending + process_mfc_list_cmd.
+        let lsa_base = 0x10000u32;
+        let event_size = 24u32; // 3 * 8
+        let tag = 3u32;
+        let eal = 0x800u32; // descriptor LSA (just a synthetic offset)
+        arm_pending_for_list_cmd(&mut state, lsa_base, eal, event_size, tag);
+
+        let event = SpuMfcCmdEvent {
+            seq: 100, side: CapturedSide::Spu, target_spu: 0, pc: 256,
+            cmd: 0x44, tag, size: event_size, lsa: lsa_base, eah: 0, eal,
+            ea_chunk_sha256: desc_sha.clone(),
+            descriptor_sha256: Some(desc_sha.clone()),
+            descriptor_size: Some(event_size),
+            element_chunks: Some(vec![e0_sha.clone(), e1_sha.clone(), e2_sha.clone()]),
+            element_sizes: Some(vec![64, 32, 16]),
+            element_eals: Some(vec![0xD0001000, 0xD0002000, 0xD0003000]),
+        };
+        state.process_mfc_list_cmd(&event, &mut ls).expect("dispatch ok");
+
+        // Post-dispatch: E0 + E1 in LS, E2 untouched.
+        assert_eq!(&ls[0x10000..0x10040], &e0_bytes[..], "E0 copied");
+        assert_eq!(&ls[0x10040..0x10060], &e1_bytes[..], "E1 copied BEFORE stall");
+        assert_eq!(&ls[0x10060..0x10070], &[0u8; 16][..], "E2 NOT yet copied");
+        // Partial saved with next_index = 2.
+        let p = state.partial_list_dma().expect("partial saved");
+        assert_eq!(p.tag, tag);
+        assert_eq!(p.next_element_index, 2);
+        assert_eq!(p.cumulative_sum, 64 + 32);
+        // list_stall_mask set to 1 << tag.
+        assert_eq!(state.list_stall_mask(), 1u32 << tag);
+        // in_flight NOT yet populated (waiting for full completion).
+        assert!(state.in_flight.is_empty());
+
+        // ch25 read: captured == mask, mask cleared on success.
+        let mask_value = state
+            .process_spu_rdch_list_stall_stat(1u32 << tag)
+            .expect("ch25 ok");
+        assert_eq!(mask_value, 1u32 << tag);
+        assert_eq!(state.list_stall_mask(), 0, "ch25 destructive read");
+
+        // ch26 ack: resume walk, copy E2, complete.
+        state.process_spu_wrch_list_stall_ack(tag, &mut ls).expect("ack resumes");
+        assert_eq!(&ls[0x10060..0x10070], &e2_bytes[..], "E2 copied after ack");
+        assert_eq!(&ls[0x10040..0x10060], &e1_bytes[..], "E1 NOT re-touched");
+        // Partial cleared; in_flight populated with cumulative_sum.
+        assert!(state.partial_list_dma().is_none(), "partial cleared on full completion");
+        assert!(state.in_flight.contains_key(&tag), "in_flight inserted");
+        assert_eq!(state.in_flight[&tag].size, 64 + 32 + 16);
+
+        // Final: mfc_dma_complete promotes the tag.
+        let complete = make_dma_complete_event(0, tag, 64 + 32 + 16);
+        state.process_mfc_dma_complete(&complete).expect("complete ok");
+        assert_eq!(state.completed_tags() & (1u32 << tag), 1u32 << tag);
+    }
+
+    /// R8.5c — explicit test of the Cell BE invariant: the stalled
+    /// element IS transferred BEFORE the stall is raised, and the
+    /// ack handler does NOT re-transfer it. Uses a sentinel pattern
+    /// in LS to detect any double-copy.
+    #[test]
+    fn stalled_element_copied_before_stall_not_twice() {
+        let tmp = TempDir::new().unwrap();
+        // E0: no stall. E1: stalled. Two elements, predictable bytes.
+        let (e0_bytes, e0_sha) = synthetic_chunk(32);
+        let (e1_bytes, e1_sha) = synthetic_chunk(16);
+        let desc_bytes = build_descriptor(&[
+            (0x00, 32, 0xD0001000),
+            (0x80, 16, 0xD0002000),
+        ]);
+        let desc_sha = descriptor_sha(&desc_bytes);
+        let (trace_path, canonical) = setup_per_trace_listdesc(
+            &tmp, "single_stall.jsonl", &desc_sha, &desc_bytes,
+        );
+        let mut dir_str = trace_path.as_os_str().to_owned();
+        dir_str.push(".dma");
+        let dma_dir = PathBuf::from(dir_str);
+        std::fs::write(dma_dir.join(format!("{e0_sha}.dmachunk")), &e0_bytes).unwrap();
+        std::fs::write(dma_dir.join(format!("{e1_sha}.dmachunk")), &e1_bytes).unwrap();
+
+        let mut state = MfcReplayState::new(&trace_path, &canonical);
+        let mut ls = vec![0u8; SPU_LS_SIZE];
+        let lsa_base = 0x10000u32;
+        let tag = 5u32;
+        arm_pending_for_list_cmd(&mut state, lsa_base, 0x800, 16, tag);
+
+        let event = SpuMfcCmdEvent {
+            seq: 100, side: CapturedSide::Spu, target_spu: 0, pc: 256,
+            cmd: 0x44, tag, size: 16, lsa: lsa_base, eah: 0, eal: 0x800,
+            ea_chunk_sha256: desc_sha.clone(),
+            descriptor_sha256: Some(desc_sha),
+            descriptor_size: Some(16),
+            element_chunks: Some(vec![e0_sha, e1_sha]),
+            element_sizes: Some(vec![32, 16]),
+            element_eals: Some(vec![0xD0001000, 0xD0002000]),
+        };
+        state.process_mfc_list_cmd(&event, &mut ls).expect("dispatch ok");
+
+        // Capture LS state at dispatch time.
+        let post_dispatch_e1_bytes: Vec<u8> = ls[0x10020..0x10030].to_vec();
+        assert_eq!(post_dispatch_e1_bytes, e1_bytes,
+            "stalled element E1 must be IN LS post-dispatch (Cell BE: transfer-then-stall)");
+
+        // SENTINEL: overwrite E1's LS region with garbage to detect
+        // if the ack handler accidentally re-copies E1's chunk.
+        for b in ls[0x10020..0x10030].iter_mut() {
+            *b = 0xAA;
+        }
+
+        // ch25 + ch26: ack the stall.
+        state.process_spu_rdch_list_stall_stat(1u32 << tag).unwrap();
+        state.process_spu_wrch_list_stall_ack(tag, &mut ls).expect("ack ok");
+
+        // Critical invariant: E1's LS region still holds the SENTINEL
+        // (0xAA), proving the ack handler did NOT re-transfer E1.
+        // The ack should have started at next_index = 1 + 1 = 2,
+        // which is BEYOND the descriptor end (only 2 elements) →
+        // empty resume body → no LS writes.
+        let post_ack_e1_bytes: &[u8] = &ls[0x10020..0x10030];
+        assert_eq!(post_ack_e1_bytes, &[0xAA; 16][..],
+            "stalled element E1 must NOT be re-copied by ack — \
+             sentinel 0xAA preserved");
+    }
+
+    /// R8.5c — multi-stall descriptor: 4 elements, both E1 and E2
+    /// carry sb=0x80. Verifies two stall+ack cycles, single dispatch
+    /// event, single mfc_dma_complete event.
+    #[test]
+    fn replay_multi_stall_descriptor_handshakes_both() {
+        let tmp = TempDir::new().unwrap();
+        let (e0_bytes, e0_sha) = synthetic_chunk(32);
+        let (e1_bytes, e1_sha) = synthetic_chunk(16);
+        let (e2_bytes, e2_sha) = synthetic_chunk(64);
+        let (e3_bytes, e3_sha) = synthetic_chunk(48);
+        let desc_bytes = build_descriptor(&[
+            (0x00, 32, 0xD0001000),
+            (0x80, 16, 0xD0002000), // first stall after E1
+            (0x80, 64, 0xD0003000), // second stall after E2
+            (0x00, 48, 0xD0004000),
+        ]);
+        let desc_sha = descriptor_sha(&desc_bytes);
+        let (trace_path, canonical) = setup_per_trace_listdesc(
+            &tmp, "multi_stall.jsonl", &desc_sha, &desc_bytes,
+        );
+        let mut dir_str = trace_path.as_os_str().to_owned();
+        dir_str.push(".dma");
+        let dma_dir = PathBuf::from(dir_str);
+        for (sha, bytes) in
+            [(&e0_sha, &e0_bytes), (&e1_sha, &e1_bytes), (&e2_sha, &e2_bytes), (&e3_sha, &e3_bytes)]
+        {
+            std::fs::write(dma_dir.join(format!("{sha}.dmachunk")), bytes).unwrap();
+        }
+
+        let mut state = MfcReplayState::new(&trace_path, &canonical);
+        let mut ls = vec![0u8; SPU_LS_SIZE];
+        let lsa_base = 0x10000u32;
+        let tag = 7u32;
+        arm_pending_for_list_cmd(&mut state, lsa_base, 0x800, 32, tag);
+
+        let event = SpuMfcCmdEvent {
+            seq: 100, side: CapturedSide::Spu, target_spu: 0, pc: 256,
+            cmd: 0x44, tag, size: 32, lsa: lsa_base, eah: 0, eal: 0x800,
+            ea_chunk_sha256: desc_sha.clone(),
+            descriptor_sha256: Some(desc_sha),
+            descriptor_size: Some(32),
+            element_chunks: Some(vec![e0_sha, e1_sha, e2_sha, e3_sha]),
+            element_sizes: Some(vec![32, 16, 64, 48]),
+            element_eals: Some(vec![0xD0001000, 0xD0002000, 0xD0003000, 0xD0004000]),
+        };
+        state.process_mfc_list_cmd(&event, &mut ls).expect("dispatch ok");
+
+        // After dispatch: E0 + E1 copied, stall at E1.
+        assert_eq!(state.partial_list_dma().unwrap().next_element_index, 2);
+        assert_eq!(state.list_stall_mask(), 1u32 << tag);
+        assert!(state.in_flight.is_empty());
+
+        // First handshake.
+        state.process_spu_rdch_list_stall_stat(1u32 << tag).unwrap();
+        state.process_spu_wrch_list_stall_ack(tag, &mut ls).unwrap();
+
+        // After first ack: E2 should be copied, stall again at E2.
+        assert!(state.partial_list_dma().is_some(), "second stall pending");
+        assert_eq!(state.partial_list_dma().unwrap().next_element_index, 3);
+        assert_eq!(state.list_stall_mask(), 1u32 << tag, "stall re-raised");
+        assert!(state.in_flight.is_empty(), "still not complete");
+        // E0 + E1 + E2 all in LS now; E3 not yet.
+        assert_eq!(&ls[0x10000..0x10020], &e0_bytes[..]);
+        assert_eq!(&ls[0x10020..0x10030], &e1_bytes[..]);
+        assert_eq!(&ls[0x10030..0x10070], &e2_bytes[..]);
+
+        // Second handshake.
+        state.process_spu_rdch_list_stall_stat(1u32 << tag).unwrap();
+        state.process_spu_wrch_list_stall_ack(tag, &mut ls).unwrap();
+
+        // After second ack: full completion. E3 copied; partial cleared.
+        assert!(state.partial_list_dma().is_none());
+        assert_eq!(state.list_stall_mask(), 0);
+        assert!(state.in_flight.contains_key(&tag));
+        assert_eq!(&ls[0x10070..0x100A0], &e3_bytes[..]);
+        assert_eq!(state.in_flight[&tag].size, 32 + 16 + 64 + 48);
+
+        // mfc_dma_complete with total bytes.
+        let complete = make_dma_complete_event(0, tag, 32 + 16 + 64 + 48);
+        state.process_mfc_dma_complete(&complete).expect("complete ok");
+        assert_eq!(state.completed_tags() & (1u32 << tag), 1u32 << tag);
+    }
+
+    /// R8.5c — ch26 ack with wrong tag returns StallAckTagMismatch.
+    #[test]
+    fn replay_stall_with_wrong_ack_tag_errors() {
+        let tmp = TempDir::new().unwrap();
+        let (e0_bytes, e0_sha) = synthetic_chunk(16);
+        let desc_bytes = build_descriptor(&[(0x80, 16, 0xD0001000)]);
+        let desc_sha = descriptor_sha(&desc_bytes);
+        let (trace_path, canonical) =
+            setup_per_trace_listdesc(&tmp, "wrong_ack.jsonl", &desc_sha, &desc_bytes);
+        let mut dir_str = trace_path.as_os_str().to_owned();
+        dir_str.push(".dma");
+        let dma_dir = PathBuf::from(dir_str);
+        std::fs::write(dma_dir.join(format!("{e0_sha}.dmachunk")), &e0_bytes).unwrap();
+
+        let mut state = MfcReplayState::new(&trace_path, &canonical);
+        let mut ls = vec![0u8; SPU_LS_SIZE];
+        let tag = 3u32;
+        arm_pending_for_list_cmd(&mut state, 0x10000, 0x800, 8, tag);
+        let event = SpuMfcCmdEvent {
+            seq: 100, side: CapturedSide::Spu, target_spu: 0, pc: 256,
+            cmd: 0x44, tag, size: 8, lsa: 0x10000, eah: 0, eal: 0x800,
+            ea_chunk_sha256: desc_sha.clone(),
+            descriptor_sha256: Some(desc_sha),
+            descriptor_size: Some(8),
+            element_chunks: Some(vec![e0_sha]),
+            element_sizes: Some(vec![16]),
+            element_eals: Some(vec![0xD0001000]),
+        };
+        state.process_mfc_list_cmd(&event, &mut ls).expect("dispatch stalled");
+        state.process_spu_rdch_list_stall_stat(1u32 << tag).unwrap();
+
+        // Ack with wrong tag (5 instead of 3).
+        let wrong_tag = 5u32;
+        let err = state
+            .process_spu_wrch_list_stall_ack(wrong_tag, &mut ls)
+            .expect_err("wrong tag must error");
+        match err {
+            MfcReplayError::StallAckTagMismatch { expected_tag, captured_tag } => {
+                assert_eq!(expected_tag, tag);
+                assert_eq!(captured_tag, wrong_tag);
+            }
+            other => panic!("expected StallAckTagMismatch, got {other:?}"),
+        }
+        // State preserved: partial still pending.
+        assert!(state.partial_list_dma().is_some(), "partial preserved on bad ack");
+    }
+
+    /// R8.5c — ch26 ack with NO pending stall returns
+    /// StallAckWithoutPendingStall.
+    #[test]
+    fn replay_ack_without_pending_stall_errors() {
+        let tmp = TempDir::new().unwrap();
+        let trace_path = tmp.path().join("no_pending.jsonl");
+        let canonical = tmp.path().join("canonical_dma");
+        std::fs::create_dir_all(&canonical).unwrap();
+        let mut state = MfcReplayState::new(&trace_path, &canonical);
+        let mut ls = vec![0u8; SPU_LS_SIZE];
+        let tag = 4u32;
+
+        let err = state
+            .process_spu_wrch_list_stall_ack(tag, &mut ls)
+            .expect_err("no pending must error");
+        match err {
+            MfcReplayError::StallAckWithoutPendingStall { tag: t } => {
+                assert_eq!(t, tag);
+            }
+            other => panic!("expected StallAckWithoutPendingStall, got {other:?}"),
+        }
+    }
+
+    /// R8.5c — mfc_dma_complete while partial_list_dma is Some
+    /// returns MfcDmaCompleteWhileStalled.
+    #[test]
+    fn replay_unresolved_stall_at_end_errors() {
+        let tmp = TempDir::new().unwrap();
+        let (e0_bytes, e0_sha) = synthetic_chunk(16);
+        let desc_bytes = build_descriptor(&[(0x80, 16, 0xD0001000)]);
+        let desc_sha = descriptor_sha(&desc_bytes);
+        let (trace_path, canonical) =
+            setup_per_trace_listdesc(&tmp, "unresolved.jsonl", &desc_sha, &desc_bytes);
+        let mut dir_str = trace_path.as_os_str().to_owned();
+        dir_str.push(".dma");
+        let dma_dir = PathBuf::from(dir_str);
+        std::fs::write(dma_dir.join(format!("{e0_sha}.dmachunk")), &e0_bytes).unwrap();
+
+        let mut state = MfcReplayState::new(&trace_path, &canonical);
+        let mut ls = vec![0u8; SPU_LS_SIZE];
+        let tag = 2u32;
+        arm_pending_for_list_cmd(&mut state, 0x10000, 0x800, 8, tag);
+        let event = SpuMfcCmdEvent {
+            seq: 100, side: CapturedSide::Spu, target_spu: 0, pc: 256,
+            cmd: 0x44, tag, size: 8, lsa: 0x10000, eah: 0, eal: 0x800,
+            ea_chunk_sha256: desc_sha.clone(),
+            descriptor_sha256: Some(desc_sha),
+            descriptor_size: Some(8),
+            element_chunks: Some(vec![e0_sha]),
+            element_sizes: Some(vec![16]),
+            element_eals: Some(vec![0xD0001000]),
+        };
+        state.process_mfc_list_cmd(&event, &mut ls).expect("dispatch stalled");
+        // partial_list_dma is Some here.
+
+        // Premature mfc_dma_complete arrives → error.
+        let complete = make_dma_complete_event(0, tag, 16);
+        let err = state
+            .process_mfc_dma_complete(&complete)
+            .expect_err("premature complete must error");
+        match err {
+            MfcReplayError::MfcDmaCompleteWhileStalled { tag: t } => {
+                assert_eq!(t, tag);
+            }
+            other => panic!("expected MfcDmaCompleteWhileStalled, got {other:?}"),
+        }
+        // State preserved.
+        assert!(state.partial_list_dma().is_some());
+    }
+
+    /// R8.5c — ch25 read with wrong captured value returns
+    /// StallStatValueMismatch and does NOT mutate state.
+    #[test]
+    fn replay_stall_stat_value_mismatch_preserves_state() {
+        let tmp = TempDir::new().unwrap();
+        let (e0_bytes, e0_sha) = synthetic_chunk(16);
+        let desc_bytes = build_descriptor(&[(0x80, 16, 0xD0001000)]);
+        let desc_sha = descriptor_sha(&desc_bytes);
+        let (trace_path, canonical) =
+            setup_per_trace_listdesc(&tmp, "stat_mismatch.jsonl", &desc_sha, &desc_bytes);
+        let mut dir_str = trace_path.as_os_str().to_owned();
+        dir_str.push(".dma");
+        let dma_dir = PathBuf::from(dir_str);
+        std::fs::write(dma_dir.join(format!("{e0_sha}.dmachunk")), &e0_bytes).unwrap();
+
+        let mut state = MfcReplayState::new(&trace_path, &canonical);
+        let mut ls = vec![0u8; SPU_LS_SIZE];
+        let tag = 4u32;
+        arm_pending_for_list_cmd(&mut state, 0x10000, 0x800, 8, tag);
+        let event = SpuMfcCmdEvent {
+            seq: 100, side: CapturedSide::Spu, target_spu: 0, pc: 256,
+            cmd: 0x44, tag, size: 8, lsa: 0x10000, eah: 0, eal: 0x800,
+            ea_chunk_sha256: desc_sha.clone(),
+            descriptor_sha256: Some(desc_sha),
+            descriptor_size: Some(8),
+            element_chunks: Some(vec![e0_sha]),
+            element_sizes: Some(vec![16]),
+            element_eals: Some(vec![0xD0001000]),
+        };
+        state.process_mfc_list_cmd(&event, &mut ls).expect("dispatch stalled");
+
+        // Captured value 0xDEADBEEF doesn't match expected (1<<4 = 0x10).
+        let err = state
+            .process_spu_rdch_list_stall_stat(0xDEADBEEF)
+            .expect_err("mismatch must error");
+        match err {
+            MfcReplayError::StallStatValueMismatch { expected, captured } => {
+                assert_eq!(expected, 1u32 << tag);
+                assert_eq!(captured, 0xDEADBEEF);
+            }
+            other => panic!("expected StallStatValueMismatch, got {other:?}"),
+        }
+        // State preserved: list_stall_mask still set, partial still pending.
+        assert_eq!(state.list_stall_mask(), 1u32 << tag, "mask not cleared on mismatch");
+        assert!(state.partial_list_dma().is_some(), "partial preserved");
     }
 }
