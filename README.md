@@ -170,10 +170,11 @@ cargo test -p rpcs3-io-dimensions --lib
 ## Documentação
 
 - [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) — **Status autoritativo atual** (testes verificados localmente, R4a/R4b/R4c done, próxima fase recomendada).
-- [`behavior-freeze/docs/INVENTORY.md`](behavior-freeze/docs/INVENTORY.md) — Inventário P0/P1/P2 (estável, fatos por crate).
-- [`behavior-freeze/docs/HOMEBREW_PLAN.md`](behavior-freeze/docs/HOMEBREW_PLAN.md) — Plano para validação diferencial vs RPCS3 com homebrew real (P1+P5 ainda bloqueados).
-- [`historico/pre-r4b-2026-04-25/`](historico/pre-r4b-2026-04-25/) — Snapshots históricos completos dos docs antes da limpeza. Inclui `CURRENT_STATE.md`, `CHECKLIST.md`, `ROADMAP.md`, `PORT_PLAN.md`, `AUTONOMOUS_LOG.md` (versão completa com 230+ iters), `SPU_RECOMPILER_PLAN.md`, frozen snapshots `*_2026-04-24.md`, e arquivos `.bak` originais.
-- `behavior-freeze/docs/AUTONOMOUS_LOG.md` e `behavior-freeze/docs/SPU_RECOMPILER_PLAN.md` — mantidos no caminho original como stubs porque hook do Claude Code (Stop/SessionStart) e doc-comment do Rust source (`rust/rpcs3-spu-recompiler/src/lib.rs`) dependem do path exato. Conteúdo completo está em `historico/`.
+- [`docs/history/INVENTORY.md`](docs/history/INVENTORY.md) — Inventário P0/P1/P2 (estável, fatos por crate; movido de `behavior-freeze/docs/` em 2026-05-22).
+- [`docs/history/HOMEBREW_PLAN.md`](docs/history/HOMEBREW_PLAN.md) — Plano para validação diferencial vs RPCS3 com homebrew real (movido de `behavior-freeze/docs/` em 2026-05-22).
+- [`docs/history/`](docs/history/) — Single archive location para docs point-in-time / pre-R6 / stubs redirecionando para `PROJECT_STATUS.md`. Inclui R5 archive + os 5 ex-`behavior-freeze/docs/` stubs (`BACKLOG_RESIDUAL`, `DECISIONS`, `DEFERRED`, `HOMEBREW_PLAN`, `INVENTORY`).
+- [`historico/pre-r4b-2026-04-25/`](historico/pre-r4b-2026-04-25/) — Snapshots históricos completos pré-R4b. Inclui `CURRENT_STATE.md`, `CHECKLIST.md`, `ROADMAP.md`, `PORT_PLAN.md`, `AUTONOMOUS_LOG.md` (versão completa com 230+ iters), `SPU_RECOMPILER_PLAN.md`, frozen snapshots `*_2026-04-24.md`, e arquivos `.bak` originais.
+- `behavior-freeze/docs/AUTONOMOUS_LOG.md` e `behavior-freeze/docs/SPU_RECOMPILER_PLAN.md` — mantidos no caminho original como stubs porque hook do Claude Code (Stop/SessionStart) e doc-comment do Rust source (`rust/rpcs3-spu-recompiler/src/lib.rs`) dependem do path exato. Conteúdo completo está em `historico/`. Ver [`behavior-freeze/docs/README.md`](behavior-freeze/docs/README.md) para detalhes.
 
 ## Licença
 

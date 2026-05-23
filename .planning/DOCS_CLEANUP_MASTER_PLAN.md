@@ -101,7 +101,7 @@ during R8.5b debugging.
 - `docs/SPU_DMA_MFC_R6_7_DESIGN.md` (working tree) — § 19 closure marker + § 20 all verified
 - `behavior-freeze/fixtures/spu/traces/README.md` (working tree) — item 5 all 8 cmd codes verified
 - 16 of 18 `.notes.md` (mailbox, branch_loop, signal, loadstore, mailbox_multi, game_like, dma_get, dma_get_multi, dma_get_any, dma_tag_poll, dma_tag_immediate, dma_getl, dma_putl, dma_getlf, dma_putlb, dma_putlf)
-- `behavior-freeze/docs/*.md` (INVENTORY, DECISIONS, DEFERRED, BACKLOG_RESIDUAL, HOMEBREW_PLAN, SPU_RECOMPILER_PLAN, AUTONOMOUS_LOG) — all carry explicit point-in-time disclaimers + cross-ref live PROJECT_STATUS
+- The legacy `behavior-freeze/docs/` stubs (INVENTORY, DECISIONS, DEFERRED, BACKLOG_RESIDUAL, HOMEBREW_PLAN) — all carry explicit point-in-time disclaimers + cross-ref live PROJECT_STATUS. **Moved 2026-05-22 to `docs/history/`** as part of the Option B consolidation; only path-locked `behavior-freeze/docs/AUTONOMOUS_LOG.md` (Claude Code hooks) and `behavior-freeze/docs/SPU_RECOMPILER_PLAN.md` (Rust doc-comment in `rust/rpcs3-spu-recompiler/src/lib.rs`) remain at the original path. See `behavior-freeze/docs/README.md`.
 - `docs/history/PROJECT_STATUS_R5_ARCHIVE.md` — clear archive marker, properly back-referenced
 - `historico/pre-r4b-2026-04-25/*` — clear "🧊 FROZEN BASELINE" banners, only `.md` + `.md.bak` (no large binaries)
 - `docs/patches/*.patch` — all 3 SHAs match pinned values exactly
@@ -182,7 +182,9 @@ Commit message must:
 If the conversation gets compacted or the session restarts before fixes
 are applied:
 
-1. Read this file (`behavior-freeze/docs/DOCS_AUDIT_2026_05_22.md`)
+1. Read this file (`.planning/DOCS_CLEANUP_MASTER_PLAN.md` — moved here
+   on 2026-05-22 from `behavior-freeze/docs/DOCS_AUDIT_2026_05_22.md`
+   as part of the Option B docs consolidation)
 2. Read memory `project_docs_audit_2026_05_22.md` (if step 5 above
    was approved)
 3. Resume from Stage 1 by applying the 5 P0 edits listed above

@@ -106,9 +106,10 @@ list-DMA directions.
 
 ## Build
 
-Requires the PSL1GHT toolchain (see `behavior-freeze/docs/HOMEBREW_PLAN.md`
-or the `rpcs3-ps3dev-toolchain:local` Docker image). From this
-directory:
+Requires the PSL1GHT toolchain (see `docs/history/HOMEBREW_PLAN.md`,
+moved from `behavior-freeze/docs/` in the 2026-05-22 docs
+consolidation, or the `rpcs3-ps3dev-toolchain:local` Docker image).
+From this directory:
 
 ```sh
 source /etc/profile.d/ps3dev.sh

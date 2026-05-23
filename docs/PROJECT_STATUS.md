@@ -661,8 +661,9 @@ These items are **not** part of R6 closure and are not active workstreams:
   for header / signature parity, not execution parity. Out of scope.
 - **Complete loader / game boot parity.** PSF / PUP / PKG / SELF /
   decrypt paths are partially Rust-mirrored at the contract level
-  (per `behavior-freeze/docs/INVENTORY.md`) but full boot of a
-  commercial game does not run through the Rust stack.
+  (per `docs/history/INVENTORY.md` — moved from `behavior-freeze/docs/`
+  in 2026-05-22 consolidation) but full boot of a commercial game
+  does not run through the Rust stack.
 - **UI / packaging.** No Qt UI port. No installer / packaging story.
 - **Commercial game trace promotion.** Hard rule: traces of
   commercial PS3 games NEVER go into `behavior-freeze/`. Only CC0
@@ -2334,9 +2335,15 @@ R5 closure plus the R5.11 / R5.11b expansions. The archive includes:
   R5.8 / R6 — those are **obsolete / historical**. The current "next
   steps" are in § 9 above.
 
-Hooks and other files that reference `behavior-freeze/docs/`
-historical doc paths (`AUTONOMOUS_LOG.md` stub, `SPU_RECOMPILER_PLAN.md`
-stub, `INVENTORY.md`, `DECISIONS.md`, `DEFERRED.md`,
-`BACKLOG_RESIDUAL.md`, `HOMEBREW_PLAN.md`) are unchanged. Older
-verbatim snapshots remain at
-[`historico/pre-r4b-2026-04-25/`](../historico/pre-r4b-2026-04-25/).
+Path layout (as of 2026-05-22 consolidation):
+- `behavior-freeze/docs/` — retains ONLY the two path-locked
+  operational stubs: `AUTONOMOUS_LOG.md` (Claude Code Stop /
+  SessionStart hook target) and `SPU_RECOMPILER_PLAN.md`
+  (referenced from `rust/rpcs3-spu-recompiler/src/lib.rs` doc-comment).
+  See `behavior-freeze/docs/README.md` for the lock-in rationale.
+- [`docs/history/`](./history/) — single archive location for the
+  legacy stubs moved out of `behavior-freeze/docs/` in 2026-05-22:
+  `INVENTORY.md`, `DECISIONS.md`, `DEFERRED.md`, `BACKLOG_RESIDUAL.md`,
+  `HOMEBREW_PLAN.md`, plus the original `PROJECT_STATUS_R5_ARCHIVE.md`.
+- [`historico/pre-r4b-2026-04-25/`](../historico/pre-r4b-2026-04-25/) —
+  pre-R4b verbatim snapshots (older still).

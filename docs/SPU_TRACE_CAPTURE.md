@@ -637,4 +637,4 @@ The capture only asserts `r3` (last command consumed = 0xFF) and `r6` (last comp
 - R5.4a parking model: [`rust/rpcs3-spu-thread/src/lib.rs`](../rust/rpcs3-spu-thread/src/lib.rs) — `SpuParkReason`, `SpuParkState`.
 - R5.4b wake API: same file — `SpuWakeResult`, `try_resolve_park`, `ppu_*_and_try_wake` helpers.
 - Project status & next-phase recommendations: [`docs/PROJECT_STATUS.md`](./PROJECT_STATUS.md).
-- Homebrew capture / RPCS3 dump plan: [`behavior-freeze/docs/HOMEBREW_PLAN.md`](../behavior-freeze/docs/HOMEBREW_PLAN.md).
+- Homebrew capture / RPCS3 dump plan: [`docs/history/HOMEBREW_PLAN.md`](./history/HOMEBREW_PLAN.md) (moved from `behavior-freeze/docs/` in 2026-05-22 consolidation).
