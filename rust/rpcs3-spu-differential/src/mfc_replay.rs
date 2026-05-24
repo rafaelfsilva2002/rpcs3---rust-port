@@ -1664,6 +1664,14 @@ pub struct DmaPreReplayPlan {
     /// `SpuMfcCmd` events processed). Mostly informational for
     /// callers / tests / diagnostics.
     pub dispatched_get_count: u32,
+    /// R8.5d D.6 — per-tag stall mask the SPU's `rdch ch25`
+    /// (`MFC_RdListStallStat`) is expected to return on its first
+    /// destructive read during replay. Captured BEFORE the pre-
+    /// replay's `process_spu_rdch_list_stall_stat` clears it, so
+    /// the caller can plumb it into the executor via
+    /// `SpuProgram::with_mfc_list_stall_mask`. Zero for non-stall
+    /// traces (no `sb & 0x80` encountered).
+    pub initial_list_stall_mask: u32,
 }
 
 /// Walk a captured event slice (filtered to a single `target_spu`) and:
@@ -1738,6 +1746,11 @@ pub fn apply_mfc_dma_pre_replay(
     let mut state = MfcReplayState::new(trace_path, canonical_dma_dir);
     let mut tag_stat_queue: VecDeque<u32> = VecDeque::new();
     let mut dispatched_get_count: u32 = 0;
+    // R8.5d D.6 — captured BEFORE process_spu_rdch_list_stall_stat
+    // destructively clears state.list_stall_mask. Defaults to 0 if
+    // no ch25 read appears in the trace (= non-stall trace).
+    let mut initial_list_stall_mask: u32 = 0;
+    let mut ch25_seen = false;
 
     for event in events {
         match event {
@@ -1767,6 +1780,16 @@ pub fn apply_mfc_dma_pre_replay(
             // remaining elements into LS).
             CapturedEvent::SpuRdch(r) if r.channel == 25 => {
                 let captured_value = r.value.unwrap_or(0);
+                // R8.5d D.6 — record the FIRST ch25 read's value as
+                // the initial mask seeded into the SPU's channels at
+                // thread start. Subsequent ch25 reads (multi-stall
+                // scenarios) are not yet plumbed for replay mode;
+                // such fixtures would need a queue rather than a
+                // scalar.
+                if !ch25_seen {
+                    initial_list_stall_mask = captured_value;
+                    ch25_seen = true;
+                }
                 state.process_spu_rdch_list_stall_stat(captured_value)?;
             }
             CapturedEvent::SpuWrch(w) if w.channel == 26 => {
@@ -1795,12 +1818,14 @@ pub fn apply_mfc_dma_pre_replay(
         // the helper composable with callers who already have a
         // queue from another source.
         initial_mfc_tag_stat_queue: Vec::new(),
+        initial_mfc_list_stall_mask: 0,
     };
 
     Ok(DmaPreReplayPlan {
         program: post_dma_program,
         tag_stat_queue,
         dispatched_get_count,
+        initial_list_stall_mask,
     })
 }
 

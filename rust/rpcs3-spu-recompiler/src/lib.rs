@@ -459,6 +459,12 @@ impl RecompilerExecutor {
         channels.mfc_tag_stat_queue.extend(
             program.initial_mfc_tag_stat_queue.iter().copied(),
         );
+        // R8.5d D.6 — seed the per-tag stall mask so the JIT's
+        // `rdch ch25 MFC_RdListStallStat` codegen path returns the
+        // captured value destructively (mirrors the Interpreter
+        // backend in rpcs3-spu-differential::lib.rs). Zero for
+        // non-stall traces.
+        channels.mfc_list_stall_mask = program.initial_mfc_list_stall_mask;
 
         let max_iterations = (program.max_steps.max(1)) as usize;
         let mut total_steps: u64 = 0;

@@ -108,6 +108,15 @@ pub struct SpuProgram {
     /// captured trace; left empty for non-DMA programs (the queue
     /// is dormant if the SPU never reads ch24).
     pub initial_mfc_tag_stat_queue: Vec<u32>,
+    /// R8.5d D.6 — pre-populated `MFC_RD_LIST_STALL_STAT` (ch25)
+    /// per-tag stall mask. Seeded into the SPU's channels at thread
+    /// start so the SPU's `rdch ch25` during replay returns the
+    /// captured mask (destructively — same as real RPCS3). Zero
+    /// for non-stall traces (the channel returns 0 by default).
+    /// Populated by
+    /// [`crate::mfc_replay::apply_mfc_dma_pre_replay`] from a
+    /// captured stall-and-notify trace.
+    pub initial_mfc_list_stall_mask: u32,
 }
 
 impl SpuProgram {
@@ -119,6 +128,7 @@ impl SpuProgram {
             max_steps,
             initial_gpr_overrides: Vec::new(),
             initial_mfc_tag_stat_queue: Vec::new(),
+            initial_mfc_list_stall_mask: 0,
         }
     }
 
@@ -145,6 +155,21 @@ impl SpuProgram {
     #[must_use]
     pub fn with_mfc_tag_stat_queue(mut self, queue: Vec<u32>) -> Self {
         self.initial_mfc_tag_stat_queue = queue;
+        self
+    }
+
+    /// R8.5d D.6 — set the pre-populated `MFC_RD_LIST_STALL_STAT`
+    /// (ch25) per-tag stall mask. Seeded into the SPU's channels
+    /// at thread start. The SPU's first `rdch ch25` during replay
+    /// returns this mask (destructive — same as real RPCS3); later
+    /// reads return 0 until the mask is re-armed (which currently
+    /// only happens via the C++ bridge runtime path, not replay).
+    /// Used by [`crate::mfc_replay::apply_mfc_dma_pre_replay`] to
+    /// plumb the captured stall mask into the executor for
+    /// stall-and-notify traces.
+    #[must_use]
+    pub fn with_mfc_list_stall_mask(mut self, mask: u32) -> Self {
+        self.initial_mfc_list_stall_mask = mask;
         self
     }
 
@@ -339,6 +364,11 @@ impl SpuExecutor for InterpreterExecutor {
         spu.channels.mfc_tag_stat_queue.extend(
             program.initial_mfc_tag_stat_queue.iter().copied(),
         );
+        // R8.5d D.6 — seed the per-tag stall mask so the SPU's
+        // `rdch ch25 MFC_RdListStallStat` during replay returns the
+        // captured value destructively (same semantic as real
+        // RPCS3 + the C++ bridge runtime). Zero for non-stall traces.
+        spu.channels.mfc_list_stall_mask = program.initial_mfc_list_stall_mask;
         spu.pc = program.entry_pc & 0x3FFFC;
 
         let max = program.max_steps.min(usize::MAX as u64) as usize;
