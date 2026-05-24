@@ -80,18 +80,21 @@ fn r9_1a_run_self_parses_mailbox_v1_and_executes_ppu() {
 
     let result = core.run_self(&self_bytes);
 
-    // R9.1c diagnostic — dump key PPU state at exit so each smoke
-    // run reports where the boot path stopped and what came after.
-    // The 20-oracle integration goal needs this trail to be
-    // monotonically deeper across R9.x slices.
+    // R9.1c-R9.1f diagnostic — dump key PPU state at exit so each
+    // smoke run reports where the boot path stopped and what came
+    // after. R9.1f extension: GPR0-12 + CTR + LR for bug isolation
+    // when control-flow corruption (CIA in unmapped region) is
+    // suspected.
     eprintln!(
-        "[R9.1c diag] post-run state: CIA=0x{:08x} r1=0x{:016x} r2=0x{:016x} r3=0x{:016x} LR=0x{:016x}",
-        core.ppu.cia,
-        core.ppu.gpr[1],
-        core.ppu.gpr[2],
-        core.ppu.gpr[3],
-        core.ppu.lr,
+        "[R9.1f diag] post-run: CIA=0x{:08x} LR=0x{:016x} CTR=0x{:016x}",
+        core.ppu.cia, core.ppu.lr, core.ppu.ctr,
     );
+    for r in 0..=12u8 {
+        eprintln!(
+            "[R9.1f diag]   r{:<2} = 0x{:016x}",
+            r, core.ppu.gpr[r as usize]
+        );
+    }
 
     match result {
         Ok(report) => {
