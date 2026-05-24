@@ -132,6 +132,16 @@ impl std::error::Error for Error {}
 // EmuCore
 // =====================================================================
 
+/// R9.1c — PSL1GHT user-mode stack defaults. The real lv2 loader
+/// honors `SYS_PROCESS_PARAM(prio, stack_size)` from the `.self`;
+/// the R8.x oracle fixtures all specify `stack_size = 0x10000`
+/// (64 KB). We place the stack at a fixed EA below the
+/// `vm::_ptr<u8>` user-mode window (well above the `.text` /
+/// `.data` ranges of PSL1GHT-built binaries, which top out around
+/// 0x10100000 per the empirical PHDR layouts).
+pub const USER_STACK_TOP: u32 = 0xD000_0000;
+pub const USER_STACK_SIZE: u32 = 0x0001_0000; // 64 KB
+
 /// Single-threaded PPU emulator core. One of these per run.
 pub struct EmuCore {
     pub mem: SparseBackend,
@@ -294,11 +304,51 @@ impl EmuCore {
         }
         let elf_bytes = &self_bytes[elf_start..];
         self.load_elf(elf_bytes)?;
+        self.init_user_stack(USER_STACK_TOP, USER_STACK_SIZE)?;
         let exit_status = self.run()?;
         Ok(RunReport {
             exit_status,
             tty_output: self.tty.captured_output.clone(),
         })
+    }
+
+    /// R9.1c — allocate the user-mode PPU stack and seed `r1` (the
+    /// SPU/PPC ABI's stack pointer) so PSL1GHT's `_start` can run
+    /// its first `stdu r1, -N(r1)` frame-allocation without faulting.
+    ///
+    /// `top` is the EA of the byte ONE PAST the top of stack (so
+    /// the initial r1 is `top - 0x10` — aligned to a 16-byte slot
+    /// and leaving headroom for the very first frame's back chain
+    /// + saved LR per the PowerPC ELFv1 ABI).
+    ///
+    /// The real PS3 lv2 loader reads the `SYS_PROCESS_PARAM(prio,
+    /// stack_size)` block from the .self and allocates `stack_size`
+    /// bytes of user-mode stack at a kernel-chosen EA. We use a
+    /// hard-coded EA and size for now; revisit if a fixture cares
+    /// about the specific address (none of the 20 SPU oracles do).
+    pub fn init_user_stack(&mut self, top: u32, size: u32) -> Result<(), Error> {
+        if size == 0 || size & 0xFFF != 0 {
+            return Err(Error::ElfNotLoadable(
+                "init_user_stack: size must be non-zero and page-aligned",
+            ));
+        }
+        let base = top.checked_sub(size)
+            .ok_or(Error::ElfNotLoadable("init_user_stack: top below size"))?;
+        if base & 0xFFF != 0 {
+            return Err(Error::ElfNotLoadable(
+                "init_user_stack: top - size must be page-aligned",
+            ));
+        }
+        self.mem.alloc_at(
+            base,
+            size,
+            PageFlags::READABLE | PageFlags::WRITABLE,
+        )?;
+        // Seed r1 to top-of-stack minus a 16-byte ABI padding slot.
+        // `stdu r1, -N(r1)` will allocate the first real frame
+        // starting from here, growing downward toward `base`.
+        self.ppu.gpr[1] = (top.wrapping_sub(0x10)) as u64;
+        Ok(())
     }
 
     /// Run the currently-loaded program until process exit or error.

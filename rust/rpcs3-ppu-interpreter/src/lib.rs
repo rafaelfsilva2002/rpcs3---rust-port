@@ -908,6 +908,16 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                     let ea = effective_address_ds(ppu, op);
                     mem_write_u64_be(mem, ea, ppu.gpr[op.rs() as usize])?;
                 }
+                1 => {
+                    // R9.1c — stdu rs, ds(ra): store rs to mem[ea],
+                    // then ra := ea. Per PowerPC ISA, RA must not
+                    // be 0 (undefined). The compiler guarantees that;
+                    // we use ra_or_zero anyway for safety (matches
+                    // std semantics if invariant is somehow violated).
+                    let ea = effective_address_ds(ppu, op);
+                    mem_write_u64_be(mem, ea, ppu.gpr[op.rs() as usize])?;
+                    ppu.gpr[op.ra() as usize] = ea as u64;
+                }
                 _ => {
                     return Err(Error::Unimplemented {
                         inst,
