@@ -642,6 +642,32 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                         update_cr0(ppu, r);
                     }
                 }
+                826 | 827 => {
+                    // R9.1d — sradi ra, rs, sh — algebraic shift
+                    // right doubleword immediate. The 6-bit shift
+                    // amount is sh5 || sh0..4, where sh5 is encoded
+                    // at bit 30 (selecting XO 826 vs 827) and
+                    // sh0..4 at bits 16..20. `op.sh64()` already
+                    // assembles this 6-bit value.
+                    //
+                    // Semantics:
+                    //   ra = (i64)rs >> sh
+                    //   XER[CA] = (rs < 0 AND any bit shifted out is set)
+                    let shift = op.sh64();
+                    let rs = ppu.gpr[op.rs() as usize] as i64;
+                    let r = (rs >> shift) as u64;
+                    let ca = if shift == 0 {
+                        false
+                    } else {
+                        let mask = (1u64 << shift) - 1;
+                        rs < 0 && (rs as u64 & mask) != 0
+                    };
+                    ppu.gpr[op.ra() as usize] = r;
+                    ppu.xer.ca = ca;
+                    if rc_bit {
+                        update_cr0(ppu, r);
+                    }
+                }
 
                 // ---- Unary / extension / count-leading-zeros ----
                 104 => {
