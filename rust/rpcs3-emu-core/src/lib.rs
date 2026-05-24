@@ -238,7 +238,32 @@ impl EmuCore {
             return Err(Error::ElfNotLoadable("no PT_LOAD segments"));
         }
 
-        self.ppu.cia = info.e_entry as u32;
+        // R9.1b — PPC64 ELFv1 / Cell PS3 function-descriptor entry.
+        //
+        // PSL1GHT-compiled PPU binaries place `e_entry` at a 4-byte
+        // function descriptor in a non-executable (R-only) `.opd`
+        // segment. The first u32 BE of that descriptor holds the
+        // actual code address in the `.text` segment.
+        //
+        // If `e_entry` lands in an executable segment, treat it
+        // literally as the code address. If it lands in a R-only
+        // segment, dereference the function descriptor.
+        let entry_addr = info.e_entry as u32;
+        let entry_in_executable_segment = info.pt_load_iter().any(|ph| {
+            let start = ph.p_vaddr as u32;
+            let end = start.saturating_add(ph.p_memsz as u32);
+            (start..end).contains(&entry_addr) && (ph.p_flags & 0x1) != 0
+        });
+        if entry_in_executable_segment {
+            self.ppu.cia = entry_addr;
+        } else {
+            // Dereference the function descriptor: u32 BE at e_entry
+            // is the actual code address.
+            let mut fd_bytes = [0u8; 4];
+            self.mem.read(entry_addr, &mut fd_bytes)?;
+            let code_addr = u32::from_be_bytes(fd_bytes);
+            self.ppu.cia = code_addr;
+        }
         Ok(info)
     }
 
