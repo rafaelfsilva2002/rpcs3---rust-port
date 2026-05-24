@@ -260,6 +260,7 @@ impl CelpEnc {
             .ok_or(CELL_CELPENC_ERROR_ARG)
     }
 
+    #[allow(dead_code)]
     fn handle_ref(&self, id: u32) -> Result<&EncoderHandle, CellError> {
         self.handles
             .iter()

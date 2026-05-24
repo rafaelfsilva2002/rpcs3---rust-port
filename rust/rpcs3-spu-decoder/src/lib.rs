@@ -62,6 +62,7 @@ fn i16_signed(inst: u32) -> i16 {
 }
 
 #[inline]
+#[allow(dead_code)]
 fn i18_unsigned(inst: u32) -> u32 {
     bits(inst, 7, 18)
 }

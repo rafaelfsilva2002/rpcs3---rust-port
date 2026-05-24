@@ -227,6 +227,7 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, VecDeque};
 
+    #[allow(dead_code)]
     struct Queue {
         attr: QueueAttr,
         size: u32,

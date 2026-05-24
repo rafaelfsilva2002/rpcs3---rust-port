@@ -12,7 +12,6 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
 use rpcs3_emu_types::CellError;
 
 pub const MODULE_NAME: &str = "sceNp";

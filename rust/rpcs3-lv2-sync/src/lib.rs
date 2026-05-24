@@ -285,6 +285,7 @@ mod tests {
     }
 
     #[derive(Default)]
+    #[allow(dead_code)]
     struct TestSema {
         attr: SemaAttr,
         max: i32,

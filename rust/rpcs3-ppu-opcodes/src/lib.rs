@@ -48,12 +48,13 @@ impl PpuOpcode {
     }
 
     #[inline]
+    #[allow(dead_code)]
     const fn sbits(self, start_bit: u32, width: u32) -> i32 {
         // Signed extract: left-shift so sign bit lands in MSB of i32,
         // then arithmetic right-shift.
-        let lsb_pos = 32 - width - start_bit;
-        let shift_left = 32 - width;
-        ((self.0 as i32) << (start_bit + lsb_pos - lsb_pos) >> lsb_pos) as i32
+        let _lsb_pos = 32 - width - start_bit;
+        let _shift_left = 32 - width;
+        ((self.0 as i32) << (start_bit + _lsb_pos - _lsb_pos) >> _lsb_pos) as i32
             >> 0 // unused branch trick below
                 * 0
             + (((self.0 << start_bit) as i32) >> (32 - width))

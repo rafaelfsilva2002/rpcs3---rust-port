@@ -117,6 +117,7 @@ struct CompiledMeta {
     exact_hash: u64,
     /// Cached for symmetry with `ChainEntry`; lets the SMC scan skip
     /// touching the decoded-function cache to find the size again.
+    #[allow(dead_code)]
     function_size: u64,
 }
 
@@ -137,6 +138,7 @@ struct CachedFunction {
     /// Whether the JIT was able to compile this function.
     /// `Some(_)` means JIT is ready; `None` means we already tried
     /// and bailed — fall back to interpreter without re-attempting.
+    #[allow(dead_code)]
     jit_compiled: Option<()>,
 }
 

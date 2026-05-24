@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use rpcs3_vfs_paths::{get_path_root_and_trail, PathParts};
+use rpcs3_vfs_paths::get_path_root_and_trail;
 
 // ---------------------------------------------------------------------
 // Mount table

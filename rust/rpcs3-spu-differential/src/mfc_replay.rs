@@ -109,6 +109,7 @@ mod ch {
     pub const MFC_CMD: u32 = 21;
     pub const WR_TAG_MASK: u32 = 22;
     pub const WR_TAG_UPDATE: u32 = 23;
+    #[allow(dead_code)]
     pub const RD_TAG_STAT: u32 = 24;
 }
 

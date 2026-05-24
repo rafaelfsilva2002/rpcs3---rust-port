@@ -202,6 +202,7 @@ pub fn is_known_frame_rate(r: u32) -> bool {
 // =====================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum DecoderState {
     Closed,
     Open,

@@ -214,6 +214,7 @@ enum TransState {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct Transaction {
     id: u32,
     client_id: u32,

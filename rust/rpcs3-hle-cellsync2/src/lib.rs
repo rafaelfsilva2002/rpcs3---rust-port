@@ -179,6 +179,7 @@ struct Semaphore {
     #[allow(dead_code)]
     name: String,
     count: i32,
+    #[allow(dead_code)]
     initial_count: i32,
     max_count: i32,
     waiters: u16,

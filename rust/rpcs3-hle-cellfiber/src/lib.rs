@@ -175,6 +175,7 @@ mod s32_helper {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct Scheduler {
     id: u32,
     attr: SchedulerAttribute,

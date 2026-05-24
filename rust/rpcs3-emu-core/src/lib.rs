@@ -35,8 +35,7 @@ use rpcs3_ppu_thread::{PpuThread, PPU_ID_BASE};
 
 use rpcs3_lv2_process::{
     sys_process_get_number_of_object, sys_process_get_sdk_version, sys_process_getpid,
-    sys_process_getppid, ObjectType as ProcObjectType, ProcessState, SyscallResult,
-    TestProcessState,
+    sys_process_getppid, ObjectType as ProcObjectType, SyscallResult, TestProcessState,
 };
 
 use rpcs3_lv2_spu_group::{
@@ -255,7 +254,7 @@ impl EmuCore {
         // r3..r10 hold args; return value goes back into r3.
         let r3 = self.ppu.gpr[3];
         let r4 = self.ppu.gpr[4];
-        let r5 = self.ppu.gpr[5];
+        let _r5 = self.ppu.gpr[5];
 
         match number {
             1 => {

@@ -191,6 +191,7 @@ pub struct TestRwlockRegistry {
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 struct RwlockSlot {
     attr: RwlockAttr,
     readers: Vec<u32>,    // currently-holding reader tids

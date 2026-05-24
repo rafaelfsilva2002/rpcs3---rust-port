@@ -5250,6 +5250,7 @@ mod tests {
             "cwd lane 0 must match captured RPCS3 r7 = 0x10111213; got 0x{lane0:08x}");
     }
 
+    #[allow(dead_code)]
     fn cdd_real_v4_inst_at_pc_854() {
         let mut spu = SpuThread::new(0);
         // Place the v4 inst at pc=0x100 (any aligned slot — pc=0x854
