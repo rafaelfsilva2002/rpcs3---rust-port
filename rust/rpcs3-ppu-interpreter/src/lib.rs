@@ -854,6 +854,101 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                     ppu.gpr[op.rd() as usize] = v;
                 }
 
+                // ====================================================
+                // R9.1e — batch top-10 P31 XO gaps from PSL1GHT _start
+                // coverage audit (.planning/R9_1_OPCODE_COVERAGE_AUDIT.md).
+                // Ordered by audit usage count, highest first.
+                // ====================================================
+                202 => {
+                    // addze ra, rs — rd = ra + XER[CA]
+                    let a = ppu.gpr[op.ra() as usize];
+                    let carry_in: u64 = if ppu.xer.ca { 1 } else { 0 };
+                    let (r, c1) = a.overflowing_add(carry_in);
+                    ppu.gpr[op.rd() as usize] = r;
+                    ppu.xer.ca = c1;
+                    if rc_bit {
+                        update_cr0(ppu, r);
+                    }
+                }
+                144 => {
+                    // mtcrf FXM, rs — for each bit set in the 8-bit
+                    // FXM mask (bits 12..19 of inst, MSB-first), copy
+                    // the corresponding 4-bit CR field from rs.
+                    // FXM bit 0 (MSB) controls CR0, FXM bit 7 controls CR7.
+                    let fxm = ((inst >> 12) & 0xFF) as u8;
+                    let rs = ppu.gpr[op.rs() as usize] as u32;
+                    for i in 0..8u8 {
+                        let mask_bit = 1u8 << (7 - i);
+                        if fxm & mask_bit != 0 {
+                            // CR field i lives at cr.0[i*4 .. i*4+4].
+                            // Bits within the 32-bit packed CR are
+                            // MSB-first: CR0 occupies bits 0..3 of u32.
+                            let shift = 28 - (i as u32) * 4;
+                            let field4 = ((rs >> shift) & 0xF) as u8;
+                            ppu.cr.set_field(i as usize, field4);
+                        }
+                    }
+                }
+                149 => {
+                    // stdx rs, ra, rb — store doubleword indexed
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    mem_write_u64_be(mem, ea, ppu.gpr[op.rs() as usize])?;
+                }
+                87 => {
+                    // lbzx rt, ra, rb — load byte zero-extended indexed
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    let v = mem_read_u8(mem, ea)?;
+                    ppu.gpr[op.rd() as usize] = v as u64;
+                }
+                23 => {
+                    // lwzx rt, ra, rb — load word zero-extended indexed
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    let v = mem_read_u32_be(mem, ea)?;
+                    ppu.gpr[op.rd() as usize] = v as u64;
+                }
+                124 => {
+                    // nor ra, rs, rb — ra = ~(rs | rb)
+                    let r = !(ppu.gpr[op.rs() as usize]
+                        | ppu.gpr[op.rb() as usize]);
+                    ppu.gpr[op.ra() as usize] = r;
+                    if rc_bit {
+                        update_cr0(ppu, r);
+                    }
+                }
+                21 => {
+                    // ldx rt, ra, rb — load doubleword indexed
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    let v = mem_read_u64_be(mem, ea)?;
+                    ppu.gpr[op.rd() as usize] = v;
+                }
+                233 => {
+                    // mulld rd, ra, rb — signed multiply low doubleword
+                    // (low 64 bits of 64×64 → 128 product)
+                    let a = ppu.gpr[op.ra() as usize] as i64;
+                    let b = ppu.gpr[op.rb() as usize] as i64;
+                    let r = a.wrapping_mul(b) as u64;
+                    ppu.gpr[op.rd() as usize] = r;
+                    if rc_bit {
+                        update_cr0(ppu, r);
+                    }
+                }
+                19 => {
+                    // mfcr rt — rt = CR (packed, zero-extended to u64)
+                    let packed = ppu.cr.pack();
+                    ppu.gpr[op.rd() as usize] = packed as u64;
+                }
+                599 => {
+                    // lfdx frt, ra, rb — load fp double indexed
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    let bits = mem_read_u64_be(mem, ea)?;
+                    ppu.fpr[op.frd() as usize] = f64::from_bits(bits);
+                }
+
                 _ => {
                     return Err(Error::Unimplemented {
                         inst,
