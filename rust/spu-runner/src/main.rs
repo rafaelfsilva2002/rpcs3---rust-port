@@ -194,6 +194,18 @@ fn main() -> ExitCode {
             );
             ExitCode::from(2)
         }
+        // R7.1 — honest MFC fallback surfaces as its own stop
+        // reason. The runtime bridge would route this to a C++
+        // fallback; in this CLI tool there is no fallback path,
+        // so report and exit non-zero (same class as ChannelStall:
+        // SPU halted unexpectedly mid-execution).
+        ExecutionStopReason::MfcUnsupported { channel, is_write, is_count } => {
+            println!(
+                "steps={} entry=0x{:x} pc=0x{:x} -- MFC_UNSUPPORTED channel={channel} write={is_write} count={is_count}",
+                result.steps_executed, program.entry_pc, result.final_state.pc
+            );
+            ExitCode::from(1)
+        }
     };
 
     exit_code
@@ -276,6 +288,9 @@ fn dump_state(
             format!("MAX_STEPS reached without Stop ({})", result.steps_executed)
         }
         ExecutionStopReason::Error(msg) => format!("ERROR {msg}"),
+        ExecutionStopReason::MfcUnsupported { channel, is_write, is_count } => {
+            format!("MFC_UNSUPPORTED channel={channel} write={is_write} count={is_count}")
+        }
     };
     fs::write(
         out.join("summary.txt"),
