@@ -27,11 +27,12 @@
 //! args from `r3..=r10`, and writes the return value back into `r3`.
 
 use rpcs3_emu_types::CellError;
-use rpcs3_loader_elf_self::{parse_elf, ElfInfo, Error as ElfError};
+use rpcs3_loader_elf_self::{parse_elf, parse_sce_header, ElfInfo, Error as ElfError};
 use rpcs3_memory::PageFlags;
 use rpcs3_memory_backing::{Error as MemError, SparseBackend};
 use rpcs3_ppu_interpreter::{step, Error as InterpError, StepOutcome};
 use rpcs3_ppu_thread::{PpuThread, PPU_ID_BASE};
+use rpcs3_lv2_tty::SysTty;
 
 use rpcs3_lv2_process::{
     sys_process_get_number_of_object, sys_process_get_sdk_version, sys_process_getpid,
@@ -54,6 +55,18 @@ use rpcs3_spu_thread::SpuThread;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitStatus {
     pub status: i32,
+}
+
+/// R9.1a — Report returned by [`EmuCore::run_self`]: the PPU exit
+/// status plus everything the run captured for the integration test
+/// to assert on (today: TTY output per channel).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunReport {
+    pub exit_status: ExitStatus,
+    /// Captured TTY output per channel (0..=15). Channel 3
+    /// (`SYS_TTYP_USER1`) is the default stdout channel for
+    /// PSL1GHT homebrew.
+    pub tty_output: Vec<String>,
 }
 
 /// Errors the core can surface to callers.
@@ -124,6 +137,10 @@ pub struct EmuCore {
     pub mem: SparseBackend,
     pub ppu: PpuThread,
     pub process: TestProcessState,
+    /// R9.1a — captured TTY output across all 16 channels.
+    /// `sys_tty_write` (syscall 403) appends here; tests read it
+    /// post-run to assert canonical TTY strings.
+    pub tty: SysTty,
     /// Maximum steps per `run` invocation. 0 = unbounded.
     pub step_budget: usize,
 }
@@ -141,6 +158,7 @@ impl EmuCore {
             mem: SparseBackend::new(),
             ppu: PpuThread::new(PPU_ID_BASE),
             process: TestProcessState::default(),
+            tty: SysTty::new(),
             step_budget: 100_000,
         }
     }
@@ -222,6 +240,40 @@ impl EmuCore {
 
         self.ppu.cia = info.e_entry as u32;
         Ok(info)
+    }
+
+    /// R9.1a — boot a PSL1GHT-built `.self` file (fself, unencrypted)
+    /// end-to-end: parse the SCE header, locate the loadable PPU64
+    /// ELF body at `header_length` (= total SCE/SELF metadata size),
+    /// delegate to [`load_elf`](Self::load_elf), then run to process
+    /// exit.
+    ///
+    /// The returned [`RunReport`] carries the PPU exit status plus a
+    /// snapshot of captured TTY output per channel (so integration
+    /// tests can assert against the homebrew's `printf` output —
+    /// channel 3 = `SYS_TTYP_USER1` is the default stdout target for
+    /// PSL1GHT programs).
+    ///
+    /// fself binaries from the `rpcs3-ps3dev-toolchain` Docker image
+    /// embed an unencrypted ELF AFTER the SCE/SELF header block. The
+    /// SCE header's `header_length` field is the byte offset of the
+    /// loadable ELF body (NOT the SelfExtHeader's `elf_offset`, which
+    /// points to the metadata-info ELF used by SELF descriptors).
+    /// The `.self` files captured for the R8.x oracles
+    /// (`single_spu_*_v1.self`) match that pattern.
+    pub fn run_self(&mut self, self_bytes: &[u8]) -> Result<RunReport, Error> {
+        let sce = parse_sce_header(self_bytes)?;
+        let elf_start = sce.header_length as usize;
+        if elf_start >= self_bytes.len() {
+            return Err(Error::ElfNotLoadable("SCE header_length past end of file"));
+        }
+        let elf_bytes = &self_bytes[elf_start..];
+        self.load_elf(elf_bytes)?;
+        let exit_status = self.run()?;
+        Ok(RunReport {
+            exit_status,
+            tty_output: self.tty.captured_output.clone(),
+        })
     }
 
     /// Run the currently-loaded program until process exit or error.
@@ -318,6 +370,47 @@ impl EmuCore {
             }
             43 => {
                 // sys_ppu_thread_yield — no-op in single-thread mode.
+            }
+            403 => {
+                // R9.1a — sys_tty_write(ch, buf_ptr, len, *pwritelen)
+                //
+                // Reads `len` bytes from guest mem at `buf_ptr`,
+                // appends them to the captured TTY output for the
+                // given channel, and writes the bytes-written count
+                // back into *pwritelen (BE u32 in guest memory).
+                let ch = r3 as i32;
+                let buf_ptr = r4 as u32;
+                let len = self.ppu.gpr[5] as u32;
+                let pwritelen_ptr = self.ppu.gpr[6] as u32;
+
+                // Read `len` bytes from guest memory. If `len` is 0
+                // the payload is treated as an empty string (valid
+                // per cpp:127 — actual = min(len, payload.len())).
+                let mut payload_bytes = vec![0u8; len as usize];
+                if len > 0 {
+                    self.mem.read(buf_ptr, &mut payload_bytes)?;
+                }
+                // PSL1GHT writes plain ASCII/UTF-8; the SysTty buffer
+                // is a String. Lossy decode is acceptable for the
+                // integration-test contract (printf output is ASCII).
+                let payload_str = String::from_utf8_lossy(&payload_bytes).into_owned();
+                let mut pwritelen_local: u32 = 0;
+                match self.tty.write(
+                    ch,
+                    Some(&payload_str),
+                    len,
+                    Some(&mut pwritelen_local),
+                ) {
+                    Ok(()) => {
+                        // Write bytes-written count back to guest mem.
+                        let buf = pwritelen_local.to_be_bytes();
+                        self.mem.write(pwritelen_ptr, &buf)?;
+                        self.ppu.gpr[3] = 0; // CELL_OK
+                    }
+                    Err(e) => {
+                        self.ppu.gpr[3] = u64::from(u32::from(e));
+                    }
+                }
             }
             _ => {
                 return Err(Error::UnsupportedSyscall { number, cia: cia_at_sc });
