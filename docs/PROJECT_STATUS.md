@@ -1,8 +1,76 @@
-# Project Status — R8.4f-b LANDED (PUTLB + PUTLF — 17th + 18th oracles; entire 6-code list-DMA family complete)
+# Project Status — R8.5e LANDED (PUTL stall-and-notify — 20th oracle; entire R8.5 wave closed; full LS↔EA list-DMA stall coverage)
 
 **Authoritative current source of truth for the RPCS3 → Rust port.**
 
-Last updated: **2026-05-21 (R8.4f-b landing)**. R8.4f-b adds
+Last updated: **2026-05-23 (R8.5e E.6 landing — 20th oracle)**.
+R8.5e closes the list-DMA stall-and-notify wave by promoting
+`single_spu_dma_putl_stall_v1` to the 20th replay-validated
+oracle — the symmetric inverse of R8.5d D.6
+`single_spu_dma_getl_stall_v1` (19th). The PUTL stall test
+passed on first run because R8.5d D.6's
+`initial_mfc_list_stall_mask` plumbing (SpuProgram →
+DmaPreReplayPlan → spu-thread) was already direction-agnostic;
+the `is_putl=true` branch in `process_mfc_list_cmd` (R8.5c)
+and the `is_put=true` branch in
+`bridge_dma_list_stall_ack_callback` (R8.5d D.2) were exercised
+end-to-end against real-captured JSONL with zero new code.
+**Full LS↔EA list-DMA stall coverage** — 8 list-DMA oracles
+total across the 6-code family + GETL stall + PUTL stall.
+FIXED OUT_MBOX sentinel 0xC0FFEEC3 (vs PPU-computed
+ea_status=0xA12FDC1E). No SHA bumps in E.6 (replay test only).
+Bridge default OFF unchanged; behavior-freeze contract
+preserved. Workspace warnings cleaned: 101 → 84 (zero
+dead-code; remainder is fn-pointer comparison correctness in
+rpcs3-spu-thread, separate work). spu-runner non-exhaustive
+match on `MfcUnsupported` fixed. See § R8.5e at the bottom +
+§ 9 for the refreshed roadmap.
+
+Previously: **2026-05-23 (R8.5d D.6 landing — 19th oracle)**.
+R8.5d D.6 closes the GETL half by promoting
+`single_spu_dma_getl_stall_v1` to the 19th oracle. Fixed an
+R8.5c plumbing gap (`initial_mfc_list_stall_mask` was not
+threaded through SpuProgram into spu-thread — captured ch25
+value never reached SPU runtime; replay-replays diverged at
+the ch25 read). Triple-symmetric acceptance: replay + bridge
+runtime (R8.5d D.1.b GETL + D.2 PUTL extension) + bridge OFF
+(C++ executor unchanged).
+
+Previously: **2026-05-23 (R8.5d D.2 landing — PUTL bridge stall)**.
+R8.5d D.2 unifies the C++ bridge stall handshake to handle both
+GETL and PUTL via `ListPartialState{is_put: bool}` (renamed
+from `GetlPartialState`). Restructures
+`bridge_dma_putl_callback` to the Cell BE Sec. 12.5
+transfer-then-stall pattern (mirror of D.1.b GETL). Single
+`bridge_dma_list_stall_ack_callback` dispatches resume direction
+via `partial.is_put`. No Rust changes (replay R8.5c was
+already direction-agnostic; FFI D.1.a callback is
+direction-agnostic). Bridge SHA `19a81b5452…`; rpcs3.exe
+`57D3746A…`.
+
+Previously: **2026-05-23 (R8.5d D.1.a + D.1.b landing — bridge
+runtime stall, GETL-only)**. Added Rust FFI scaffolding for ch25
+destructive read + ch26 ack callback (`MFC_RD_LIST_STALL_STAT`
+const, `MFC_WR_LIST_STALL_ACK` const, `DmaListStallAckCallback`,
+`RUST_SPU_DMA_LIST_STALL_PENDING=-2` sentinel) + C++ bridge
+stall handshake (`GetlPartialState`, `bridge_save/take_getl_partial`
+helpers, `bridge_dma_list_stall_ack_callback`). Scope intentionally
+GETL-only to keep risk small; D.2 generalizes to PUTL.
+
+Previously: **2026-05-23 (R8.5c landing — Rust replay handshake)**.
+Rust-side state machine for list-DMA stall-and-notify in
+`process_mfc_list_cmd` (enforces Cell BE Sec. 12.5
+transfer-then-stall: stalled element transferred BEFORE stall
+bit raised; ACK resumes at `next_element_index`).
+`ListDmaPartialProgress` resume state; 4 new error variants;
+7 synthetic tests including `stalled_element_copied_before_stall_not_twice`.
+
+Previously: **2026-05-22 (R8.5b landing — capture surface unlock)**.
+Schema A: reused existing `SpuRdch ch=25` / `SpuWrch ch=26`
+events (no new EventKind). C++ writer no longer rejects ch25/ch26
+on target_spu match; Rust parser no longer triggers
+UnsupportedChannel. Writer + parser only — no replay, no bridge.
+
+Previously: **2026-05-21 (R8.4f-b landing)**. R8.4f-b adds
 MFC PUTLB (cmd=0x25, PUTL + barrier) and PUTLF (cmd=0x26,
 PUTL + fence) end-to-end in a single phase. Same REUSE-PUT
 strategy as R8.4f-a's REUSE-GET: per RPCS3 `do_list_transfer`
@@ -2194,17 +2262,18 @@ addressed pool dedup); TWO new `.spuimg`.
 
 ---
 
-## 9. R8+ recommended next scope (refreshed 2026-05-22 post R8.4f-b)
+## 9. R8+ recommended next scope (refreshed 2026-05-23 post R8.5e — wave R8.5 closed)
 
 > **Authoritative roadmap.** This section was originally written at R7
 > closure (2026-05-18) and predated the actual landed sequence
 > (R8.1 PUT → R8.2 multi-DMA GET → R8.3a/b/c TagStat modes →
-> R8.4 list-DMA family). The numbering below was rewritten to match
-> what has landed and the workstreams currently contemplated.
-> **Do not begin R8.5+ work without re-reading the hard rules in § 8
-> and § 20.7 of `SPU_DMA_MFC_R6_7_DESIGN.md`.**
+> R8.4 list-DMA family → R8.5 stall-and-notify). The numbering
+> below was rewritten to match what has landed and the workstreams
+> currently contemplated. **Do not begin R8.6+ work without
+> re-reading the hard rules in § 9.5 and § 20.7 of
+> `SPU_DMA_MFC_R6_7_DESIGN.md`.**
 
-### 9.1 Recap of what landed (R8.1 → R8.4f-b)
+### 9.1 Recap of what landed (R8.1 → R8.5e)
 
 | Phase | Scope | Oracle # | Closure date |
 |-------|-------|----------|--------------|
@@ -2220,40 +2289,76 @@ addressed pool dedup); TWO new `.spuimg`.
 | **R8.4e** | PUTL end-to-end (writer + replay + bridge in one cycle) | 14th | 2026-05-21 |
 | **R8.4f-a** | GETLB + GETLF via REUSE-GETL (barrier/fence variants) | 15th + 16th | 2026-05-21 |
 | **R8.4f-b** | PUTLB + PUTLF via REUSE-PUTL — **6-code list-DMA family complete** | 17th + 18th | 2026-05-21 |
+| **R8.5a** | Research-only stall-and-notify feasibility | — | 2026-05-22 |
+| **R8.5b** | Writer/parser capture surface unlock (Schema A: reuse SpuRdch ch25 / SpuWrch ch26) | — | 2026-05-22 |
+| **R8.5c** | Rust replay state machine for stall handshake (`process_mfc_list_cmd` transfer-then-stall + `process_spu_rdch_list_stall_stat` + `process_spu_wrch_list_stall_ack`) | — | 2026-05-23 |
+| **R8.5d D.1.a + D.1.b** | Rust FFI + C++ bridge runtime GETL stall surface | — | 2026-05-23 |
+| **R8.5d D.2** | Bridge stall handshake extended to PUTL family (unify `GetlPartialState` → `ListPartialState{is_put}`) | — | 2026-05-23 |
+| **R8.5d D.3** | `single_spu_dma_getl_stall_v1` CC0 source authored | (source) | 2026-05-23 |
+| **R8.5d D.6** | 19th oracle promotion (`getl_stall_v1` replay) + `initial_mfc_list_stall_mask` plumbing fix | 19th | 2026-05-23 |
+| **R8.5e E.3** | `single_spu_dma_putl_stall_v1` CC0 source authored | (source) | 2026-05-23 |
+| **R8.5e E.6** | 20th oracle promotion (`putl_stall_v1` replay) — D.6 plumbing carried over zero-code-change | 20th | 2026-05-23 |
 
-**Current state:** 18 replay-validated SPU oracles. Full 6-code
-MFC list-DMA family (GETL/GETLB/GETLF/PUTL/PUTLB/PUTLF) end-to-end
-supported across parser, replay state machine, and runtime bridge.
-`MFC_LIST_CMDS_UNSUPPORTED` parser slice is empty.
+**Current state:** **20 replay-validated SPU oracles.** Full 6-code
+MFC list-DMA family (GETL/GETLB/GETLF/PUTL/PUTLB/PUTLF) +
+stall-and-notify (GETL stall + PUTL stall) end-to-end supported
+across parser, replay state machine, and runtime bridge (bridge
+default OFF; bridge ON validated for the 6-code family triple-
+symmetric on 8 fixtures; stall fixtures replay-validated only —
+bridge-ON triple-symmetry on stall fixtures deferred until a
+real workload exercises that path). `MFC_LIST_CMDS_UNSUPPORTED`
+parser slice is empty.
 
-### 9.2 Current workstream — R8.5 list-DMA stall-and-notify
+### 9.2 R8.5 wave — list-DMA stall-and-notify (CLOSED)
 
-R8.5 covers the `sb & 0x80` stall-and-notify bit on list
-descriptor elements (the single semantic divergence R8.4 deferred).
-R8.5a research-only confirmed feasibility: the SPU↔MFC handshake
-uses `ch25 MFC_RdListStallStat` (read, returns bitmask of stalled
-tags) and `ch26 MFC_WrListStallAck` (write, takes a tag id). **No
-PPU handshake is required for the minimal CC0 fixture.** Full
-design in `SPU_DMA_MFC_R6_7_DESIGN.md` § 20.
+R8.5 covered the `sb & 0x80` stall-and-notify bit on list
+descriptor elements — the single semantic divergence R8.4
+explicitly deferred. SPU↔MFC handshake via `ch25
+MFC_RdListStallStat` (destructive read, returns bitmask of
+stalled tags) and `ch26 MFC_WrListStallAck` (write, takes a tag
+id). **No PPU handshake required** in the minimal CC0 fixture
+— the SPU acks itself. Full design preserved in
+`SPU_DMA_MFC_R6_7_DESIGN.md` § 20.
 
-| Phase | Scope | Status |
-|-------|-------|--------|
-| **R8.5a** | Research-only feasibility study | ✅ **complete** (no commits — memory record `project_r8_5a_research_stall_and_notify`) |
-| **R8.5b** | C++ writer + Rust parser unlock for `sb & 0x80` | **next implementation slice** (no oracle promotion) |
-| R8.5c | Replay state machine handles stall/resume | DEFERRED (gates on real oracle) |
-| R8.5d | Runtime bridge ch25/ch26 cooperative re-entry + 19th oracle | DEFERRED |
+| Phase | Scope | Outcome |
+|-------|-------|---------|
+| R8.5a | Research-only feasibility study | ✅ complete |
+| R8.5b | Writer + parser unlock (Schema A — reuse ch25/ch26 SpuRdch/SpuWrch event kinds) | ✅ landed `1f5450b56` |
+| R8.5c | Replay state machine (transfer-then-stall per Cell BE § 12.5; resume from `next_element_index`) | ✅ landed `a4d0d58f7` |
+| R8.5d D.1.a + D.1.b | Rust FFI + C++ bridge runtime (GETL stall partial state + ack callback) | ✅ landed `b6c717b55` |
+| R8.5d D.2 | Bridge PUTL stall handshake (unify `ListPartialState{is_put}`) | ✅ landed `8e4039677` |
+| R8.5d D.3 + D.4 + D.5 + D.6 | `single_spu_dma_getl_stall_v1` source + Docker build + JSONL capture + 19th oracle | ✅ landed `35d637a3a` + `6936d7900` |
+| R8.5e E.3 + E.4 + E.5 + E.6 | `single_spu_dma_putl_stall_v1` source + build + capture + 20th oracle | ✅ landed `c171c09b0` + `6e650c363` |
 
-R8.5b is intentionally small: writer relaxes the `sb & 0x80` reject
-and emits new `spu_mfc_list_stall` + `spu_mfc_list_stall_ack`
-events; parser adds the event kinds + `sb_stall_notify` field; the
-R6.7 A.4 canary is lifted only for cmd=0x44 + sb=0x80. No fixture,
-no oracle promotion, no bridge work. The 18 existing oracles stay
-green.
+**Key architectural insight:** R8.5d D.6's `initial_mfc_list_stall_mask`
+plumbing (SpuProgram → DmaPreReplayPlan → spu-thread, capturing
+ch25 value before destructive read consumes it) was direction-
+agnostic from the start. R8.5e E.6 PUTL stall test **passed on
+first run with zero new code** — R8.5c's `is_putl=true` branch in
+`process_mfc_list_cmd` and R8.5d D.2's `is_put=true` branch in
+`bridge_dma_list_stall_ack_callback` were exercised end-to-end
+against real-captured PUTL JSONL with only a new replay test file.
 
-R8.5c/d defer indefinitely; gate only by real workload demand. The
-1-cycle ladder pattern (R8.4d → R8.4e → R8.4f-a → R8.4f-b) is
-**not expected to hold** through R8.5c/d because stall-and-notify
-adds real SPU↔MFC signalling that no prior list-DMA cycle exercised.
+**Side-file pool stats post-R8.5e:**
+- 20 `.jsonl` traces, 20 `.notes.md`
+- Canonical chunks: 24 (1 new from PUTL stall: only the .spuimg)
+- Canonical listdescs: shared between getl_stall + putl_stall
+  (the descriptor BYTES are identical — cmd is not in the
+  descriptor per Cell BE encoding)
+
+### 9.3 Subsequent SPU scope (R8.6+)
+
+| Phase | Scope | Notes |
+|-------|-------|-------|
+| **R8.6** | Multi-SPU DMA races on shared EA | The bridge's persistent-handle table is keyed by `lv2_id`; multi-SPU is a separate workstream. Defer until a CC0 multi-SPU fixture authored for the purpose forces the path. |
+| **R8.7** | MFC atomic primitives (GETLLAR / PUTLLC / PUTLLUC / PUTQLLUC) | LL/SC reservation tracking — bridge needs a per-`raddr` reservation map shared with RPCS3's C++ atomic infrastructure |
+| **R8.8** | Sync commands (BARRIER / EIEIO / SYNC — cmd codes 0xC0 / 0xC8 / 0xCC) | Likely incremental |
+| **R8.9** | PUTRL family (atomic-REPLACE, cmd 0x34 / 0x35 / 0x36) | Semantic divergence vs PUT; may force a separate state machine path |
+| — | **Stall fixtures bridge-ON triple-symmetry** | Bridge runtime stall path is landed (R8.5d D.1.b + D.2); promoting `getl_stall_v1` / `putl_stall_v1` to bridge-ON triple-symmetric oracles is a small follow-up if a real workload needs it. Currently the stall fixtures are replay-only validated. |
+| — | **SPURS production support** | OUT OF SCOPE. SPURS captures contain commercial code. Defer to a separate CC0 multi-SPU fixture authored for the purpose. **v4 / SPURS traces remain diagnostic-only forever.** |
+
+R8.6+ gate only on real workload demand or a CC0 fixture that
+forces the path.
 
 ### 9.3 Subsequent SPU scope (R8.6+)
 
@@ -2268,28 +2373,47 @@ adds real SPU↔MFC signalling that no prior list-DMA cycle exercised.
 R8.6+ gate only on real workload demand or a CC0 fixture that
 forces the path.
 
-### 9.4 Strategic pivot candidate (post-R8.5b) — broader RPCS3 integration
+### 9.4 Strategic pivot recommendation (post-R8.5e) — broader RPCS3 integration
 
-The SPU foundation is **MVP-complete at R8.4f-b**: 18 oracles
+The SPU foundation is **MVP-complete at R8.5e**: 20 oracles
 covering mailbox / signal / loadstore / GET / PUT / multi-DMA /
-TagStat modes / full list-DMA family, with triple-symmetric
-acceptance (bridge OFF / bridge ON / replay) on 8 DMA fixtures.
+TagStat modes / full 6-code list-DMA family / stall-and-notify
+(both directions), with triple-symmetric acceptance (bridge OFF
+/ bridge ON / replay) on 8 DMA fixtures + replay-validated
+stall handshake on 2 stall fixtures. The R8.5 wave's empirical
+result — D.6 plumbing carrying over to PUTL stall with zero
+code — validates that the SPU stack's abstractions have stabilized.
 
-After R8.5b lands the stall-and-notify writer/parser unlock, the
-**strategic next pivot** is broader RPCS3 integration rather than
-deeper SPU depth:
+**The strategic pivot is now broader RPCS3 integration** rather
+than deeper SPU depth:
 
 1. **LV2 / SPU group syscalls** — the kernel-side surface that
    creates / dispatches / synchronizes SPU threads. Currently
-   scaffolded for headers only (no execution parity).
-2. **PPU minimal loader** — enough to drive an SPU-using
-   homebrew end-to-end through the Rust stack.
-3. **Loader / FS / VFS** — required for PPU work.
+   scaffolded for headers only (no execution parity). Concrete
+   first deliverable: end-to-end `sys_spu_thread_group_create` →
+   `sysSpuThreadInitialize` → `sysSpuThreadGroupStart` →
+   `sysSpuThreadGroupJoin` lifecycle in Rust, with the captured
+   CC0 oracle binaries (`single_spu_*_v1.self`) as the integration
+   test corpus. Today these run only via real RPCS3 `--headless`
+   for capture; a Rust-side driver that replicates the lv2 path
+   would let the existing 20 oracles double as end-to-end
+   integration tests.
+2. **PPU minimal interpreter** — enough to execute the PPU half
+   of an SPU-using CC0 homebrew. The PPU side of every existing
+   fixture is ~150 lines of PSL1GHT calls; covering that surface
+   lets the existing fixtures drive their own end-to-end runs
+   from Rust without RPCS3.
+3. **Loader / FS / VFS** — required for the PPU path
+   (`.self` / `.sprx` parsing, lv2 process startup, FS mounts).
 
-R8.5c/d, R8.6, R8.7, R8.8, R8.9 should defer until a real workload
-demands them. Without a PPU+LV2 path that drives SPUs, those
+R8.6, R8.7, R8.8, R8.9 and stall-fixture bridge-ON promotion
+should defer until a real workload demands them. Without a
+PPU+LV2 path that drives SPUs from the Rust stack, those
 features can only be validated against synthetic CC0 fixtures —
-diminishing-returns risk is real.
+diminishing-returns risk is real and the R8.5 wave just
+demonstrated it (R8.5e validated PUTL stall with literally zero
+new architectural surface — incrementally polishing a saturated
+abstraction).
 
 ### 9.5 Hard rules carried forward to R8.5+
 

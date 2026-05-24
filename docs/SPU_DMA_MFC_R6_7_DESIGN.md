@@ -1758,19 +1758,35 @@ per-list-element).
 
 Defer rationale: same as R8.5c — gates on a real oracle.
 
-### 20.6 R8.5 phase plan
+### 20.6 R8.5 phase plan (CLOSED 2026-05-23)
 
-| Phase  | Scope                  | Deliverable                                                                                                                   | Engine changes                       |
-|--------|------------------------|-------------------------------------------------------------------------------------------------------------------------------|--------------------------------------|
-| **R8.5a** | Research-only         | Memory record + this section                                                                                                  | None                                 |
-| **R8.5b** | Writer + parser unlock | C++ writer accepts `sb=0x80`, emits stall events; Rust parser additive event kinds; canary relaxed for cmd=0x44                | C++ writer + Rust parser             |
-| R8.5c (deferred) | Replay state machine | `process_mfc_list_cmd` stall handling; new `mfc_list_stall_mask` on `SpuChannels`; pre-replay walks stall+ack pairs            | Rust core                            |
-| R8.5d (deferred) | Runtime bridge       | ch25/ch26 cooperative re-entry; FFI hook for stall observation; first stalling CC0 oracle (19th)                              | Rust core + C++ bridge + new fixture |
+| Phase | Scope | Status | Commit |
+|-------|-------|--------|--------|
+| **R8.5a** | Research-only feasibility study | ✅ landed | (no commits — memory record) |
+| **R8.5b** | Writer + parser unlock — Schema A: reuse `SpuRdch ch=25` / `SpuWrch ch=26` (no new EventKind variants); canary relaxed for cmd=0x44 + sb=0x80 | ✅ landed | `1f5450b56` |
+| **R8.5c** | Replay state machine — Cell BE § 12.5 transfer-then-stall semantic; `mfc_list_stall_mask` + `partial_list_dma` on `MfcReplayState`; `process_spu_rdch_list_stall_stat` + `process_spu_wrch_list_stall_ack`; 7 synthetic tests | ✅ landed | `a4d0d58f7` |
+| **R8.5d D.1.a + D.1.b** | Rust FFI (typedef + setter) + C++ bridge runtime (GETL-only `bridge_dma_list_stall_ack_callback` + `GetlPartialState` per-tag map on `BridgeSession`) | ✅ landed | `b6c717b55` |
+| **R8.5d D.2** | Bridge stall handshake extended to PUTL family (unify `GetlPartialState` → `ListPartialState{is_put}`; per-element direction dispatch in ack callback) | ✅ landed | `8e4039677` |
+| **R8.5d D.3** | `single_spu_dma_getl_stall_v1` CC0 source authored (3-element list, element 1 sb=0x80, predicted status 0xDF1EEC3A) | ✅ landed | `35d637a3a` |
+| **R8.5d D.4 + D.5** | Docker build + JSONL capture via `rpcs3.exe --headless` Interpreter (static); 17 events; new `.dmalistdesc` sha `f72728d1…`; new 96 B 0x11 `.dmachunk` | ✅ landed | (folded into D.6 commit) |
+| **R8.5d D.6** | **19th oracle** (`getl_stall_v1` replay test) + `initial_mfc_list_stall_mask` plumbing fix (`SpuProgram::with_mfc_list_stall_mask` → `DmaPreReplayPlan::initial_list_stall_mask` → spu-thread runtime) | ✅ landed | `6936d7900` |
+| **R8.5e E.3** | `single_spu_dma_putl_stall_v1` CC0 source authored (symmetric inverse; FIXED OUT_MBOX sentinel 0xC0FFEEC3; PPU computes ea_status=0xA12FDC1E post-join) | ✅ landed | `c171c09b0` |
+| **R8.5e E.4 + E.5** | Docker build + JSONL capture; full chunk + descriptor dedup against the D.5 pool (only `.spuimg` is new) | ✅ landed | (folded into E.6 commit) |
+| **R8.5e E.6** | **20th oracle** (`putl_stall_v1` replay test) — D.6 plumbing carried over **zero-code-change**; R8.5c's `is_putl=true` + R8.5d D.2's `is_put=true` branches exercised end-to-end against real JSONL | ✅ landed | `6e650c363` |
 
-### 20.7 Hard rules carried forward to R8.5+
+**Wave-closure insight:** D.6's `initial_mfc_list_stall_mask`
+plumbing was direction-agnostic from the start. E.6 PUTL stall
+test passed on first run with only the new replay test file —
+R8.5c's `is_putl=true` branch in `process_mfc_list_cmd` and
+R8.5d D.2's `is_put=true` branch in
+`bridge_dma_list_stall_ack_callback` carried the work. **The
+R8.5 wave delivered 2 oracles (19th + 20th) in 6 commits.**
 
-- The 18 oracles built so far MUST remain green at every
-  R8.5 phase boundary. Stall-and-notify is strictly additive.
+### 20.7 Hard rules carried forward to R8.6+
+
+- The 20 oracles built so far MUST remain green at every
+  future phase boundary. Stall-and-notify was strictly additive
+  and remained so end-to-end.
 - No fake `MfcListStall` / no fake `MfcListStallAck` events
   in real-capture JSONL.
 - No fake `RdListStallStat` value — must come from a real
@@ -1781,29 +1797,42 @@ Defer rationale: same as R8.5c — gates on a real oracle.
 - v4 / SPURS stays diagnostic-only forever.
 - The behavior-freeze contract remains active.
 
-### 20.8 Strategic note (2026-05-22 docs refresh)
+### 20.8 Strategic note (refreshed 2026-05-23 post R8.5e)
 
-The SPU foundation is **MVP-complete at R8.4f-b**: 18
-replay-validated oracles covering mailbox / signal / loadstore
-/ GET / PUT / multi-DMA / TagStat modes (ANY/ALL/IMMEDIATE
-/repeated polling) / full 6-code list-DMA family + triple
-symmetry on 8 DMA fixtures.
+The SPU foundation is **MVP-complete at R8.5e**: 20 replay-
+validated oracles covering mailbox / signal / loadstore / GET
+/ PUT / multi-DMA / TagStat modes (ANY/ALL/IMMEDIATE/repeated
+polling) / full 6-code list-DMA family + stall-and-notify
+(both directions); triple symmetry on 8 DMA fixtures + replay-
+validated handshake on 2 stall fixtures.
 
-R8.5b is a small additive unlock — the writer/parser slice
-without an oracle. After R8.5b, the **strategic pivot
-candidate** is broader RPCS3 integration rather than deeper
-SPU depth:
+R8.5 wave's empirical lesson — D.6 plumbing carried over to
+PUTL stall (E.6) with **zero new code** — confirms the SPU
+stack's abstractions have stabilized at the bridge and replay
+layers. Continuing to drill deeper into SPU MFC features
+(atomics, sync, multi-SPU) without a real PPU+LV2 path to
+drive them risks polishing a saturated abstraction.
+
+**Strategic pivot recommendation: broader RPCS3 integration**
 
 1. **LV2 / SPU group syscalls** (kernel-side SPU thread
    creation / dispatch / sync; currently scaffolded for
-   headers only).
-2. **PPU minimal loader / FS / VFS** (enough to drive an
-   SPU-using homebrew end-to-end through the Rust stack).
+   headers only). Concrete first deliverable: end-to-end
+   `sysSpuThreadGroupCreate` → `sysSpuThreadInitialize` →
+   `sysSpuThreadGroupStart` → `sysSpuThreadGroupJoin` in
+   Rust, with the 20 existing CC0 oracle binaries as the
+   integration test corpus.
+2. **PPU minimal interpreter** (enough to execute the PPU
+   half of an SPU-using CC0 homebrew; ~150 lines of PSL1GHT
+   calls per fixture).
+3. **Loader / FS / VFS** (required for the PPU path —
+   `.self`/`.sprx` parsing, lv2 process startup, FS mounts).
 
-R8.5c / R8.5d (stall-and-notify replay + runtime delegation),
 R8.6 (multi-SPU), R8.7 (atomics), R8.8 (sync cmds), R8.9
-(PUTRL family) gate only on real workload demand. Without a
-PPU+LV2 path that drives SPUs, those features can only be
-validated against synthetic CC0 fixtures — diminishing-returns
-risk is real. See `PROJECT_STATUS.md` § 9.4 for the strategic
-pivot framing.
+(PUTRL family), and stall-fixture bridge-ON triple-symmetry
+promotion gate only on real workload demand. Without a PPU+LV2
+path that drives SPUs, those features can only be validated
+against synthetic CC0 fixtures — diminishing-returns risk is
+real and R8.5e just demonstrated it directly (the 20th oracle
+required literally zero new architectural surface). See
+`PROJECT_STATUS.md` § 9.4 for the strategic pivot framing.
