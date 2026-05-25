@@ -1092,6 +1092,124 @@ impl EmuCore {
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
+                        // R9.1i — console_putc(ch) (NID 0xe66bac36):
+                        // emit single char to TTY ch3.
+                        0xe66bac36 => {
+                            let c = (r3_in as u8) as char;
+                            let s = c.to_string();
+                            let mut written: u32 = 0;
+                            let _ = self.tty.write(
+                                3,
+                                Some(&s),
+                                1,
+                                Some(&mut written),
+                            );
+                            self.ppu.gpr[3] = 1;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // R9.1i — console_write(buf, len) (NID
+                        // 0xf57e1d6f): emit `len` bytes from r3 to
+                        // TTY ch3. This is PSL1GHT's primary console
+                        // write entry point — printf/puts/etc may
+                        // route through here.
+                        0xf57e1d6f => {
+                            let buf_ptr = r3_in as u32;
+                            let len = r4_in as u32;
+                            let mut bytes = vec![0u8; len as usize];
+                            if len > 0 && self
+                                .mem
+                                .read(buf_ptr, &mut bytes)
+                                .is_ok()
+                            {
+                                let s = String::from_utf8_lossy(&bytes)
+                                    .into_owned();
+                                let mut written: u32 = 0;
+                                let _ = self.tty.write(
+                                    3,
+                                    Some(&s),
+                                    len,
+                                    Some(&mut written),
+                                );
+                                eprintln!(
+                                    "[R9.1i] console_write(*0x{buf_ptr:x}, \
+                                     {len}) → {written}: {s:?}",
+                                );
+                            }
+                            self.ppu.gpr[3] = len as u64;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // R9.1i — _sys_vprintf(fmt, va_list)
+                        // (NID 0xfa7f693d): va_list pointer at r4.
+                        // For the MVP, deref the va_list as a contiguous
+                        // u64 array (PSL1GHT layout) and reuse
+                        // mini_printf.
+                        0xfa7f693d => {
+                            let fmt_ptr = r3_in as u32;
+                            let va_ptr = r4_in as u32;
+                            let fmt = read_c_string(&self.mem, fmt_ptr, 4096)
+                                .unwrap_or_default();
+                            let mut args = [0u64; 7];
+                            for (i, slot) in args.iter_mut().enumerate() {
+                                let mut buf = [0u8; 8];
+                                if self.mem.read(
+                                    va_ptr.wrapping_add((i * 8) as u32),
+                                    &mut buf,
+                                ).is_ok() {
+                                    *slot = u64::from_be_bytes(buf);
+                                }
+                            }
+                            let formatted = mini_printf(&fmt, &args, &self.mem);
+                            let mut written: u32 = 0;
+                            let _ = self.tty.write(
+                                3,
+                                Some(&formatted),
+                                formatted.len() as u32,
+                                Some(&mut written),
+                            );
+                            eprintln!(
+                                "[R9.1i] _sys_vprintf(*0x{fmt_ptr:x}) → {written}: {formatted:?}",
+                            );
+                            self.ppu.gpr[3] = formatted.len() as u64;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // R9.1i — _sys_snprintf(buf, n, fmt, ...)
+                        // (NID 0x06574237) + _sys_sprintf(buf, fmt, ...)
+                        // (NID 0xa1f9eafe): format into buf at r3.
+                        0x06574237 | 0xa1f9eafe => {
+                            let buf_ptr = r3_in as u32;
+                            let (n_cap, fmt_ptr, fmt_args_start) = if nid == 0x06574237 {
+                                (
+                                    r4_in as usize,
+                                    self.ppu.gpr[5] as u32,
+                                    6usize,
+                                )
+                            } else {
+                                (usize::MAX, r4_in as u32, 5usize)
+                            };
+                            let fmt = read_c_string(&self.mem, fmt_ptr, 4096)
+                                .unwrap_or_default();
+                            let args = [
+                                self.ppu.gpr[fmt_args_start],
+                                self.ppu.gpr[fmt_args_start + 1],
+                                self.ppu.gpr[fmt_args_start + 2],
+                                self.ppu.gpr[fmt_args_start + 3],
+                                self.ppu.gpr[fmt_args_start + 4],
+                                0,
+                                0,
+                            ];
+                            let formatted = mini_printf(&fmt, &args, &self.mem);
+                            let limit = formatted.len().min(n_cap.saturating_sub(1));
+                            let mut bytes = formatted.into_bytes();
+                            bytes.truncate(limit);
+                            bytes.push(0);
+                            self.mem.write(buf_ptr, &bytes).ok();
+                            self.ppu.gpr[3] = (bytes.len() - 1) as u64;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
                         // R9.1h slice 4 — `_sys_printf(fmt, ...)`
                         // (NID 0x9f04f7af): PSL1GHT's actual printf
                         // entry point as used by `printf()` in
@@ -1508,6 +1626,62 @@ impl EmuCore {
                     let out_ptr = r3 as u32;
                     self.mem.write(out_ptr, &STUB_IMAGE_ID.to_be_bytes())?;
                 }
+                self.ppu.gpr[3] = 0;
+            }
+            803 => {
+                // R9.1i — sys_fs_write(fd, *buf, size, *pwritten).
+                // PSL1GHT's stdio may route TTY writes via the
+                // fs_write path (vs sys_tty_write #403). Routes
+                // fd=1/2 (stdout/stderr) to TTY ch3 + writes
+                // bytes count back to *pwritten.
+                let fd = r3 as i32;
+                let buf_ptr = r4 as u32;
+                let size = self.ppu.gpr[5] as u32;
+                let pwritten_ptr = self.ppu.gpr[6] as u32;
+                let mut payload = vec![0u8; size as usize];
+                if size > 0 {
+                    self.mem.read(buf_ptr, &mut payload).ok();
+                }
+                if fd == 1 || fd == 2 {
+                    let s = String::from_utf8_lossy(&payload).into_owned();
+                    let mut written: u32 = 0;
+                    let _ = self.tty.write(
+                        3, Some(&s), size, Some(&mut written),
+                    );
+                    eprintln!(
+                        "[R9.1i] sys_fs_write(fd={fd}, *0x{buf_ptr:x}, {size}) \
+                         → {written}: {s:?}",
+                    );
+                }
+                if pwritten_ptr != 0 {
+                    self.mem.write(pwritten_ptr, &(size as u64).to_be_bytes())?;
+                }
+                self.ppu.gpr[3] = 0;
+            }
+            809 => {
+                // R9.1i — sys_fs_fstat(fd, *stat_out).
+                // PSL1GHT's stdio calls fstat(stdout) to detect
+                // whether the fd is a TTY (S_IFCHR) before
+                // routing print operations. Without a proper
+                // stat struct, stdio's "this isn't a tty" path
+                // skips the write to TTY entirely.
+                //
+                // CellFsStat layout (rpcs3 sys_fs.h struct
+                // CellFsStat, 52 bytes BE):
+                //   u32 mode, s32 uid, s32 gid, u64 atime,
+                //   u64 mtime, u64 ctime, u64 size, u64 blksize
+                let fd = r3 as i32;
+                let stat_ptr = r4 as u32;
+                let s_ifchr: u32 = 0x2000;  // CELL_FS_S_IFCHR
+                let rw: u32 = 0o666;
+                let mode = s_ifchr | rw;
+                let mut buf = [0u8; 52];
+                buf[0..4].copy_from_slice(&mode.to_be_bytes());
+                self.mem.write(stat_ptr, &buf)?;
+                eprintln!(
+                    "[R9.1i] sys_fs_fstat(fd={fd}, *0x{stat_ptr:x}) \
+                     mode=S_IFCHR|0o666",
+                );
                 self.ppu.gpr[3] = 0;
             }
             324 | 325 | 326 | 327 | 328 | 329 | 331 | 332 | 333 |
