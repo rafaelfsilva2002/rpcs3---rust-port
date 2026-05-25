@@ -192,7 +192,21 @@ impl ElfInfo {
             .iter()
             .find(|p| p.p_type == PT_SCE_PPU_PROC_PARAM)
     }
+
+    /// R9.1g.4 — return the PT_TLS segment if present. PSL1GHT
+    /// binaries emit one PT_TLS that describes the thread-local
+    /// storage template: `p_filesz` bytes of initialized data
+    /// (sometimes 0 = pure tbss / zero-init), `p_memsz` total
+    /// bytes per thread, and `p_align` byte alignment.
+    pub fn pt_tls(&self) -> Option<&ProgramHeader> {
+        self.program_headers
+            .iter()
+            .find(|p| p.p_type == PT_TLS)
+    }
 }
+
+/// Standard ELF program-header type for thread-local storage.
+pub const PT_TLS: u32 = 7;
 
 /// R9.1g.2 — custom PHDR type for PSL1GHT `sys_process_param_t`
 /// segment. The standard ELF spec reserves the `0x60000000..=0x6FFFFFFF`

@@ -142,6 +142,20 @@ impl std::error::Error for Error {}
 pub const USER_STACK_TOP: u32 = 0xD000_0000;
 pub const USER_STACK_SIZE: u32 = 0x0001_0000; // 64 KB
 
+/// R9.1g.4 — default virtual address for the per-thread TLS
+/// region. Sits below the user-mode stack with plenty of headroom
+/// (PSL1GHT fixtures observed need at most ~2 KB).
+pub const USER_TLS_VADDR: u32 = 0xCFFE_0000;
+
+/// R9.1g.4 — chosen TLS region (returned by [`EmuCore::init_tls`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlsRegion {
+    /// Base virtual address of the allocated TLS region.
+    pub vaddr: u32,
+    /// Effective size in bytes (matches `p_memsz` from PT_TLS).
+    pub size: u32,
+}
+
 /// Single-threaded PPU emulator core. One of these per run.
 pub struct EmuCore {
     pub mem: SparseBackend,
@@ -310,6 +324,96 @@ impl EmuCore {
             exit_status,
             tty_output: self.tty.captured_output.clone(),
         })
+    }
+
+    /// R9.1g.4 — allocate the per-thread TLS region described by
+    /// the ELF's PT_TLS segment and seed `r13` (the PowerPC ELFv1
+    /// thread pointer). PSL1GHT's `_start` and any TLS-using code
+    /// in `main()` reads/writes TLS variables via offsets from
+    /// `r13`; without this, the first such access faults.
+    ///
+    /// The PT_TLS segment provides:
+    /// - `p_filesz` bytes of initialized data (often 0 = pure tbss)
+    /// - `p_memsz` total bytes per thread (init + zero-fill tail)
+    /// - `p_align` alignment requirement
+    /// - `p_offset` file offset of the init image (within
+    ///   `elf_bytes`)
+    ///
+    /// We allocate `tls_total = round_up(p_memsz, p_align)` bytes
+    /// at the chosen virtual address, copy `p_filesz` init bytes,
+    /// and set `r13 = tls_vaddr`. Returns the chosen tls_vaddr +
+    /// total size so callers can use them for verification.
+    ///
+    /// Returns `Ok(None)` if the ELF has no PT_TLS segment (some
+    /// minimal binaries omit it).
+    pub fn init_tls(
+        &mut self,
+        info: &ElfInfo,
+        elf_bytes: &[u8],
+        tls_vaddr: u32,
+    ) -> Result<Option<TlsRegion>, Error> {
+        let tls = match info.pt_tls() {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let align = tls.p_align.max(1) as u32;
+        if !align.is_power_of_two() {
+            return Err(Error::ElfNotLoadable(
+                "init_tls: PT_TLS p_align must be a power of two",
+            ));
+        }
+        // Page-round the size for SparseBackend's 4 KB granularity.
+        // The PpuThread sees only the first `p_memsz` bytes; the
+        // rest of the rounded page is unused but reserved.
+        let memsz = tls.p_memsz as u32;
+        if memsz == 0 {
+            // Empty TLS: nothing to allocate. Still set r13 to a
+            // sentinel so any later TLS access surfaces a clean
+            // MissingFlags rather than reading random mem.
+            self.ppu.gpr[13] = tls_vaddr as u64;
+            return Ok(Some(TlsRegion {
+                vaddr: tls_vaddr,
+                size: 0,
+            }));
+        }
+        if tls_vaddr & 0xFFF != 0 {
+            return Err(Error::ElfNotLoadable(
+                "init_tls: tls_vaddr must be page-aligned",
+            ));
+        }
+        let page_rounded = (memsz + 0xFFF) & !0xFFF;
+        self.mem.alloc_at(
+            tls_vaddr,
+            page_rounded,
+            PageFlags::READABLE | PageFlags::WRITABLE,
+        )?;
+        // Copy init image if any.
+        let filesz = tls.p_filesz as usize;
+        if filesz > 0 {
+            let src_start = tls.p_offset as usize;
+            let src_end = src_start.checked_add(filesz).ok_or(
+                Error::ElfNotLoadable("init_tls: p_offset+p_filesz overflow"),
+            )?;
+            if src_end > elf_bytes.len() {
+                return Err(Error::ElfNotLoadable(
+                    "init_tls: PT_TLS init image extends past ELF",
+                ));
+            }
+            self.mem.write(tls_vaddr, &elf_bytes[src_start..src_end])?;
+            // The rest (p_memsz - p_filesz) is the tbss tail — the
+            // SparseBackend's alloc_at zeroes the page on first
+            // touch, so no explicit memset needed.
+        }
+        // PowerPC ELFv1 thread pointer convention: r13 points to
+        // the start of the TLS region. TLS variables are accessed
+        // via positive offsets from r13. (Linux ELFv1 uses a
+        // +0x7000 bias; PSL1GHT empirically uses no bias — to be
+        // confirmed during R9.1g.9 smoke iteration.)
+        self.ppu.gpr[13] = tls_vaddr as u64;
+        Ok(Some(TlsRegion {
+            vaddr: tls_vaddr,
+            size: memsz,
+        }))
     }
 
     /// R9.1c — allocate the user-mode PPU stack and seed `r1` (the
