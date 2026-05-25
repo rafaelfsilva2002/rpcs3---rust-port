@@ -80,13 +80,17 @@ fn r9_1a_run_self_parses_mailbox_v1_and_executes_ppu() {
 
     let result = core.run_self(&self_bytes);
 
-    // R9.1k — scan PHDR[3] data segment post-run for the
-    // `__syscalls` table (~41 sequential u32 BE function-
-    // pointers, each pointing into .text 0x10000..0x2C000 or
-    // the .opd FD area near 0x10000000).
+    // R9.1m — scan PHDR[3] (.data + .bss) for u64 BE FD pointers
+    // (PowerPC ELFv1 function pointers ARE u64 addresses of
+    // 24-byte FD structs that live in PHDR[1] data, range
+    // 0x30000..0x32D08). The __syscalls table populated by
+    // __syscalls_init constructor would be ~41 consecutive
+    // such pointers. PHDR[3] has p_memsz=0x414D8 (266 KB
+    // including .bss), so scan the full memsz range, not just
+    // p_filesz.
     {
         const DATA_BASE: u32 = 0x10010000;
-        const DATA_SIZE: u32 = 0x14D8;
+        const DATA_SIZE: u32 = 0x4_14D8;
         let mut buf = vec![0u8; DATA_SIZE as usize];
         if core.mem.read(DATA_BASE, &mut buf).is_ok() {
             let mut best_start = 0u32;
@@ -94,12 +98,16 @@ fn r9_1a_run_self_parses_mailbox_v1_and_executes_ppu() {
             let mut run_start = 0u32;
             let mut run_len = 0usize;
             let mut i = 0usize;
-            while i + 4 <= buf.len() {
-                let v = u32::from_be_bytes([
+            while i + 8 <= buf.len() {
+                let v = u64::from_be_bytes([
                     buf[i], buf[i + 1], buf[i + 2], buf[i + 3],
+                    buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7],
                 ]);
-                let looks_like_text_ptr = (0x10000..0x2_C000).contains(&v);
-                if looks_like_text_ptr {
+                // FD-pointer heuristic: value points into PHDR[1]
+                // (0x30000..0x32D08) where 24-byte FDs live.
+                let looks_like_fd_ptr = (0x30000..0x32D08).contains(&(v as u32))
+                    && (v >> 32) == 0;
+                if looks_like_fd_ptr {
                     if run_len == 0 {
                         run_start = DATA_BASE + i as u32;
                     }
@@ -111,29 +119,37 @@ fn r9_1a_run_self_parses_mailbox_v1_and_executes_ppu() {
                 } else {
                     run_len = 0;
                 }
-                i += 4;
+                i += 8;
             }
             if best_len > 0 {
                 eprintln!(
-                    "[R9.1k scan] longest text-ptr run in .data: \
-                     start=0x{best_start:08x} len={best_len} u32s",
+                    "[R9.1n scan] longest FD-ptr run in .data: \
+                     start=0x{best_start:08x} len={best_len} u64 FD-pointers",
                 );
-                // Print first ~16 ptrs.
-                let mut sub = vec![0u8; (best_len.min(16) * 4) as usize];
-                if core.mem.read(best_start, &mut sub).is_ok() {
-                    for k in 0..(sub.len() / 4) {
-                        let v = u32::from_be_bytes([
-                            sub[k * 4], sub[k * 4 + 1],
-                            sub[k * 4 + 2], sub[k * 4 + 3],
-                        ]);
-                        eprintln!(
-                            "[R9.1k scan]   [{k:02}] +0x{:04x}: 0x{v:08x}",
-                            k * 4,
-                        );
-                    }
+                // Dump each FD's code field (first u64 inside the FD)
+                // so we can identify which slot is __librt_write_r
+                // (we know its body starts at vaddr 0x11168).
+                for k in 0..best_len {
+                    let mut slot = [0u8; 8];
+                    if core.mem.read(
+                        best_start + (k * 8) as u32,
+                        &mut slot,
+                    ).is_err() { break; }
+                    let fd_addr = u64::from_be_bytes(slot) as u32;
+                    let mut code_bytes = [0u8; 8];
+                    let code = if core.mem.read(fd_addr, &mut code_bytes).is_ok() {
+                        u64::from_be_bytes(code_bytes)
+                    } else { 0 };
+                    eprintln!(
+                        "[R9.1n scan]   [{k:02}] slot=+0x{:04x} FD@0x{fd_addr:x} code=0x{:x}",
+                        k * 8, code,
+                    );
                 }
             } else {
-                eprintln!("[R9.1k scan] NO text-pointer runs in .data — __syscalls not populated; constructors likely did NOT run");
+                eprintln!(
+                    "[R9.1m scan] NO FD-pointer runs in .data — \
+                     __syscalls table NOT populated",
+                );
             }
         }
     }

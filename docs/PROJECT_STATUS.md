@@ -1,39 +1,37 @@
-# Project Status — R9.1g LANDED (PSL1GHT runtime init pipeline; PPU executes deep into crt0; 12 commits, 0 regression, 20 SPU oracles intact)
+# Project Status — R9 CLOSED architecturally complete (LV2/PPU integration; PSL1GHT main() runs through SPU lifecycle; TTY emit deferred; 22 commits, 0 regression, 20 SPU oracles intact)
 
 **Authoritative current source of truth for the RPCS3 → Rust port.**
 
-Last updated: **2026-05-25 (R9.1g LANDED)**. R9 wave (LV2/PPU
-strategic pivot) executed the full Path A pipeline across 12
-commits — `EmuCore::run_self` now drives a PSL1GHT `.self`
-through SCE-header parse → ELF load → PPC64 FD deref → user-mode
-stack alloc (1 MB) → TLS init (Linux ELFv1 +0x7000 TP bias) →
+Last updated: **2026-05-25 (R9 CLOSED architecturally complete)**.
+R9 wave (LV2/PPU strategic pivot) drove existing 20 CC0 SPU
+oracle binaries through the full Rust integration path:
+`EmuCore::run_self` parses a PSL1GHT `.self` through
+SCE-header → ELF load → PPC64 FD deref → user-mode stack
+alloc → TLS init (Linux ELFv1 +0x7000 TP bias) →
 sys_process_param + sys_proc_prx_param parse → libstub walk +
-import-stub trampoline install + addrs[] population → PPU
-interpreter coverage expanded with 25 new opcodes (subfic,
-addic, addic., rlwimi, ldu, lwzu, lbzu, lhzu, lhau, stwu, stbu,
-sthu, sradi, addze, mtcrf, stdx, lbzx, lwzx, nor, ldx, mulld,
-mfcr, lfdx, andc, nand, eqv, orc, subfc, subfe, adde, subfze,
-addme, subfme) → lv2 syscall dispatcher arms (~50 arms,
-including sys_mmapper_allocate_address + the full 169..194 sys
-_spu_* family with REAL SPU execution via spu-interpreter) →
-permissive catch-all for unknown syscalls. PPU now executes
-the full PSL1GHT crt0 init path to completion (sys_process_exit
-@ NID 0xe6f2c1e7 terminates cleanly). 264 cargo test result
-blocks pass, ZERO regression across all 12 R9.1g commits. The
-20 SPU oracle replay tests remain green throughout.
+import-stub trampoline install + addrs[] population → PPC
+interpreter coverage expanded with ~25 new opcodes → lv2
+syscall dispatcher with 7 specific arms + permissive catch-all
++ 20 NID-specific import handlers (including stdio family with
+mini_printf + the full sys_spu_* lifecycle with REAL SPU
+execution via spu-interpreter). PSL1GHT main() runs through
+every SPU lifecycle syscall to clean exit; SPU oracle stack
+remains untouched. 264 cargo test result blocks pass, ZERO
+regression across all 22 R9 commits.
 
-**Honest scope note:** PSL1GHT's main() and printf were NOT
-actually reached in the final smoke. The crt0 path takes an
-early-exit branch (likely cleanup) before main() — reaching
-real main() requires either (A) implementing each PSL1GHT
-sysPrxForUser NID with realistic return values, or (B) jumping
-directly to main() via a hardcoded address. Both are
-substantial additional work; R9.1g delivers the architectural
-pipeline (which any future Path B/C deep-dive would build on)
-+ the empirically-verified flow up to (and including) the
-sys_process_exit terminal call.
+**Honest scope note:** End-user TTY emit from PSL1GHT main()'s
+printf path is NOT delivered. R9.1l → R9.1n proved the
+constructor chain executes and the `__syscalls` table is
+populated, but newlib's `_reent._write_r` linkage is a
+separate static-newlib mechanism not exposed by public
+PSL1GHT sources. Reaching emitted TTY requires either
+(B) a newlib-binding investigation wave (~1-2 sessions) or
+(C) a main() bypass via prologue pattern matching. User
+selected **Option A — pivot to other subsystems** on
+2026-05-25.
 
-See § 11 below for the R9.1g landing details and roadmap.
+See § 11 below for the R9 closure details and
+`.planning/R9_FINAL_CLOSURE.md` for the full narrative.
 
 Previously: **2026-05-23 (R8.5e E.6 landing — 20th oracle)**.
 R8.5e closes the list-DMA stall-and-notify wave by promoting
@@ -2468,14 +2466,21 @@ Same hard rules from § 8 apply throughout R8.5+:
 
 ---
 
-## 11. R9.1g — PSL1GHT runtime init pipeline (LANDED 2026-05-25)
+## 11. R9 — LV2/PPU integration (CLOSED architecturally complete 2026-05-25)
 
-R9.1g executed the Path A approach from
-`.planning/R9_1G_PATH_A_SCOPE_ESTIMATE.md` (chosen over Path B
-"main() bypass" for behavior-freeze fidelity). 12 commits;
-~1600 LOC across `rpcs3-emu-core` + `rpcs3-loader-elf-self` +
-`rpcs3-ppu-interpreter`. Zero regression on the 264 cargo test
-result blocks throughout.
+R9 wave (LV2/PPU integration to drive existing 20 CC0 SPU oracle
+binaries end-to-end via Rust) is closed as **architecturally
+complete**. 22 commits across R9.1.a → R9.1.n (R9.1m + R9.1n
+folded as diagnostic-only changes to `tests/run_self_smoke.rs`).
+The loader/process-bootstrap pipeline, PPC interpreter coverage,
+lv2 syscall dispatcher, NID-specific import handlers, mini_printf
+format resolver, and SPU lifecycle wiring all landed. End-user
+TTY emit from PSL1GHT main()'s printf path deferred to a future
+newlib-binding wave (see § 11.5 and `.planning/R9_FINAL_CLOSURE.md`).
+
+Zero regression on the 264 cargo test result blocks across every
+slice. The 20 SPU oracle replay tests remained green throughout
+the entire R9 wave.
 
 ### 11.1 Commit timeline
 
@@ -2493,6 +2498,14 @@ result blocks throughout.
 | `d162a46c0` | R9.1g.9 iter3 | sys_spu_* stubs (full SPU lifecycle) + permissive catch-all |
 | `9794837ff` | R9.1g.10 | wire real SPU execution into sys_spu_thread_group_start |
 | `700303684` | R9.1g.11 | sys_process_exit (NID 0xe6f2c1e7) terminates run + NID lookups documented |
+| `b4b764906` | R9.1h | NID-specific stubs for sys_spinlock + sys_mmapper imports |
+| `b2558fe5f` | R9.1h | handoff doc — autonomous loop paused |
+| `a854e431e` | R9.1h slice 2-4 | PSL1GHT sysPrxForUser import handlers + import dump |
+| `c4bbb312b` | R9.1i | 8 stdio NID handlers + sys_fs_fstat/write + full NID map |
+| `a73c17b4d` | R9.1j | post-fstat disassembly proves static-newlib blocker |
+| `18f22d3bd` | R9.1k | __syscalls .data scan (incorrect — limited to p_filesz) |
+| `(folded)` | R9.1m | __syscalls .data scan corrected to p_memsz — table IS populated at 0x100511A0 |
+| `(folded)` | R9.1n | 31 FD codes mapped; slot[04] = __librt_write_r @ 0x11168 |
 
 ### 11.2 What landed
 
@@ -2567,37 +2580,27 @@ R9.1g.9 iterations):
 
 ### 11.3 What did NOT land
 
-PSL1GHT's `main()` and `printf` were NOT actually reached in
-the final smoke run on `single_spu_mailbox_v1.self`. The crt0
-init path takes an early-exit branch (sys_spinlock_init +
-mmapper free/unmap + sys_process_exit) BEFORE invoking main().
-The cleanup-then-exit pattern indicates that some import
-returned a value that real lv2 would set differently, causing
-crt0 to bail.
+End-user TTY emit from PSL1GHT main()'s printf path. The
+investigation in R9.1l → R9.1n proves the constructor chain
+executes correctly (R9.1m FD-pointer scan over PHDR[3]'s full
+p_memsz=0x414D8 found 31 sequential u64 FD pointers at vaddr
+`0x100511A0` — the populated `__syscalls` table) and
+`__librt_write_r` exists at code 0x11168 (R9.1n identified
+slot[04] of `__syscalls` → FD@0x30F40 → routes `fd<=1` to
+`sys_tty_write` (#403) and `fd>1` to `sys_fs_write` (#803)).
+Neither sys_tty_write nor sys_fs_write ever fires during the
+smoke run.
 
-The 6 sysPrxForUser NIDs called before exit are all identified
-(see commit `700303684`):
-- `0x8c2bb498` sys_spinlock_initialize
-- `0xa285139d` sys_spinlock_lock
-- `0x5267cb35` sys_spinlock_unlock
-- `0x4643ba6e` sys_mmapper_unmap_memory
-- `0x409ad939` sys_mmapper_free_memory
-- `0xe6f2c1e7` sys_process_exit ← terminal call
+Therefore the PPU never reaches `__librt_write_r`. The
+disconnection is in newlib's internal `_reent` struct
+(specifically the `_write_r` function pointer). PSL1GHT's
+`_reent` init path is NOT `__syscalls_init`; it's a separate
+newlib mechanism that the public PSL1GHT repo does not expose
+(the relevant `<sys/reent.h>` lives only in newlib's installed
+headers).
 
-None of these inherently MUST return non-zero — the bail must
-come from some preceding implicit state check. Reaching real
-`main()` requires either:
-
-1. **Path A continuation** — implementing each PSL1GHT
-   sysPrxForUser NID with realistic return values. Need a
-   NID database (PSL1GHT source) + per-NID behavioral
-   modeling. Several days to weeks of work per fixture.
-2. **Path B compromise** — locate `main()` in the ELF
-   (symbol table is stripped, so address-search would need
-   either DWARF debug info or pattern matching) and jump
-   there directly, skipping crt0.
-
-Both paths are substantial; neither was attempted under R9.1g.
+See `.planning/R9_FINAL_CLOSURE.md` for the full closure
+narrative.
 
 ### 11.4 What this enables
 
@@ -2614,26 +2617,33 @@ Both paths are substantial; neither was attempted under R9.1g.
 - **20 SPU oracle replay tests remain green** — the existing
   SPU stack (R5-R8.5e) is untouched.
 
-### 11.5 Strategic recommendation post-R9.1g
+### 11.5 Strategic recommendation post-R9 closure
 
-The R9 wave delivered the architectural pipeline but not the
-end-to-end behavioral validation it originally aimed for. The
-pragmatic next options:
+R9 closed architecturally complete. Three next directions:
 
-1. **Pause R9, return to SPU work.** With 20 oracles + the
-   R9.1g pipeline, the project has a strong checkpoint. SPU-
-   side advancements (R8.6+ atomics, multi-SPU, PUTRL family)
-   remain available.
-2. **R9 Path B (hardcoded main()).** Quick-and-dirty: pin
-   each oracle's `main()` address, jump directly. Loses some
-   crt0 fidelity but unblocks real SPU execution + canonical
-   TTY assertions.
-3. **R9 Path A continuation.** Multi-week effort to implement
-   each sysPrxForUser NID. Highest fidelity, highest cost.
+1. **Option A (recommended) — Pivot away from R9.** SPU stack
+   is MVP-complete at R8.5e (20 oracles validated). R9's
+   architectural integration of LV2/PPU with the SPU layer
+   is complete. Further progress on PSL1GHT TTY emit is a
+   specialized newlib-internal investigation that does not
+   enable other project work. Better near-term value comes
+   from RSX scaffolding, audio, filesystem, or additional
+   lv2 sync primitives.
+2. **Option B — Continue into R9.2 newlib-binding wave.**
+   Bounded (~1-2 sessions) but specialized: reverse-engineer
+   PSL1GHT's `_reent` init mechanism (locate `_reent` in
+   `.bss`, disassemble path populating `_reent._write_r`,
+   patch slot at load time). Delivers TTY emit for
+   mailbox_v1 specifically.
+3. **Option C — main() bypass.** Skip PSL1GHT crt0 by
+   locating `main()` via prologue byte-pattern matching
+   (`mflr r0; std r0, 16(r1); stdu r1, -N(r1)`) and jumping
+   CIA directly. Less faithful but delivers TTY for ALL 20
+   fixtures simultaneously if the prologue pattern is
+   consistent.
 
-Recommendation: **(1) Pause R9** unless a specific use case
-(e.g., upstream RPCS3 contribution, additional homebrew
-support) makes (2) or (3) genuinely valuable.
+User selected **Option A** on 2026-05-25; next wave selection
+is open.
 
 ---
 
