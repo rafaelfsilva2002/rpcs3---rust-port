@@ -240,6 +240,11 @@ pub struct EmuCore {
     /// `sys_tty_write` (syscall 403) appends here; tests read it
     /// post-run to assert canonical TTY strings.
     pub tty: SysTty,
+    /// R9.1g.6/.7 — resolved import stubs (set by
+    /// [`EmuCore::init_imports`]). When the PPU `sc` instruction
+    /// fires from a stub trampoline, the dispatcher looks up the
+    /// stub here to either dispatch the import or return-to-caller.
+    pub import_plan: Option<ImportPlan>,
     /// Maximum steps per `run` invocation. 0 = unbounded.
     pub step_budget: usize,
 }
@@ -258,6 +263,7 @@ impl EmuCore {
             ppu: PpuThread::new(PPU_ID_BASE),
             process: TestProcessState::default(),
             tty: SysTty::new(),
+            import_plan: None,
             step_budget: 100_000,
         }
     }
@@ -669,6 +675,32 @@ impl EmuCore {
         let number = self.ppu.gpr[11];
         let cia_at_sc = self.ppu.cia.wrapping_sub(4);
 
+        // R9.1g.7 — if the `sc` fired from inside the import-stub
+        // region, this is NOT a real lv2 syscall. It's a PLT thunk
+        // hitting an installed trampoline. Look up the import and
+        // (for the MVP) return-to-caller with r3 = 0. Future
+        // slices will route specific NIDs to their Rust impls.
+        if self.is_in_import_stub_region(cia_at_sc) {
+            if let Some(plan) = self.import_plan.as_ref() {
+                if let Some(stub) = plan.lookup_by_trampoline(self.ppu.cia) {
+                    // Log + return-to-caller. The caller did
+                    // `bcctrl` which set LR = caller's next inst,
+                    // so jumping to LR resumes the caller. We also
+                    // zero r3 (PowerPC convention: return value in r3).
+                    eprintln!(
+                        "[R9.1g.7] unimplemented import: {}::0x{:08x} \
+                         (trampoline=0x{:08x} addrs_slot=0x{:08x}) — \
+                         returning 0",
+                        stub.module_name, stub.nid,
+                        stub.trampoline_vaddr, stub.addrs_slot,
+                    );
+                    self.ppu.gpr[3] = 0;
+                    self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                    return Ok(None);
+                }
+            }
+        }
+
         // r3..r10 hold args; return value goes back into r3.
         let r3 = self.ppu.gpr[3];
         let r4 = self.ppu.gpr[4];
@@ -783,6 +815,15 @@ impl EmuCore {
             }
         }
         Ok(None)
+    }
+
+    /// R9.1g.7 — true if `cia` is inside the import-stub region.
+    /// The check is range-based so the dispatcher recognizes any
+    /// stub trampoline regardless of which import it belongs to.
+    #[inline]
+    fn is_in_import_stub_region(&self, cia: u32) -> bool {
+        cia >= USER_IMPORT_STUB_VADDR
+            && cia < USER_IMPORT_STUB_VADDR.wrapping_add(USER_IMPORT_STUB_SIZE)
     }
 
     fn write_syscall_result(&mut self, r: SyscallResult) {
