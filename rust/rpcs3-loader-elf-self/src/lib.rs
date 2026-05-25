@@ -172,6 +172,107 @@ impl ElfInfo {
     pub fn pt_load_iter(&self) -> impl Iterator<Item = &ProgramHeader> {
         self.program_headers.iter().filter(|p| p.p_type == 1)
     }
+
+    /// R9.1g.2 — return the PT_SCE_PPU_PROCESS_PARAM segment (custom
+    /// PHDR type `0x60000001`) if present. PSL1GHT-built `.self`
+    /// binaries emit this for every executable; it holds the
+    /// `sys_process_param_t` block (priority + stack size + sdk_ver
+    /// + magic).
+    pub fn pt_proc_param(&self) -> Option<&ProgramHeader> {
+        self.program_headers
+            .iter()
+            .find(|p| p.p_type == PT_SCE_PPU_PROCESS_PARAM)
+    }
+
+    /// R9.1g.3 — return the PT_SCE_PPU_PROC_PARAM segment (custom
+    /// PHDR type `0x60000002`) if present. Holds pointers to
+    /// malloc/free init hooks lv2 must call before _start.
+    pub fn pt_proc_proc_param(&self) -> Option<&ProgramHeader> {
+        self.program_headers
+            .iter()
+            .find(|p| p.p_type == PT_SCE_PPU_PROC_PARAM)
+    }
+}
+
+/// R9.1g.2 — custom PHDR type for PSL1GHT `sys_process_param_t`
+/// segment. The standard ELF spec reserves the `0x60000000..=0x6FFFFFFF`
+/// range for OS-specific use; PS3 lv2 occupies a subset.
+pub const PT_SCE_PPU_PROCESS_PARAM: u32 = 0x6000_0001;
+
+/// R9.1g.3 — custom PHDR type for the proc_param struct (malloc /
+/// free / fixed-alloc init hooks).
+pub const PT_SCE_PPU_PROC_PARAM: u32 = 0x6000_0002;
+
+/// R9.1g.2 — parsed contents of the `sys_process_param_t` segment
+/// (PT_SCE_PPU_PROCESS_PARAM, 32 bytes). Field layout reverse-
+/// engineered from PSL1GHT-built `.self` binaries; cross-verified
+/// against the `SYS_PROCESS_PARAM(prio, stack)` macro values:
+/// observed values for `single_spu_mailbox_v1.self` match the
+/// macro inputs (prio=1001, stack=0x10000).
+///
+/// All fields are big-endian on the wire (PowerPC native).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SysProcessParam {
+    /// Self-reported size of this struct (always `0x20` for v1).
+    pub size: u32,
+    /// Magic value `0x13BCC5F6` identifying the PSL1GHT v1 layout.
+    pub magic: u32,
+    /// SDK version reported to the loader (e.g. `0x00009000`).
+    pub sdk_version: u32,
+    /// PS3 firmware-version code the binary was built against
+    /// (e.g. `0x00192001` = 4.93). Not always meaningful for
+    /// homebrew, but the loader records it for diagnostics.
+    pub fw_version_code: u32,
+    /// Primary thread priority (matches `SYS_PROCESS_PARAM` macro
+    /// arg 1; e.g. 1001 for our oracle fixtures).
+    pub primary_prio: u32,
+    /// Primary thread stack size in bytes (matches macro arg 2;
+    /// e.g. `0x10000` = 64 KB for our oracle fixtures).
+    pub primary_stacksize: u32,
+    /// Default page size for the lv2 user-mode `malloc` heap
+    /// (typically `0x100000` = 1 MB).
+    pub malloc_pagesize: u32,
+    /// Reserved (zero in observed binaries).
+    pub reserved: u32,
+}
+
+pub const SYS_PROCESS_PARAM_SIZE: usize = 32;
+pub const SYS_PROCESS_PARAM_MAGIC: u32 = 0x13BC_C5F6;
+
+impl SysProcessParam {
+    /// Parse the 32-byte BE struct from a raw byte slice. Errors if
+    /// the slice is shorter than `SYS_PROCESS_PARAM_SIZE` or if the
+    /// `size` field disagrees with the slice length / `magic` is
+    /// off.
+    pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() < SYS_PROCESS_PARAM_SIZE {
+            return Err(Error::TooShort);
+        }
+        let size = read_u32_be(bytes, 0)?;
+        let magic = read_u32_be(bytes, 4)?;
+        if size as usize != SYS_PROCESS_PARAM_SIZE {
+            return Err(Error::Malformed(format!(
+                "sys_process_param size 0x{size:x} != expected 0x{:x}",
+                SYS_PROCESS_PARAM_SIZE
+            )));
+        }
+        if magic != SYS_PROCESS_PARAM_MAGIC {
+            return Err(Error::Malformed(format!(
+                "sys_process_param magic 0x{magic:08x} != expected 0x{:08x}",
+                SYS_PROCESS_PARAM_MAGIC
+            )));
+        }
+        Ok(Self {
+            size,
+            magic,
+            sdk_version: read_u32_be(bytes, 8)?,
+            fw_version_code: read_u32_be(bytes, 12)?,
+            primary_prio: read_u32_be(bytes, 16)?,
+            primary_stacksize: read_u32_be(bytes, 20)?,
+            malloc_pagesize: read_u32_be(bytes, 24)?,
+            reserved: read_u32_be(bytes, 28)?,
+        })
+    }
 }
 
 /// Parse an ELF header + program headers. Delegates to `goblin`.
@@ -367,6 +468,64 @@ pub fn parse_self_ext_header(bytes: &[u8]) -> Result<SelfExtHeader, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- R9.1g.2 sys_process_param parser --------------------------
+
+    /// Empirical bytes from `single_spu_mailbox_v1.self` PHDR[6]
+    /// (PT_SCE_PPU_PROCESS_PARAM segment at vaddr 0x2BEC0).
+    /// SYS_PROCESS_PARAM(1001, 0x10000) → prio=0x3E9, stack=0x10000.
+    const MAILBOX_V1_PROC_PARAM_BYTES: [u8; 32] = [
+        0x00, 0x00, 0x00, 0x20,   // size = 32
+        0x13, 0xBC, 0xC5, 0xF6,   // magic
+        0x00, 0x00, 0x90, 0x00,   // sdk_version
+        0x00, 0x19, 0x20, 0x01,   // fw_version_code
+        0x00, 0x00, 0x03, 0xE9,   // primary_prio = 1001
+        0x00, 0x01, 0x00, 0x00,   // primary_stacksize = 64 KB
+        0x00, 0x10, 0x00, 0x00,   // malloc_pagesize = 1 MB
+        0x00, 0x00, 0x00, 0x00,   // reserved
+    ];
+
+    #[test]
+    fn sys_process_param_parses_mailbox_v1_layout() {
+        let p = SysProcessParam::parse(&MAILBOX_V1_PROC_PARAM_BYTES).unwrap();
+        assert_eq!(p.size, 0x20);
+        assert_eq!(p.magic, SYS_PROCESS_PARAM_MAGIC);
+        assert_eq!(p.sdk_version, 0x9000);
+        assert_eq!(p.fw_version_code, 0x0019_2001);
+        assert_eq!(p.primary_prio, 1001);
+        assert_eq!(p.primary_stacksize, 0x10000);
+        assert_eq!(p.malloc_pagesize, 0x10_0000);
+        assert_eq!(p.reserved, 0);
+    }
+
+    #[test]
+    fn sys_process_param_rejects_short_input() {
+        let bytes = [0u8; 16];
+        assert!(matches!(
+            SysProcessParam::parse(&bytes),
+            Err(Error::TooShort)
+        ));
+    }
+
+    #[test]
+    fn sys_process_param_rejects_wrong_magic() {
+        let mut bytes = MAILBOX_V1_PROC_PARAM_BYTES;
+        bytes[4..8].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        assert!(matches!(
+            SysProcessParam::parse(&bytes),
+            Err(Error::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn sys_process_param_rejects_wrong_size_field() {
+        let mut bytes = MAILBOX_V1_PROC_PARAM_BYTES;
+        bytes[0..4].copy_from_slice(&0x40u32.to_be_bytes()); // size says 64, not 32
+        assert!(matches!(
+            SysProcessParam::parse(&bytes),
+            Err(Error::Malformed(_))
+        ));
+    }
 
     // -- Magic identification --------------------------------------
 
