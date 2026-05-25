@@ -923,6 +923,269 @@ impl EmuCore {
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
+                        // R9.1h slice 2 — newlib `write(fd, buf,
+                        // count)` (NID 0x526a496a). Routes any
+                        // write to the per-channel TTY buffer
+                        // (mapping fd→tty_channel as
+                        // 1=stdout→ch3, 2=stderr→ch3 fallback).
+                        // Returns count on success.
+                        0x526a496a => {
+                            let fd = r3_in as i32;
+                            let buf_ptr = r4_in as u32;
+                            let count = self.ppu.gpr[5] as u32;
+                            let ch: i32 = if fd == 2 { 3 } else { 3 };
+                            let mut bytes = vec![0u8; count as usize];
+                            if count > 0 && self
+                                .mem
+                                .read(buf_ptr, &mut bytes)
+                                .is_ok()
+                            {
+                                let s =
+                                    String::from_utf8_lossy(&bytes)
+                                        .into_owned();
+                                let mut written: u32 = 0;
+                                let _ = self.tty.write(
+                                    ch, Some(&s), count, Some(&mut written),
+                                );
+                                eprintln!(
+                                    "[R9.1h] write(fd={fd}, *0x{buf_ptr:x}, \
+                                     {count}) → {written} (ch{ch})",
+                                );
+                            }
+                            self.ppu.gpr[3] = count as u64;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // newlib `puts(s)` (NID 0xe3cc73f3): write
+                        // NUL-terminated string at r3 to TTY +
+                        // append a newline.
+                        0xe3cc73f3 => {
+                            let str_ptr = r3_in as u32;
+                            let s = read_c_string(&self.mem, str_ptr, 4096).unwrap_or_default();
+                            let payload = format!("{s}\n");
+                            let mut written: u32 = 0;
+                            let _ = self.tty.write(
+                                3,
+                                Some(&payload),
+                                payload.len() as u32,
+                                Some(&mut written),
+                            );
+                            eprintln!(
+                                "[R9.1h] puts(*0x{str_ptr:x}) → {written}",
+                            );
+                            self.ppu.gpr[3] = payload.len() as u64;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // R9.1h slice 3 — PSL1GHT lwmutex family
+                        // (all no-ops + minimal initialization).
+                        // 0x2f85c0ef sys_lwmutex_create(*lock, *attr):
+                        // zero the 8-byte lwmutex struct.
+                        0x2f85c0ef => {
+                            let lock_ptr = r3_in as u32;
+                            self.mem.write(lock_ptr, &[0u8; 8]).ok();
+                            self.ppu.gpr[3] = 0;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // 0x1573dc3f sys_lwmutex_lock(*lock, timeout):
+                        // single-threaded no-op.
+                        0x1573dc3f => {
+                            self.ppu.gpr[3] = 0;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // 0x1bc200f4 sys_lwmutex_unlock (already
+                        // handled above).
+                        // 0xb257540b sys_mmapper_allocate_memory(
+                        //   size, flags, *mem_id_out): write a
+                        // unique mem_id and pretend the heap was
+                        // allocated.
+                        0xb257540b => {
+                            self.mmapper_alloc_cursor =
+                                self.mmapper_alloc_cursor.wrapping_add(1);
+                            let mem_id = self.mmapper_alloc_cursor;
+                            let out_ptr = self.ppu.gpr[5] as u32;
+                            if out_ptr != 0 {
+                                self.mem.write(out_ptr, &mem_id.to_be_bytes())
+                                    .ok();
+                            }
+                            self.ppu.gpr[3] = 0;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // 0xebe5f72f sys_spu_image_import(*image, src, type):
+                        // load SPU ELF from src into our captured
+                        // SpuImage so subsequent sysSpuThreadGroup_*
+                        // calls can run it.
+                        0xebe5f72f => {
+                            let image_ptr = r3_in as u32;
+                            let src_ptr = r4_in as u32;
+                            eprintln!(
+                                "[R9.1h] sys_spu_image_import(*0x{image_ptr:x}, \
+                                 src=0x{src_ptr:x})",
+                            );
+                            // Read up to 256 KB of SPU ELF from
+                            // PPU memory.
+                            let mut blob = vec![0u8; 256 * 1024];
+                            let read_len =
+                                self.mem.read(src_ptr, &mut blob).map(|_| blob.len()).unwrap_or(0);
+                            if read_len > 0 {
+                                if let Ok(info) =
+                                    rpcs3_loader_elf_self::parse_elf(&blob[..read_len])
+                                {
+                                    if info.is_spu() {
+                                        let phdrs: Vec<_> = info
+                                            .program_headers
+                                            .iter()
+                                            .map(|p| rpcs3_lv2_spu_image::SpuPhdr {
+                                                p_type: p.p_type,
+                                                p_offset: p.p_offset as u32,
+                                                p_vaddr: p.p_vaddr as u32,
+                                                p_filesz: p.p_filesz as u32,
+                                                p_memsz: p.p_memsz as u32,
+                                            })
+                                            .collect();
+                                        if let Ok(image) =
+                                            rpcs3_lv2_spu_image::build_image(
+                                                info.e_entry as u32,
+                                                &phdrs,
+                                                src_ptr,
+                                            )
+                                        {
+                                            eprintln!(
+                                                "[R9.1h] SPU image captured: \
+                                                 entry=0x{:x} segs={}",
+                                                image.entry_point,
+                                                image.segments.len(),
+                                            );
+                                            self.spu_image = Some(image.clone());
+                                            self.spu_image_src_vaddr = src_ptr;
+                                            // Write a stub sysSpuImage
+                                            // struct: type=0, entry,
+                                            // segs_ptr=0, nsegs=count.
+                                            let mut buf = [0u8; 16];
+                                            buf[0..4].copy_from_slice(
+                                                &0u32.to_be_bytes(),
+                                            );
+                                            buf[4..8].copy_from_slice(
+                                                &(image.entry_point).to_be_bytes(),
+                                            );
+                                            buf[8..12].copy_from_slice(
+                                                &0u32.to_be_bytes(),
+                                            );
+                                            buf[12..16].copy_from_slice(
+                                                &(image.segments.len() as u32)
+                                                    .to_be_bytes(),
+                                            );
+                                            self.mem.write(image_ptr, &buf).ok();
+                                            self.ppu.gpr[3] = 0;
+                                            self.ppu.cia =
+                                                (self.ppu.lr as u32) & !0x3;
+                                            return Ok(None);
+                                        }
+                                    }
+                                }
+                            }
+                            // Fallback: signal success but no image.
+                            self.ppu.gpr[3] = 0;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // R9.1h slice 4 — `_sys_printf(fmt, ...)`
+                        // (NID 0x9f04f7af): PSL1GHT's actual printf
+                        // entry point as used by `printf()` in
+                        // mailbox_v1's main(). Routes through
+                        // mini_printf + tty.write to TTY ch3.
+                        0x9f04f7af => {
+                            let fmt_ptr = r3_in as u32;
+                            let fmt = read_c_string(&self.mem, fmt_ptr, 4096)
+                                .unwrap_or_default();
+                            let args = [
+                                self.ppu.gpr[4],
+                                self.ppu.gpr[5],
+                                self.ppu.gpr[6],
+                                self.ppu.gpr[7],
+                                self.ppu.gpr[8],
+                                self.ppu.gpr[9],
+                                self.ppu.gpr[10],
+                            ];
+                            let formatted = mini_printf(&fmt, &args, &self.mem);
+                            let mut written: u32 = 0;
+                            let _ = self.tty.write(
+                                3,
+                                Some(&formatted),
+                                formatted.len() as u32,
+                                Some(&mut written),
+                            );
+                            eprintln!(
+                                "[R9.1h] _sys_printf(*0x{fmt_ptr:x}) → {written}: {formatted:?}",
+                            );
+                            self.ppu.gpr[3] = formatted.len() as u64;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // `_sys_vsprintf(buf, fmt, va_list)` (NID
+                        // 0x791b9219): write formatted output into
+                        // `buf` (r3). The PSL1GHT runtime threads
+                        // its va_list through r5. For the MVP, treat
+                        // it like printf and dump the formatted
+                        // result into the supplied buffer.
+                        0x791b9219 => {
+                            let buf_ptr = r3_in as u32;
+                            let fmt_ptr = r4_in as u32;
+                            let fmt = read_c_string(&self.mem, fmt_ptr, 4096)
+                                .unwrap_or_default();
+                            let args = [
+                                self.ppu.gpr[5],
+                                self.ppu.gpr[6],
+                                self.ppu.gpr[7],
+                                self.ppu.gpr[8],
+                                self.ppu.gpr[9],
+                                self.ppu.gpr[10],
+                            ];
+                            let formatted = mini_printf(&fmt, &args, &self.mem);
+                            let mut bytes = formatted.into_bytes();
+                            bytes.push(0);
+                            self.mem.write(buf_ptr, &bytes).ok();
+                            self.ppu.gpr[3] = (bytes.len() - 1) as u64;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // newlib `printf(fmt, ...)` (NID 0xc01d9f97):
+                        // for the R9.1h MVP we resolve %d / %x /
+                        // %s / %c from r4-r10 and emit to TTY ch3.
+                        // Full printf is libc territory; this
+                        // covers the formats the oracle fixtures
+                        // use ("OK status=0x%x\n", etc.).
+                        0xc01d9f97 => {
+                            let fmt_ptr = r3_in as u32;
+                            let fmt = read_c_string(&self.mem, fmt_ptr, 4096).unwrap_or_default();
+                            let args = [
+                                self.ppu.gpr[4],
+                                self.ppu.gpr[5],
+                                self.ppu.gpr[6],
+                                self.ppu.gpr[7],
+                                self.ppu.gpr[8],
+                                self.ppu.gpr[9],
+                                self.ppu.gpr[10],
+                            ];
+                            let formatted = mini_printf(&fmt, &args, &self.mem);
+                            let mut written: u32 = 0;
+                            let _ = self.tty.write(
+                                3,
+                                Some(&formatted),
+                                formatted.len() as u32,
+                                Some(&mut written),
+                            );
+                            eprintln!(
+                                "[R9.1h] printf(*0x{fmt_ptr:x}={fmt:?}) \
+                                 → {written}: {formatted:?}",
+                            );
+                            self.ppu.gpr[3] = formatted.len() as u64;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
                         _ => {}
                     }
 
@@ -1405,6 +1668,93 @@ impl EmuCore {
             }
         }
     }
+}
+
+// =====================================================================
+// R9.1h helpers — minimal libc fragments for printf-family imports
+// =====================================================================
+
+/// Minimal printf-family format-string resolver. Supports `%d`,
+/// `%u`, `%x`, `%X`, `%s`, `%c`, `%p`, `%%`, plus the common
+/// width-prefix forms (`%08x`, `%2d`). Args pulled from the
+/// supplied `args` slice (mapped from PPU r4..r10 by the caller).
+fn mini_printf(fmt: &str, args: &[u64], mem: &SparseBackend) -> String {
+    let mut out = String::with_capacity(fmt.len());
+    let mut chars = fmt.chars().peekable();
+    let mut arg_idx = 0usize;
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        // Width specifier (digit-only; flags like '0' just collapse
+        // into width here for the MVP).
+        let mut width_buf = String::new();
+        while let Some(&p) = chars.peek() {
+            if p.is_ascii_digit() {
+                width_buf.push(p);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let width: usize = width_buf.parse().unwrap_or(0);
+        let pad_zero = width_buf.starts_with('0');
+        let spec = match chars.next() {
+            Some(s) => s,
+            None => break,
+        };
+        let next_arg = || {
+            args.get(arg_idx).copied().unwrap_or(0)
+        };
+        let formatted = match spec {
+            '%' => "%".to_string(),
+            'd' | 'i' => {
+                let v = next_arg() as i64;
+                arg_idx += 1;
+                v.to_string()
+            }
+            'u' => {
+                let v = next_arg() as u32;
+                arg_idx += 1;
+                v.to_string()
+            }
+            'x' => {
+                let v = next_arg() as u32;
+                arg_idx += 1;
+                format!("{v:x}")
+            }
+            'X' => {
+                let v = next_arg() as u32;
+                arg_idx += 1;
+                format!("{v:X}")
+            }
+            'p' => {
+                let v = next_arg() as u32;
+                arg_idx += 1;
+                format!("0x{v:08x}")
+            }
+            'c' => {
+                let v = next_arg() as u8 as char;
+                arg_idx += 1;
+                v.to_string()
+            }
+            's' => {
+                let v = next_arg() as u32;
+                arg_idx += 1;
+                read_c_string(mem, v, 4096).unwrap_or_default()
+            }
+            other => format!("%{other}"),
+        };
+        if width > formatted.len() {
+            let pad = if pad_zero { '0' } else { ' ' };
+            for _ in 0..(width - formatted.len()) {
+                out.push(pad);
+            }
+        }
+        out.push_str(&formatted);
+    }
+    out
 }
 
 // =====================================================================

@@ -80,6 +80,23 @@ fn r9_1a_run_self_parses_mailbox_v1_and_executes_ppu() {
 
     let result = core.run_self(&self_bytes);
 
+    // R9.1h slice 2 — dump full import plan AFTER run_self
+    // initializes it.
+    if let Some(plan) = core.import_plan.as_ref() {
+        eprintln!(
+            "[R9.1h dump] {} imported stubs:",
+            plan.stubs.len()
+        );
+        for s in &plan.stubs {
+            eprintln!(
+                "  {}::0x{:08x} trampoline=0x{:08x} addrs=0x{:08x}",
+                s.module_name, s.nid, s.trampoline_vaddr, s.addrs_slot,
+            );
+        }
+    } else {
+        eprintln!("[R9.1h dump] no import plan");
+    }
+
     // R9.1c-R9.1f diagnostic — dump key PPU state at exit so each
     // smoke run reports where the boot path stopped and what came
     // after. R9.1f extension: GPR0-12 + CTR + LR for bug isolation
