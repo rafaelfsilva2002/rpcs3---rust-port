@@ -47,7 +47,7 @@ use rpcs3_lv2_spu_group::{
     sys_spu_thread_group_create, sys_spu_thread_group_destroy, sys_spu_thread_group_join,
     sys_spu_thread_group_start, GroupAttr, SpuGroupRegistry, TestSpuGroupRegistry,
 };
-use rpcs3_lv2_spu_image::{deploy as deploy_image, SpuImage};
+use rpcs3_lv2_spu_image::{deploy as deploy_image, build_image, SpuImage, SpuPhdr};
 use rpcs3_spu_interpreter::{run_n as spu_run_n, StepOutcome as SpuStepOutcome, Error as SpuError};
 use rpcs3_spu_thread::SpuThread;
 
@@ -255,6 +255,24 @@ pub struct EmuCore {
     /// strict-fail path (e.g. `unsupported_syscall_bubbles_up_as_error`)
     /// keep the default `false`.
     pub permissive_unknown_syscalls: bool,
+    /// R9.1g.10 — captured SPU image from
+    /// `_sys_spu_image_import` (157). Stored across the
+    /// `sys_spu_thread_initialize` / `_group_start` lifecycle
+    /// so `_group_start` can deploy + run the SPU.
+    pub spu_image: Option<SpuImage>,
+    /// R9.1g.10 — PPU vaddr where the SPU ELF source bytes
+    /// live. The `deploy()` closure reads `p_offset`-relative
+    /// chunks from this base.
+    pub spu_image_src_vaddr: u32,
+    /// R9.1g.10 — captured SPU thread args from
+    /// `sys_spu_thread_initialize` (172). PSL1GHT convention:
+    /// arg0→r3, arg1→r4, arg2→r5, arg3→r6 (each 64-bit).
+    pub spu_thread_args: [u64; 4],
+    /// R9.1g.10 — OUT_MBOX value the SPU thread group emitted
+    /// before halting. Read by `sys_spu_thread_group_join` (178)
+    /// to populate the caller's `*status` pointer with the
+    /// canonical TTY status the binary expects.
+    pub spu_exit_status: Option<u32>,
     /// Maximum steps per `run` invocation. 0 = unbounded.
     pub step_budget: usize,
 }
@@ -275,6 +293,10 @@ impl EmuCore {
             tty: SysTty::new(),
             import_plan: None,
             permissive_unknown_syscalls: false,
+            spu_image: None,
+            spu_image_src_vaddr: 0,
+            spu_thread_args: [0; 4],
+            spu_exit_status: None,
             step_budget: 100_000,
         }
     }
@@ -931,53 +953,203 @@ impl EmuCore {
                 self.ppu.gpr[3] = 0;
             }
             172 => {
-                // sys_spu_thread_initialize(*thread_id, group_id,
-                //   thread_index, *image, *attr, *args)
+                // R9.1g.10 — sys_spu_thread_initialize(*thread_id,
+                //   group_id, thread_index, *image, *attr, *args)
+                //
+                // Reads the 32-byte `sysSpuThreadArgument` struct
+                // from r6 (4× BE u64) and stashes them for the
+                // subsequent group_start to seed SPU r3-r6.
                 let thread_id_ptr = r3 as u32;
+                let args_ptr = self.ppu.gpr[8] as u32;
+                if args_ptr != 0 {
+                    for i in 0..4u32 {
+                        let mut buf = [0u8; 8];
+                        if self.mem.read(args_ptr + i * 8, &mut buf).is_ok() {
+                            self.spu_thread_args[i as usize] =
+                                u64::from_be_bytes(buf);
+                        }
+                    }
+                    eprintln!(
+                        "[R9.1g.10] sys_spu_thread_initialize: args = \
+                         arg0=0x{:016x} arg1=0x{:016x} arg2=0x{:016x} arg3=0x{:016x}",
+                        self.spu_thread_args[0],
+                        self.spu_thread_args[1],
+                        self.spu_thread_args[2],
+                        self.spu_thread_args[3],
+                    );
+                }
                 const STUB_THREAD_ID: u32 = 0x1000_0002;
                 self.mem.write(thread_id_ptr, &STUB_THREAD_ID.to_be_bytes())?;
                 self.ppu.gpr[3] = 0;
             }
             173 => {
-                // sys_spu_thread_group_start(group_id)
-                // FULL E2E execution of the SPU happens here in a
-                // future slice. For now, return 0 — the matching
-                // sys_spu_thread_group_join (178) writes hardcoded
-                // sentinel cause/status so PSL1GHT continues to
-                // its printf without faulting.
+                // R9.1g.10 — sys_spu_thread_group_start(group_id)
+                //
+                // Actually run the SPU. Takes the stored SpuImage
+                // (R9.1g.10 sys_spu_image_import) + thread args
+                // (R9.1g.10 sys_spu_thread_initialize), allocates a
+                // fresh SpuThread + LS, deploys the SPU image into
+                // LS, seeds initial PC + GPRs, runs the SPU
+                // interpreter to a stop instruction, and stashes
+                // the OUT_MBOX value for the matching join (178)
+                // to return as the group exit status.
+                if let Some(image) = self.spu_image.clone() {
+                    let mut ls = vec![0u8; rpcs3_spu_thread::SPU_LS_SIZE];
+                    // Deploy: copy each SpuSegment from the SPU
+                    // ELF blob in PPU memory into LS.
+                    let mem_ref = &self.mem;
+                    let deploy_result = deploy_image(
+                        &image,
+                        &mut ls,
+                        |addr, size| {
+                            let mut buf = vec![0u8; size as usize];
+                            mem_ref.read(addr, &mut buf).ok().map(|()| buf)
+                        },
+                    );
+                    if let Err(e) = deploy_result {
+                        return Err(Error::SpuGroup(e));
+                    }
+                    // Build the SpuThread.
+                    let mut spu = SpuThread::new(0);
+                    for (i, chunk) in ls.chunks(65536).enumerate() {
+                        spu.ls_write((i as u32) * 65536, chunk);
+                    }
+                    spu.pc = image.entry_point;
+                    // Marshal arg0..arg3 into r3..r6 per PSL1GHT
+                    // SPU calling convention. The args are u64 in
+                    // the SPU's preferred slot (top 64 bits of
+                    // 128-bit GPR).
+                    for (slot, &arg) in self.spu_thread_args.iter().enumerate() {
+                        spu.gpr[3 + slot] = (arg as u128) << 64;
+                    }
+                    eprintln!(
+                        "[R9.1g.10] sys_spu_thread_group_start: launching SPU \
+                         entry=0x{:x} arg0=0x{:x} arg1=0x{:x}",
+                        spu.pc, self.spu_thread_args[0], self.spu_thread_args[1],
+                    );
+                    // Run the SPU interpreter until a stop
+                    // instruction halts it (or the step budget is
+                    // exhausted).
+                    let (steps, outcome) = spu_run_n(&mut spu, 10_000_000)?;
+                    match outcome {
+                        SpuStepOutcome::Stop(code) => {
+                            let out_mbox = spu.channels.out_mbox.unwrap_or(0);
+                            eprintln!(
+                                "[R9.1g.10] SPU halted: stop_code=0x{:x} \
+                                 out_mbox=0x{:08x} steps={}",
+                                code, out_mbox, steps,
+                            );
+                            self.spu_exit_status = Some(out_mbox);
+                        }
+                        SpuStepOutcome::Continue => {
+                            return Err(Error::StepsExhausted);
+                        }
+                        SpuStepOutcome::ChannelStall { .. } => {
+                            // Mailbox SPUs may stall on IN_MBOX
+                            // waiting for the PPU; for now treat
+                            // as an error (R9.1g.11+ would wire
+                            // bidirectional mailbox plumbing).
+                            return Err(Error::StepsExhausted);
+                        }
+                        SpuStepOutcome::MfcUnsupported { .. } => {
+                            // The SPU hit an MFC variant not in
+                            // our interpreter — bridge-side path.
+                            // Treat as stop for R9.1g.10's MVP.
+                            self.spu_exit_status = Some(
+                                spu.channels.out_mbox.unwrap_or(0),
+                            );
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "[R9.1g.10] sys_spu_thread_group_start: no SPU image \
+                         was imported — skipping (stub returns 0)",
+                    );
+                }
                 self.ppu.gpr[3] = 0;
             }
             178 => {
-                // sys_spu_thread_group_join(group_id, *cause, *status)
-                // Stub: cause=1 (JOIN_GROUP_EXIT), status=0 (CELL_OK).
-                // Real execution of the SPU image (which would
-                // produce the genuine OUT_MBOX value) deferred.
+                // R9.1g.10 — sys_spu_thread_group_join(group_id,
+                //   *cause, *status)
+                //
+                // Writes cause = 1 (JOIN_GROUP_EXIT) and status =
+                // SPU's captured OUT_MBOX value. If no SPU ran,
+                // status defaults to 0.
                 let cause_ptr = r4 as u32;
                 let status_ptr = self.ppu.gpr[5] as u32;
+                let status = self.spu_exit_status.unwrap_or(0);
                 self.mem.write(cause_ptr, &1u32.to_be_bytes())?;
-                self.mem.write(status_ptr, &0u32.to_be_bytes())?;
+                self.mem.write(status_ptr, &status.to_be_bytes())?;
+                eprintln!(
+                    "[R9.1g.10] sys_spu_thread_group_join: cause=1 status=0x{:08x}",
+                    status,
+                );
                 self.ppu.gpr[3] = 0;
             }
-            155 | 156 | 157 | 158 | 159 | 160 | 161 |
+            157 => {
+                // R9.1g.10 — _sys_spu_image_import(*image, src, type)
+                // PSL1GHT main passes the SPU ELF blob's PPU vaddr
+                // in r4. Parse it as an SPU ELF, build an SpuImage,
+                // and stash on EmuCore for the later
+                // `sys_spu_thread_group_start` to actually run.
+                let image_out_ptr = r3 as u32;
+                let src_vaddr = r4 as u32;
+                // Read enough bytes of the SPU ELF to parse. SPU
+                // binaries are typically a few KB; cap at 256 KB
+                // (LS size). We read it lazily here.
+                let mut spu_elf_bytes = vec![0u8; 0x4_0000];
+                self.mem.read(src_vaddr, &mut spu_elf_bytes)?;
+                let info = parse_elf(&spu_elf_bytes)?;
+                if !info.is_spu() {
+                    return Err(Error::ElfNotLoadable(
+                        "_sys_spu_image_import: not an SPU ELF",
+                    ));
+                }
+                let phdrs: Vec<SpuPhdr> = info
+                    .program_headers
+                    .iter()
+                    .map(|p| SpuPhdr {
+                        p_type: p.p_type,
+                        p_offset: p.p_offset as u32,
+                        p_vaddr: p.p_vaddr as u32,
+                        p_filesz: p.p_filesz as u32,
+                        p_memsz: p.p_memsz as u32,
+                    })
+                    .collect();
+                let image = build_image(info.e_entry as u32, &phdrs, src_vaddr)
+                    .map_err(Error::SpuGroup)?;
+                eprintln!(
+                    "[R9.1g.10] _sys_spu_image_import: entry=0x{:x} \
+                     segments={} src_vaddr=0x{:08x}",
+                    image.entry_point,
+                    image.segments.len(),
+                    src_vaddr,
+                );
+                // Write a basic sysSpuImage struct (16 bytes BE):
+                // u32 type + u32 entry_point + u32 segs + u32 nsegs.
+                self.mem.write(image_out_ptr, &0u32.to_be_bytes())?;          // type
+                self.mem.write(image_out_ptr + 4, &(image.entry_point).to_be_bytes())?;
+                self.mem.write(image_out_ptr + 8, &0u32.to_be_bytes())?;      // segs ptr (unused)
+                self.mem.write(image_out_ptr + 12, &(image.segments.len() as u32).to_be_bytes())?;
+                self.spu_image = Some(image);
+                self.spu_image_src_vaddr = src_vaddr;
+                self.ppu.gpr[3] = 0;
+            }
+            155 | 156 | 158 | 159 | 160 | 161 |
             165 | 166 | 167 |
             174 | 175 | 176 | 177 |
             179 | 180 | 181 | 182 | 184 | 185 | 186 |
             187 | 188 | 190 | 191 | 192 | 193 | 194 => {
-                // R9.1g.9 — SPU support syscalls (image
-                // open/import/close, raw_spu, group state queries
-                // + write_ls / read_ls / write_snr / event_connect).
-                // PSL1GHT may call these from libsysmodule init or
-                // mailbox setup paths. Stub all with CELL_OK +
-                // write a sentinel into any obvious out-pointer
-                // slot (r3 for *image_id, *out_addr).
+                // R9.1g.9 — SPU support syscalls (image open/close,
+                // raw_spu, group state queries + write_ls / read_ls
+                // / write_snr / event_connect). Stub all with
+                // CELL_OK + sentinel into r3-target ID slot.
                 eprintln!(
                     "[R9.1g.9] sys_spu_* syscall #{number} stubbed \
                      (r3=0x{:x} r4=0x{:x} r5=0x{:x} r6=0x{:x})",
                     r3, r4, self.ppu.gpr[5], self.ppu.gpr[6],
                 );
-                // For syscalls that write an OUT_ID to r3 (e.g.
-                // _sys_spu_image_import), provide a sentinel.
-                if matches!(number, 156 | 157) {
+                if matches!(number, 156) {
                     const STUB_IMAGE_ID: u32 = 0x2000_0001;
                     let out_ptr = r3 as u32;
                     self.mem.write(out_ptr, &STUB_IMAGE_ID.to_be_bytes())?;
