@@ -27,7 +27,10 @@
 //! args from `r3..=r10`, and writes the return value back into `r3`.
 
 use rpcs3_emu_types::CellError;
-use rpcs3_loader_elf_self::{parse_elf, parse_sce_header, ElfInfo, Error as ElfError};
+use rpcs3_loader_elf_self::{
+    parse_elf, parse_sce_header, ElfInfo, Error as ElfError,
+    PpuPrxModuleInfo, SysProcPrxParam, PPU_PRX_MODULE_INFO_SIZE,
+};
 use rpcs3_memory::PageFlags;
 use rpcs3_memory_backing::{Error as MemError, SparseBackend};
 use rpcs3_ppu_interpreter::{step, Error as InterpError, StepOutcome};
@@ -154,6 +157,78 @@ pub struct TlsRegion {
     pub vaddr: u32,
     /// Effective size in bytes (matches `p_memsz` from PT_TLS).
     pub size: u32,
+}
+
+/// R9.1g.6 — virtual address of the import-stub region. We
+/// allocate 64 KB above the user-mode stack for trampolines
+/// + FD records (mailbox_v1's 119 imports need ~2.5 KB; 64 KB
+/// is enough for all 20 oracle fixtures + future binaries).
+pub const USER_IMPORT_STUB_VADDR: u32 = 0xD001_0000;
+pub const USER_IMPORT_STUB_SIZE: u32 = 0x0001_0000;
+
+/// R9.1g.6 — read a null-terminated UTF-8 string from guest
+/// memory, up to `max_len` bytes. Returns the string without
+/// the trailing nul. Errors if memory access fails or if no nul
+/// is found within `max_len`.
+fn read_c_string(
+    mem: &SparseBackend,
+    vaddr: u32,
+    max_len: u32,
+) -> Result<String, Error> {
+    let mut buf = vec![0u8; max_len as usize];
+    mem.read(vaddr, &mut buf)?;
+    let nul = buf
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or(Error::ElfNotLoadable(
+            "read_c_string: no NUL terminator within max_len",
+        ))?;
+    Ok(String::from_utf8_lossy(&buf[..nul]).into_owned())
+}
+
+/// R9.1g.6 — sentinel syscall number used by import-stub
+/// trampolines. The PPU syscall dispatcher recognizes this and
+/// looks up which import was actually invoked via the stub-
+/// region address range. NOT a real PS3 lv2 syscall number;
+/// chosen well above the lv2 range (~0..1024).
+pub const IMPORT_STUB_SC_SENTINEL: u64 = 0x1_0000;
+
+/// R9.1g.6 — single resolved import stub record.
+#[derive(Debug, Clone)]
+pub struct ImportStub {
+    pub module_name: String,
+    pub nid: u32,
+    /// VAddr of the 4-byte `sc` trampoline.
+    pub trampoline_vaddr: u32,
+    /// VAddr of the 8-byte function descriptor written into the
+    /// `addrs[]` slot.
+    pub fd_vaddr: u32,
+    /// VAddr of the `addrs[]` slot that was patched.
+    pub addrs_slot: u32,
+}
+
+/// R9.1g.6 — result of [`EmuCore::init_imports`]: the list of
+/// installed import stubs, indexed for the syscall dispatcher's
+/// reverse lookup.
+#[derive(Debug, Clone, Default)]
+pub struct ImportPlan {
+    pub stubs: Vec<ImportStub>,
+}
+
+impl ImportPlan {
+    /// Look up an import stub by its trampoline vaddr (the CIA
+    /// at which the sentinel `sc` fires). Used by the PPU
+    /// syscall dispatcher to identify which import was called.
+    #[must_use]
+    pub fn lookup_by_trampoline(&self, cia: u32) -> Option<&ImportStub> {
+        // `sc` advances CIA by 4 before the syscall dispatcher
+        // sees it; the trampoline body is just `sc` so CIA-4
+        // matches `trampoline_vaddr`.
+        let probe = cia.wrapping_sub(4);
+        self.stubs
+            .iter()
+            .find(|s| s.trampoline_vaddr == probe)
+    }
 }
 
 /// Single-threaded PPU emulator core. One of these per run.
@@ -414,6 +489,118 @@ impl EmuCore {
             vaddr: tls_vaddr,
             size: memsz,
         }))
+    }
+
+    /// R9.1g.6 — walk the `.libstub` section and install trampoline
+    /// FDs in addrs[] slots so PSL1GHT's PLT thunks no longer load
+    /// raw inst-encoding garbage when dereferencing imported
+    /// functions.
+    ///
+    /// For each imported function in each module:
+    /// 1. Emit a 4-byte trampoline in the stub region containing
+    ///    a single `sc` instruction (`0x44000002`).
+    /// 2. Emit an 8-byte function descriptor immediately after
+    ///    the trampoline: `{ code = trampoline_vaddr, toc = 0 }`.
+    /// 3. Write the FD's vaddr into the appropriate `addrs[]`
+    ///    slot in the binary's .data segment.
+    /// 4. Record the stub in the [`ImportPlan`] so the syscall
+    ///    dispatcher can later identify which import was called
+    ///    when the `sc` fires (by CIA — the trampoline's vaddr).
+    ///
+    /// The PPU sees this layout at runtime:
+    /// ```text
+    /// stub_region:
+    ///   +0x00  trampoline_0: 44 00 00 02      ; sc
+    ///   +0x04  fd_0:         00 D0 01 00      ; code = trampoline_0
+    ///                        00 00 00 00      ; toc = 0
+    ///   +0x0C  trampoline_1: 44 00 00 02
+    ///   +0x10  fd_1:         ...
+    ///   ...
+    /// ```
+    /// Each (trampoline + FD) tuple is 12 bytes. mailbox_v1's
+    /// 119 imports fit in 1428 bytes (well under the 64 KB
+    /// stub region).
+    pub fn init_imports(
+        &mut self,
+        proc_prx_param: &SysProcPrxParam,
+    ) -> Result<ImportPlan, Error> {
+        // Allocate the stub region R+W+X (executable so the
+        // trampoline `sc` instruction can be fetched).
+        self.mem.alloc_at(
+            USER_IMPORT_STUB_VADDR,
+            USER_IMPORT_STUB_SIZE,
+            PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::EXECUTABLE,
+        )?;
+
+        let mut plan = ImportPlan::default();
+        let mut next_offset: u32 = 0;
+        let region_end = USER_IMPORT_STUB_SIZE;
+
+        let mut libstub_addr = proc_prx_param.libstub_start;
+        while libstub_addr < proc_prx_param.libstub_end {
+            // Read + parse one libstub entry (44 bytes).
+            let mut entry_bytes = [0u8; PPU_PRX_MODULE_INFO_SIZE];
+            self.mem.read(libstub_addr, &mut entry_bytes)?;
+            let entry = PpuPrxModuleInfo::parse(&entry_bytes)
+                .map_err(Error::Elf)?;
+
+            // Read the null-terminated module name.
+            let module_name = read_c_string(&self.mem, entry.name, 64)?;
+
+            // Install trampolines + FDs for each imported function.
+            for i in 0..entry.num_func as u32 {
+                let nid_addr = entry.nids
+                    .checked_add(i.checked_mul(4).ok_or(
+                        Error::ElfNotLoadable("init_imports: nid index overflow"))?)
+                    .ok_or(Error::ElfNotLoadable("init_imports: nid addr overflow"))?;
+                let mut nid_bytes = [0u8; 4];
+                self.mem.read(nid_addr, &mut nid_bytes)?;
+                let nid = u32::from_be_bytes(nid_bytes);
+
+                // 4 bytes trampoline + 8 bytes FD = 12 bytes per stub.
+                let trampoline_offset = next_offset;
+                let fd_offset = trampoline_offset + 4;
+                next_offset = next_offset.checked_add(12)
+                    .ok_or(Error::ElfNotLoadable("init_imports: stub offset overflow"))?;
+                if next_offset > region_end {
+                    return Err(Error::ElfNotLoadable(
+                        "init_imports: stub region exhausted",
+                    ));
+                }
+
+                let trampoline_vaddr = USER_IMPORT_STUB_VADDR + trampoline_offset;
+                let fd_vaddr = USER_IMPORT_STUB_VADDR + fd_offset;
+
+                // Write `sc` instruction (primary 17, lev=0) BE.
+                self.mem.write(trampoline_vaddr, &0x4400_0002u32.to_be_bytes())?;
+                // Write FD: code (u32 BE) + toc (u32 BE).
+                self.mem.write(fd_vaddr, &trampoline_vaddr.to_be_bytes())?;
+                self.mem.write(fd_vaddr + 4, &0u32.to_be_bytes())?;
+
+                // Patch the addrs[] slot in the binary's .data.
+                let addrs_slot = entry.addrs
+                    .checked_add(i.checked_mul(4).ok_or(
+                        Error::ElfNotLoadable("init_imports: addrs index overflow"))?)
+                    .ok_or(Error::ElfNotLoadable("init_imports: addrs slot overflow"))?;
+                self.mem.write(addrs_slot, &fd_vaddr.to_be_bytes())?;
+
+                plan.stubs.push(ImportStub {
+                    module_name: module_name.clone(),
+                    nid,
+                    trampoline_vaddr,
+                    fd_vaddr,
+                    addrs_slot,
+                });
+            }
+
+            libstub_addr = libstub_addr.checked_add(
+                PPU_PRX_MODULE_INFO_SIZE as u32,
+            ).ok_or(Error::ElfNotLoadable(
+                "init_imports: libstub_addr overflow",
+            ))?;
+        }
+
+        Ok(plan)
     }
 
     /// R9.1c — allocate the user-mode PPU stack and seed `r1` (the
