@@ -822,18 +822,30 @@ impl EmuCore {
         let number = self.ppu.gpr[11];
         let cia_at_sc = self.ppu.cia.wrapping_sub(4);
 
-        // R9.1g.7 — if the `sc` fired from inside the import-stub
-        // region, this is NOT a real lv2 syscall. It's a PLT thunk
-        // hitting an installed trampoline. Look up the import and
-        // (for the MVP) return-to-caller with r3 = 0. Future
-        // slices will route specific NIDs to their Rust impls.
+        // R9.1g.7/.11 — if the `sc` fired from inside the import-
+        // stub region, this is NOT a real lv2 syscall. It's a PLT
+        // thunk hitting an installed trampoline. Look up the
+        // import and either:
+        //   (a) terminate the process for known-noreturn imports
+        //       like sys_process_exit (NID 0xe6f2c1e7); or
+        //   (b) return-to-caller with r3 = 0 for everything else.
+        // The default "return 0" was the R9.1g.7 MVP; the exit
+        // handling is R9.1g.11 — without it, PSL1GHT main's
+        // exit() call falls through into trailing padding and
+        // the PPU faults on inst=0.
         if self.is_in_import_stub_region(cia_at_sc) {
             if let Some(plan) = self.import_plan.as_ref() {
                 if let Some(stub) = plan.lookup_by_trampoline(self.ppu.cia) {
-                    // Log + return-to-caller. The caller did
-                    // `bcctrl` which set LR = caller's next inst,
-                    // so jumping to LR resumes the caller. We also
-                    // zero r3 (PowerPC convention: return value in r3).
+                    // Known-noreturn imports terminate the run.
+                    if stub.nid == 0xe6f2c1e7 {
+                        let exit_r3 = self.ppu.gpr[3] as i32;
+                        eprintln!(
+                            "[R9.1g.11] sys_process_exit (NID 0x{:08x}) — \
+                             terminating run, exit_status={}",
+                            stub.nid, exit_r3,
+                        );
+                        return Ok(Some(ExitStatus { status: exit_r3 }));
+                    }
                     eprintln!(
                         "[R9.1g.7] unimplemented import: {}::0x{:08x} \
                          (trampoline=0x{:08x} addrs_slot=0x{:08x}) — \
