@@ -247,6 +247,10 @@ pub struct EmuCore {
     /// fires from a stub trampoline, the dispatcher looks up the
     /// stub here to either dispatch the import or return-to-caller.
     pub import_plan: Option<ImportPlan>,
+    /// R9.1h — bump-allocator cursor for sys_mmapper_allocate_address.
+    /// Each call advances by `max(size, alignment)`, returning the
+    /// previous (aligned) cursor as the allocated base.
+    pub mmapper_alloc_cursor: u32,
     /// R9.1g.9 — when true, unknown syscall numbers log + return
     /// CELL_OK instead of bubbling as Error::UnsupportedSyscall.
     /// `run_self` sets this so PSL1GHT binaries can advance
@@ -292,6 +296,7 @@ impl EmuCore {
             process: TestProcessState::default(),
             tty: SysTty::new(),
             import_plan: None,
+            mmapper_alloc_cursor: 0x4000_0000,
             permissive_unknown_syscalls: false,
             spu_image: None,
             spu_image_src_vaddr: 0,
@@ -835,23 +840,97 @@ impl EmuCore {
         // the PPU faults on inst=0.
         if self.is_in_import_stub_region(cia_at_sc) {
             if let Some(plan) = self.import_plan.as_ref() {
-                if let Some(stub) = plan.lookup_by_trampoline(self.ppu.cia) {
-                    // Known-noreturn imports terminate the run.
-                    if stub.nid == 0xe6f2c1e7 {
-                        let exit_r3 = self.ppu.gpr[3] as i32;
+                if let Some(stub_meta) = plan.lookup_by_trampoline(self.ppu.cia) {
+                    let nid = stub_meta.nid;
+                    let module = stub_meta.module_name.clone();
+                    let r3_in = self.ppu.gpr[3];
+                    let r4_in = self.ppu.gpr[4];
+
+                    // R9.1g.11 — known-noreturn import terminates.
+                    if nid == 0xe6f2c1e7 {
+                        let exit_r3 = r3_in as i32;
                         eprintln!(
-                            "[R9.1g.11] sys_process_exit (NID 0x{:08x}) — \
-                             terminating run, exit_status={}",
-                            stub.nid, exit_r3,
+                            "[R9.1g.11] sys_process_exit (NID 0x{nid:08x}) — \
+                             terminating run, exit_status={exit_r3}",
                         );
                         return Ok(Some(ExitStatus { status: exit_r3 }));
                     }
+
+                    // R9.1h — NID-specific minimum-viable
+                    // implementations so PSL1GHT crt0 sees the
+                    // right post-call memory state and doesn't
+                    // bail to its cleanup-and-exit path.
+                    match nid {
+                        // sys_spinlock_initialize(*lock):
+                        // zero the 4-byte spinlock at r3 so
+                        // subsequent locks see a valid initialized
+                        // state.
+                        0x8c2bb498 => {
+                            eprintln!(
+                                "[R9.1h] sys_spinlock_initialize(*0x{r3_in:x}) \
+                                 — zeroing 4 bytes",
+                            );
+                            self.mem
+                                .write(r3_in as u32, &[0u8; 4])?;
+                            self.ppu.gpr[3] = 0;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // sys_spinlock_lock(*lock):
+                        // single-threaded → no-op.
+                        0xa285139d => {
+                            eprintln!(
+                                "[R9.1h] sys_spinlock_lock(*0x{r3_in:x}) — no-op",
+                            );
+                            self.ppu.gpr[3] = 0;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // sys_spinlock_unlock(*lock):
+                        // single-threaded → no-op.
+                        0x5267cb35 => {
+                            eprintln!(
+                                "[R9.1h] sys_spinlock_unlock(*0x{r3_in:x}) \
+                                 — no-op",
+                            );
+                            self.ppu.gpr[3] = 0;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // sys_mmapper_unmap_memory(addr, *alloc_addr):
+                        // pretend success; write 0 to *alloc_addr.
+                        0x4643ba6e => {
+                            eprintln!(
+                                "[R9.1h] sys_mmapper_unmap_memory(0x{r3_in:x}, \
+                                 *0x{r4_in:x}) — success",
+                            );
+                            if r4_in != 0 {
+                                self.mem
+                                    .write(r4_in as u32, &0u32.to_be_bytes())
+                                    .ok();
+                            }
+                            self.ppu.gpr[3] = 0;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // sys_mmapper_free_memory(mem_id): success.
+                        0x409ad939 => {
+                            eprintln!(
+                                "[R9.1h] sys_mmapper_free_memory(\
+                                 mem_id=0x{r3_in:x}) — success",
+                            );
+                            self.ppu.gpr[3] = 0;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        _ => {}
+                    }
+
                     eprintln!(
-                        "[R9.1g.7] unimplemented import: {}::0x{:08x} \
-                         (trampoline=0x{:08x} addrs_slot=0x{:08x}) — \
-                         returning 0",
-                        stub.module_name, stub.nid,
-                        stub.trampoline_vaddr, stub.addrs_slot,
+                        "[R9.1g.7] unimplemented import: {module}::0x{nid:08x} \
+                         (trampoline=0x{:08x} addrs_slot=0x{:08x}) r3=0x{r3_in:x} \
+                         r4=0x{r4_in:x} — returning 0",
+                        stub_meta.trampoline_vaddr, stub_meta.addrs_slot,
                     );
                     self.ppu.gpr[3] = 0;
                     self.ppu.cia = (self.ppu.lr as u32) & !0x3;
@@ -1207,16 +1286,33 @@ impl EmuCore {
                     const MAPPED_BASE: u32 = 0xB100_0000;
                     self.mem.write(out_addr_ptr, &MAPPED_BASE.to_be_bytes())?;
                 }
-                if matches!(number, 324 | 332 | 339) {
-                    // id_out at r3 (memory_container_create) or
-                    // r6 (allocate_shared_memory variants).
+                if matches!(number, 324 | 328 | 332 | 339) {
+                    // R9.1h — id_out at r3 (memory_container_create)
+                    // or r6 (allocate_shared_memory variants).
+                    // Use cursor-based unique IDs so PSL1GHT's
+                    // tracking tables don't collide.
                     let id_ptr = if number == 324 {
                         r3 as u32
                     } else {
                         self.ppu.gpr[6] as u32
                     };
-                    const STUB_ID: u32 = 0x4000_0000;
-                    self.mem.write(id_ptr, &STUB_ID.to_be_bytes())?;
+                    self.mmapper_alloc_cursor =
+                        self.mmapper_alloc_cursor.wrapping_add(1);
+                    let unique_id = self.mmapper_alloc_cursor;
+                    self.mem.write(id_ptr, &unique_id.to_be_bytes())?;
+                }
+                if matches!(number, 338) {
+                    // R9.1h — sys_memory_get_user_memory_size(*info_out)
+                    // writes a memory_info_t struct at r3. Use safe
+                    // defaults so caller's heap-size logic sees a
+                    // plausible value (256 MB total, ~256 MB free).
+                    let info_ptr = r3 as u32;
+                    let mut buf = [0u8; 16];
+                    buf[0..4].copy_from_slice(&0x1000_0000u32.to_be_bytes());
+                    buf[4..8].copy_from_slice(&0x1000_0000u32.to_be_bytes());
+                    buf[8..12].copy_from_slice(&0u32.to_be_bytes());
+                    buf[12..16].copy_from_slice(&0u32.to_be_bytes());
+                    self.mem.write(info_ptr, &buf)?;
                 }
                 self.ppu.gpr[3] = 0; // CELL_OK
             }
