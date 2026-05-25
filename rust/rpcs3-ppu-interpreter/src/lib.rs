@@ -1003,6 +1003,119 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                     ppu.fpr[op.frd() as usize] = f64::from_bits(bits);
                 }
 
+                // R9.1g.9 — additional P31 XO additions found via
+                // iterative smoke runs.
+                60 => {
+                    // andc ra, rs, rb — ra = rs & ~rb
+                    let r = ppu.gpr[op.rs() as usize]
+                        & !ppu.gpr[op.rb() as usize];
+                    ppu.gpr[op.ra() as usize] = r;
+                    if rc_bit {
+                        update_cr0(ppu, r);
+                    }
+                }
+                476 => {
+                    // nand ra, rs, rb — ra = ~(rs & rb)
+                    let r = !(ppu.gpr[op.rs() as usize]
+                        & ppu.gpr[op.rb() as usize]);
+                    ppu.gpr[op.ra() as usize] = r;
+                    if rc_bit {
+                        update_cr0(ppu, r);
+                    }
+                }
+                284 => {
+                    // eqv ra, rs, rb — ra = ~(rs ^ rb)
+                    let r = !(ppu.gpr[op.rs() as usize]
+                        ^ ppu.gpr[op.rb() as usize]);
+                    ppu.gpr[op.ra() as usize] = r;
+                    if rc_bit {
+                        update_cr0(ppu, r);
+                    }
+                }
+                412 => {
+                    // orc ra, rs, rb — ra = rs | ~rb
+                    let r = ppu.gpr[op.rs() as usize]
+                        | !ppu.gpr[op.rb() as usize];
+                    ppu.gpr[op.ra() as usize] = r;
+                    if rc_bit {
+                        update_cr0(ppu, r);
+                    }
+                }
+                8 => {
+                    // subfc rd, ra, rb — rd = rb - ra (subtract from
+                    // carrying). CA = carry-out of (~ra + rb + 1).
+                    let a = ppu.gpr[op.ra() as usize];
+                    let b = ppu.gpr[op.rb() as usize];
+                    let (s, c1) = (!a).overflowing_add(b);
+                    let (r, c2) = s.overflowing_add(1);
+                    ppu.gpr[op.rd() as usize] = r;
+                    ppu.xer.ca = c1 || c2;
+                    if rc_bit {
+                        update_cr0(ppu, r);
+                    }
+                }
+                138 => {
+                    // adde rd, ra, rb — rd = ra + rb + CA
+                    let a = ppu.gpr[op.ra() as usize];
+                    let b = ppu.gpr[op.rb() as usize];
+                    let carry_in: u64 = if ppu.xer.ca { 1 } else { 0 };
+                    let (s, c1) = a.overflowing_add(b);
+                    let (r, c2) = s.overflowing_add(carry_in);
+                    ppu.gpr[op.rd() as usize] = r;
+                    ppu.xer.ca = c1 || c2;
+                    if rc_bit {
+                        update_cr0(ppu, r);
+                    }
+                }
+                136 => {
+                    // subfe rd, ra, rb — rd = ~ra + rb + CA
+                    let a = ppu.gpr[op.ra() as usize];
+                    let b = ppu.gpr[op.rb() as usize];
+                    let carry_in: u64 = if ppu.xer.ca { 1 } else { 0 };
+                    let (s, c1) = (!a).overflowing_add(b);
+                    let (r, c2) = s.overflowing_add(carry_in);
+                    ppu.gpr[op.rd() as usize] = r;
+                    ppu.xer.ca = c1 || c2;
+                    if rc_bit {
+                        update_cr0(ppu, r);
+                    }
+                }
+                200 => {
+                    // subfze rd, ra — rd = ~ra + 0 + CA
+                    let a = ppu.gpr[op.ra() as usize];
+                    let carry_in: u64 = if ppu.xer.ca { 1 } else { 0 };
+                    let (r, c) = (!a).overflowing_add(carry_in);
+                    ppu.gpr[op.rd() as usize] = r;
+                    ppu.xer.ca = c;
+                    if rc_bit {
+                        update_cr0(ppu, r);
+                    }
+                }
+                234 => {
+                    // addme rd, ra — rd = ra + (-1) + CA
+                    let a = ppu.gpr[op.ra() as usize];
+                    let carry_in: u64 = if ppu.xer.ca { 1 } else { 0 };
+                    let (s, c1) = a.overflowing_add(u64::MAX); // -1
+                    let (r, c2) = s.overflowing_add(carry_in);
+                    ppu.gpr[op.rd() as usize] = r;
+                    ppu.xer.ca = c1 || c2;
+                    if rc_bit {
+                        update_cr0(ppu, r);
+                    }
+                }
+                232 => {
+                    // subfme rd, ra — rd = ~ra + (-1) + CA
+                    let a = ppu.gpr[op.ra() as usize];
+                    let carry_in: u64 = if ppu.xer.ca { 1 } else { 0 };
+                    let (s, c1) = (!a).overflowing_add(u64::MAX);
+                    let (r, c2) = s.overflowing_add(carry_in);
+                    ppu.gpr[op.rd() as usize] = r;
+                    ppu.xer.ca = c1 || c2;
+                    if rc_bit {
+                        update_cr0(ppu, r);
+                    }
+                }
+
                 _ => {
                     return Err(Error::Unimplemented {
                         inst,
@@ -1011,6 +1124,58 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                     });
                 }
             }
+        }
+
+        // ---- R9.1g.9 D-form with-update load/store family --------
+        // Pattern: same EA computation as the base op, then
+        // `ra = ea` after the load/store.
+        primary::LWZU => {
+            let ea = effective_address_d(ppu, op);
+            ppu.gpr[op.rd() as usize] = mem_read_u32_be(mem, ea)? as u64;
+            ppu.gpr[op.ra() as usize] = ea as u64;
+        }
+        primary::LBZU => {
+            let ea = effective_address_d(ppu, op);
+            ppu.gpr[op.rd() as usize] = mem_read_u8(mem, ea)? as u64;
+            ppu.gpr[op.ra() as usize] = ea as u64;
+        }
+        primary::LHZU => {
+            let ea = effective_address_d(ppu, op);
+            let v = {
+                let mut buf = [0u8; 2];
+                mem.read(ea, &mut buf).map_err(Error::from)?;
+                u16::from_be_bytes(buf)
+            };
+            ppu.gpr[op.rd() as usize] = v as u64;
+            ppu.gpr[op.ra() as usize] = ea as u64;
+        }
+        primary::LHAU => {
+            let ea = effective_address_d(ppu, op);
+            let v = {
+                let mut buf = [0u8; 2];
+                mem.read(ea, &mut buf).map_err(Error::from)?;
+                i16::from_be_bytes(buf)
+            };
+            ppu.gpr[op.rd() as usize] = v as i64 as u64;
+            ppu.gpr[op.ra() as usize] = ea as u64;
+        }
+        primary::STWU => {
+            let ea = effective_address_d(ppu, op);
+            let v = ppu.gpr[op.rs() as usize] as u32;
+            mem.write(ea, &v.to_be_bytes()).map_err(Error::from)?;
+            ppu.gpr[op.ra() as usize] = ea as u64;
+        }
+        primary::STBU => {
+            let ea = effective_address_d(ppu, op);
+            let v = ppu.gpr[op.rs() as usize] as u8;
+            mem.write(ea, &[v]).map_err(Error::from)?;
+            ppu.gpr[op.ra() as usize] = ea as u64;
+        }
+        primary::STHU => {
+            let ea = effective_address_d(ppu, op);
+            let v = ppu.gpr[op.rs() as usize] as u16;
+            mem.write(ea, &v.to_be_bytes()).map_err(Error::from)?;
+            ppu.gpr[op.ra() as usize] = ea as u64;
         }
 
         // ---- D-form loads (zero-extend to 64 bit) ------------------

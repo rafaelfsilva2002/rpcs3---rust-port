@@ -436,6 +436,10 @@ impl EmuCore {
         // Step 2: allocate the user-mode stack + seed r1.
         self.init_user_stack(USER_STACK_TOP, stack_size)?;
 
+        // Step 2b: pre-allocate the heap region for mmapper
+        // syscalls (R9.1g.9).
+        self.init_user_heap()?;
+
         // Step 3: TLS init if the binary has a PT_TLS segment.
         // R9.1g.4: ignores empty TLS, sets r13 to a sentinel.
         self.init_tls(&info, elf_bytes, USER_TLS_VADDR)?;
@@ -478,11 +482,39 @@ impl EmuCore {
         })
     }
 
-    /// R9.1g.4 — allocate the per-thread TLS region described by
-    /// the ELF's PT_TLS segment and seed `r13` (the PowerPC ELFv1
-    /// thread pointer). PSL1GHT's `_start` and any TLS-using code
-    /// in `main()` reads/writes TLS variables via offsets from
-    /// `r13`; without this, the first such access faults.
+    /// R9.1g.9 — pre-allocate the PSL1GHT user-mode heap region
+    /// at `[0xB0000000, 0xB2000000)` (32 MB) with R+W flags.
+    /// PSL1GHT's crt0 calls multiple mmapper syscalls
+    /// (sys_mmapper_allocate_address / _shared_memory /
+    /// _search_and_map / _map_shared_memory) whose stubs return
+    /// sentinel addresses in this region. Allocating upfront
+    /// avoids per-call alloc bookkeeping; PSL1GHT then touches
+    /// pages here as a normal heap.
+    pub fn init_user_heap(&mut self) -> Result<(), Error> {
+        const HEAP_BASE: u32 = 0xB000_0000;
+        const HEAP_SIZE: u32 = 0x0200_0000; // 32 MB
+        self.mem.alloc_at(
+            HEAP_BASE,
+            HEAP_SIZE,
+            PageFlags::READABLE | PageFlags::WRITABLE,
+        )?;
+        Ok(())
+    }
+
+    /// R9.1g.4/.9 — allocate the per-thread TLS region described
+    /// by the ELF's PT_TLS segment and seed `r13` (the PowerPC
+    /// ELFv1 thread pointer). PSL1GHT's `_start` and any TLS-using
+    /// code in `main()` reads/writes TLS variables via offsets
+    /// from `r13`; without this, the first such access faults.
+    ///
+    /// PSL1GHT empirically uses the Linux ELFv1 TLS convention:
+    /// `r13` is biased `+0x7000` above the actual TLS storage,
+    /// and variables are accessed via negative offsets in the
+    /// `[-0x8000, -0x4000)` range. R9.1g.9 widens the
+    /// allocation to a generous `[r13 - 0x8000, r13 + 0x1000)`
+    /// window (9 pages, 36 KB) — covers both negative-biased
+    /// access AND positive offsets the linker may emit for
+    /// large TLS regions.
     ///
     /// The PT_TLS segment provides:
     /// - `p_filesz` bytes of initialized data (often 0 = pure tbss)
@@ -533,13 +565,25 @@ impl EmuCore {
                 "init_tls: tls_vaddr must be page-aligned",
             ));
         }
-        let page_rounded = (memsz + 0xFFF) & !0xFFF;
+        // R9.1g.9 — allocate a 36 KB window around `tls_vaddr`
+        // (9 pages: 8 below for the negative-biased -0x8000 access
+        // pattern, 1 above for any positive-offset use).
+        const PPC_TP_NEGATIVE_BIAS: u32 = 0x8000;
+        const PPC_TP_POSITIVE_HEADROOM: u32 = 0x1000;
+        let alloc_base = tls_vaddr.checked_sub(PPC_TP_NEGATIVE_BIAS).ok_or(
+            Error::ElfNotLoadable("init_tls: tls_vaddr too low for TP bias"),
+        )?;
+        let alloc_size = PPC_TP_NEGATIVE_BIAS + PPC_TP_POSITIVE_HEADROOM;
         self.mem.alloc_at(
-            tls_vaddr,
-            page_rounded,
+            alloc_base,
+            alloc_size,
             PageFlags::READABLE | PageFlags::WRITABLE,
         )?;
-        // Copy init image if any.
+        // Copy init image if any — the TLS storage proper sits
+        // at `tls_vaddr - 0x7000` per the Linux ELFv1 PPC TP
+        // bias convention (= where -0x7000(r13) lands).
+        const PPC_TP_TLS_BIAS: u32 = 0x7000;
+        let tls_storage_vaddr = tls_vaddr - PPC_TP_TLS_BIAS;
         let filesz = tls.p_filesz as usize;
         if filesz > 0 {
             let src_start = tls.p_offset as usize;
@@ -551,16 +595,11 @@ impl EmuCore {
                     "init_tls: PT_TLS init image extends past ELF",
                 ));
             }
-            self.mem.write(tls_vaddr, &elf_bytes[src_start..src_end])?;
+            self.mem.write(tls_storage_vaddr, &elf_bytes[src_start..src_end])?;
             // The rest (p_memsz - p_filesz) is the tbss tail — the
             // SparseBackend's alloc_at zeroes the page on first
             // touch, so no explicit memset needed.
         }
-        // PowerPC ELFv1 thread pointer convention: r13 points to
-        // the start of the TLS region. TLS variables are accessed
-        // via positive offsets from r13. (Linux ELFv1 uses a
-        // +0x7000 bias; PSL1GHT empirically uses no bias — to be
-        // confirmed during R9.1g.9 smoke iteration.)
         self.ppu.gpr[13] = tls_vaddr as u64;
         Ok(Some(TlsRegion {
             vaddr: tls_vaddr,
@@ -842,24 +881,68 @@ impl EmuCore {
             }
             330 => {
                 // R9.1g.9 — sys_mmapper_allocate_address(size, flags,
-                // alignment, *out_addr). PSL1GHT crt0 calls this very
-                // early to reserve a virtual-address range for its
-                // heap. We return a fixed sentinel address; the caller
-                // will follow up with sys_mmapper_allocate_shared_memory
-                // + sys_mmapper_map_shared_memory to populate it.
-                //
-                // The SparseBackend is lazy — pages get allocated on
-                // first touch, so returning a sentinel without
-                // actually mapping pages is safe for now.
+                // alignment, *out_addr). PSL1GHT crt0 reserves a
+                // virtual-address range for its heap. Stub returns
+                // a fixed sentinel; SparseBackend's lazy mapping
+                // handles per-page allocation on first touch.
                 let _size = r3 as u32;
                 let _flags = r4 as u32;
                 let _alignment = self.ppu.gpr[5] as u32;
                 let out_addr_ptr = self.ppu.gpr[6] as u32;
-                // Pick 0xB0000000 — well above PSL1GHT .data
-                // (0x10010000..0x100514D8) and below the stack
-                // region (0xCFFF0000+).
                 const MMAPPER_FIXED_BASE: u32 = 0xB000_0000;
                 self.mem.write(out_addr_ptr, &MMAPPER_FIXED_BASE.to_be_bytes())?;
+                self.ppu.gpr[3] = 0;
+            }
+            324 | 325 | 326 | 327 | 328 | 329 | 331 | 332 | 333 |
+            334 | 335 | 336 | 337 | 338 | 339 => {
+                // R9.1g.9 — mmapper / memory-container family.
+                // PSL1GHT crt0 calls these to set up heap + shared
+                // memory regions; for our MVP we accept all with
+                // CELL_OK and (for those with *out_addr / *out_id
+                // arguments at r4 or r6) write a unique sentinel
+                // value so downstream code sees consistent IDs.
+                //
+                // 324 sys_memory_container_create(*id_out, size)
+                // 325 sys_memory_container_destroy(id)
+                // 326 sys_mmapper_allocate_fixed_address
+                // 327 sys_mmapper_enable_page_fault_notification
+                // 328 sys_mmapper_allocate_shared_memory_from_container_ext
+                // 329 sys_mmapper_free_shared_memory
+                // 331 sys_mmapper_free_address
+                // 332 sys_mmapper_allocate_shared_memory(size, page_size, flags, *out_id)
+                // 333 sys_mmapper_set_shared_memory_flag
+                // 334 sys_mmapper_map_shared_memory(addr, mem_id, flags)
+                // 335 sys_mmapper_unmap_shared_memory(addr, *out_id)
+                // 336 sys_mmapper_change_address_access_right
+                // 337 sys_mmapper_search_and_map(start, mem_id, flags, *out_addr)
+                // 338 sys_mmapper_get_shared_memory_attribute
+                // 339 sys_mmapper_allocate_shared_memory_ext
+                eprintln!(
+                    "[R9.1g.9] mmapper-family syscall #{number} stubbed \
+                     (r3=0x{:x} r4=0x{:x} r5=0x{:x} r6=0x{:x})",
+                    r3, r4, self.ppu.gpr[5], self.ppu.gpr[6],
+                );
+                // For syscalls with a *out_addr at r6, write a
+                // unique sentinel so the caller sees a valid-looking
+                // address. Mmapper IDs use a counter pattern.
+                if matches!(number, 337) {
+                    let out_addr_ptr = self.ppu.gpr[6] as u32;
+                    // Use a separate sentinel base per call to
+                    // ensure caller doesn't collide addresses.
+                    const MAPPED_BASE: u32 = 0xB100_0000;
+                    self.mem.write(out_addr_ptr, &MAPPED_BASE.to_be_bytes())?;
+                }
+                if matches!(number, 324 | 332 | 339) {
+                    // id_out at r3 (memory_container_create) or
+                    // r6 (allocate_shared_memory variants).
+                    let id_ptr = if number == 324 {
+                        r3 as u32
+                    } else {
+                        self.ppu.gpr[6] as u32
+                    };
+                    const STUB_ID: u32 = 0x4000_0000;
+                    self.mem.write(id_ptr, &STUB_ID.to_be_bytes())?;
+                }
                 self.ppu.gpr[3] = 0; // CELL_OK
             }
             403 => {
