@@ -239,6 +239,86 @@ pub struct SysProcessParam {
 pub const SYS_PROCESS_PARAM_SIZE: usize = 32;
 pub const SYS_PROCESS_PARAM_MAGIC: u32 = 0x13BC_C5F6;
 
+/// R9.1g.3 — parsed contents of the `sys_proc_prx_param_t`
+/// segment (PT_SCE_PPU_PROC_PARAM, 40 bytes). Holds pointers to
+/// PSL1GHT-specific runtime hooks (the `prx_init_func_table`)
+/// plus a back-reference to the `sys_process_param` block.
+///
+/// Field layout reverse-engineered from
+/// `single_spu_mailbox_v1.self` empirical bytes (R9.1g.1 audit).
+/// All fields are big-endian u32 on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SysProcPrxParam {
+    /// Self-reported size of this struct (always 0x28).
+    pub size: u32,
+    /// Magic value `0x1B434CEC` identifying the v1 layout.
+    pub magic: u32,
+    /// Version field (observed: 2). Treated as u32 here even
+    /// though the slot is u64-aligned; bits 32..63 are zero in
+    /// observed binaries.
+    pub version: u32,
+    /// Reserved (high half of the version u64).
+    pub reserved0: u32,
+    /// Pointer to the primary `prx_load_init` hook table (in the
+    /// observed PSL1GHT layout, slots `prx_load`, `prx_unload`,
+    /// `prx_resident` all reference the same struct address).
+    pub prx_load_table: u32,
+    /// Pointer to the `prx_unload` hook entry (typically same as
+    /// `prx_load_table`).
+    pub prx_unload_table: u32,
+    /// Pointer to the `prx_resident` hook entry (typically same
+    /// as the other two).
+    pub prx_resident_table: u32,
+    /// Pointer back to the `sys_process_param` segment
+    /// (PT_SCE_PPU_PROCESS_PARAM's vaddr). Lets the runtime
+    /// fetch process info via the proc_param structure alone.
+    pub sys_process_param_ptr: u32,
+    /// PSL1GHT runtime flags (observed: `0x01010000`).
+    pub flags: u32,
+    /// Reserved (observed: 0).
+    pub reserved1: u32,
+}
+
+pub const SYS_PROC_PRX_PARAM_SIZE: usize = 40;
+pub const SYS_PROC_PRX_PARAM_MAGIC: u32 = 0x1B43_4CEC;
+
+impl SysProcPrxParam {
+    /// Parse the 40-byte BE struct from a raw byte slice. Errors
+    /// if the slice is shorter than `SYS_PROC_PRX_PARAM_SIZE` or
+    /// if the `size`/`magic` fields disagree.
+    pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() < SYS_PROC_PRX_PARAM_SIZE {
+            return Err(Error::TooShort);
+        }
+        let size = read_u32_be(bytes, 0)?;
+        let magic = read_u32_be(bytes, 4)?;
+        if size as usize != SYS_PROC_PRX_PARAM_SIZE {
+            return Err(Error::Malformed(format!(
+                "sys_proc_prx_param size 0x{size:x} != expected 0x{:x}",
+                SYS_PROC_PRX_PARAM_SIZE
+            )));
+        }
+        if magic != SYS_PROC_PRX_PARAM_MAGIC {
+            return Err(Error::Malformed(format!(
+                "sys_proc_prx_param magic 0x{magic:08x} != expected 0x{:08x}",
+                SYS_PROC_PRX_PARAM_MAGIC
+            )));
+        }
+        Ok(Self {
+            size,
+            magic,
+            version: read_u32_be(bytes, 8)?,
+            reserved0: read_u32_be(bytes, 12)?,
+            prx_load_table: read_u32_be(bytes, 16)?,
+            prx_unload_table: read_u32_be(bytes, 20)?,
+            prx_resident_table: read_u32_be(bytes, 24)?,
+            sys_process_param_ptr: read_u32_be(bytes, 28)?,
+            flags: read_u32_be(bytes, 32)?,
+            reserved1: read_u32_be(bytes, 36)?,
+        })
+    }
+}
+
 impl SysProcessParam {
     /// Parse the 32-byte BE struct from a raw byte slice. Errors if
     /// the slice is shorter than `SYS_PROCESS_PARAM_SIZE` or if the
@@ -523,6 +603,70 @@ mod tests {
         bytes[0..4].copy_from_slice(&0x40u32.to_be_bytes()); // size says 64, not 32
         assert!(matches!(
             SysProcessParam::parse(&bytes),
+            Err(Error::Malformed(_))
+        ));
+    }
+
+    // -- R9.1g.3 sys_proc_prx_param parser -------------------------
+
+    /// Empirical bytes from `single_spu_mailbox_v1.self` PHDR[7]
+    /// (PT_SCE_PPU_PROC_PARAM segment at vaddr 0x2BEE0). The three
+    /// prx_*_table pointers all reference 0x0002BE94 in the
+    /// observed mailbox_v1 layout; the sys_process_param_ptr
+    /// back-references PHDR[6]'s vaddr 0x0002BEC0.
+    const MAILBOX_V1_PRX_PARAM_BYTES: [u8; 40] = [
+        0x00, 0x00, 0x00, 0x28,   // size = 40
+        0x1B, 0x43, 0x4C, 0xEC,   // magic
+        0x00, 0x00, 0x00, 0x02,   // version = 2
+        0x00, 0x00, 0x00, 0x00,   // reserved0
+        0x00, 0x02, 0xBE, 0x94,   // prx_load_table
+        0x00, 0x02, 0xBE, 0x94,   // prx_unload_table
+        0x00, 0x02, 0xBE, 0x94,   // prx_resident_table
+        0x00, 0x02, 0xBE, 0xC0,   // sys_process_param_ptr (= PHDR[6] vaddr)
+        0x01, 0x01, 0x00, 0x00,   // flags
+        0x00, 0x00, 0x00, 0x00,   // reserved1
+    ];
+
+    #[test]
+    fn sys_proc_prx_param_parses_mailbox_v1_layout() {
+        let p = SysProcPrxParam::parse(&MAILBOX_V1_PRX_PARAM_BYTES).unwrap();
+        assert_eq!(p.size, 0x28);
+        assert_eq!(p.magic, SYS_PROC_PRX_PARAM_MAGIC);
+        assert_eq!(p.version, 2);
+        assert_eq!(p.reserved0, 0);
+        assert_eq!(p.prx_load_table, 0x2BE94);
+        assert_eq!(p.prx_unload_table, 0x2BE94);
+        assert_eq!(p.prx_resident_table, 0x2BE94);
+        assert_eq!(p.sys_process_param_ptr, 0x2BEC0);
+        assert_eq!(p.flags, 0x0101_0000);
+        assert_eq!(p.reserved1, 0);
+    }
+
+    #[test]
+    fn sys_proc_prx_param_rejects_short_input() {
+        let bytes = [0u8; 20];
+        assert!(matches!(
+            SysProcPrxParam::parse(&bytes),
+            Err(Error::TooShort)
+        ));
+    }
+
+    #[test]
+    fn sys_proc_prx_param_rejects_wrong_magic() {
+        let mut bytes = MAILBOX_V1_PRX_PARAM_BYTES;
+        bytes[4..8].copy_from_slice(&0xCAFE_BABEu32.to_be_bytes());
+        assert!(matches!(
+            SysProcPrxParam::parse(&bytes),
+            Err(Error::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn sys_proc_prx_param_rejects_wrong_size_field() {
+        let mut bytes = MAILBOX_V1_PRX_PARAM_BYTES;
+        bytes[0..4].copy_from_slice(&0x100u32.to_be_bytes());
+        assert!(matches!(
+            SysProcPrxParam::parse(&bytes),
             Err(Error::Malformed(_))
         ));
     }
