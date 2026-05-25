@@ -253,44 +253,48 @@ pub struct SysProcessParam {
 pub const SYS_PROCESS_PARAM_SIZE: usize = 32;
 pub const SYS_PROCESS_PARAM_MAGIC: u32 = 0x13BC_C5F6;
 
-/// R9.1g.3 — parsed contents of the `sys_proc_prx_param_t`
-/// segment (PT_SCE_PPU_PROC_PARAM, 40 bytes). Holds pointers to
-/// PSL1GHT-specific runtime hooks (the `prx_init_func_table`)
-/// plus a back-reference to the `sys_process_param` block.
+/// R9.1g.3/.5 — parsed contents of the `ppu_proc_prx_param_t`
+/// segment (PT_SCE_PPU_PROC_PARAM, 40 bytes). Holds the start /
+/// end vaddrs of the `.libent` (library-export descriptor) and
+/// `.libstub` (library-import descriptor) sections plus a few
+/// PSL1GHT runtime fields. Field names + semantics aligned with
+/// RPCS3 C++ `PPUModule.cpp:2479` (struct ppu_proc_prx_param_t).
 ///
-/// Field layout reverse-engineered from
-/// `single_spu_mailbox_v1.self` empirical bytes (R9.1g.1 audit).
-/// All fields are big-endian u32 on the wire.
+/// In R9.1g.3 these fields were initially mis-named as
+/// `prx_*_table` (based on incomplete reverse-engineering); the
+/// correct names per RPCS3's reference loader are `libent_*` /
+/// `libstub_*`. The corrected field set lands in R9.1g.5.
+///
+/// All fields are big-endian on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SysProcPrxParam {
     /// Self-reported size of this struct (always 0x28).
     pub size: u32,
     /// Magic value `0x1B434CEC` identifying the v1 layout.
     pub magic: u32,
-    /// Version field (observed: 2). Treated as u32 here even
-    /// though the slot is u64-aligned; bits 32..63 are zero in
-    /// observed binaries.
+    /// Version field (observed: 2).
     pub version: u32,
-    /// Reserved (high half of the version u64).
-    pub reserved0: u32,
-    /// Pointer to the primary `prx_load_init` hook table (in the
-    /// observed PSL1GHT layout, slots `prx_load`, `prx_unload`,
-    /// `prx_resident` all reference the same struct address).
-    pub prx_load_table: u32,
-    /// Pointer to the `prx_unload` hook entry (typically same as
-    /// `prx_load_table`).
-    pub prx_unload_table: u32,
-    /// Pointer to the `prx_resident` hook entry (typically same
-    /// as the other two).
-    pub prx_resident_table: u32,
-    /// Pointer back to the `sys_process_param` segment
-    /// (PT_SCE_PPU_PROCESS_PARAM's vaddr). Lets the runtime
-    /// fetch process info via the proc_param structure alone.
-    pub sys_process_param_ptr: u32,
-    /// PSL1GHT runtime flags (observed: `0x01010000`).
-    pub flags: u32,
     /// Reserved (observed: 0).
-    pub reserved1: u32,
+    pub unk0: u32,
+    /// Start vaddr of the `.libent` section (library exports).
+    /// For executables that don't export anything (most PSL1GHT
+    /// homebrews including all 20 R8.x oracle fixtures),
+    /// `libent_start == libent_end` (empty range).
+    pub libent_start: u32,
+    /// End vaddr of the `.libent` section.
+    pub libent_end: u32,
+    /// Start vaddr of the `.libstub` section (library imports).
+    /// Each entry is a `PpuPrxModuleInfo` (44 bytes) describing
+    /// one imported PRX module + its NID/address arrays.
+    pub libstub_start: u32,
+    /// End vaddr of the `.libstub` section.
+    pub libstub_end: u32,
+    /// SDK / runtime version (observed: 0x0101).
+    pub ver: u16,
+    /// Unknown / runtime flags (observed: 0x0000).
+    pub unk1: u16,
+    /// Reserved (observed: 0).
+    pub unk2: u32,
 }
 
 pub const SYS_PROC_PRX_PARAM_SIZE: usize = 40;
@@ -322,13 +326,101 @@ impl SysProcPrxParam {
             size,
             magic,
             version: read_u32_be(bytes, 8)?,
-            reserved0: read_u32_be(bytes, 12)?,
-            prx_load_table: read_u32_be(bytes, 16)?,
-            prx_unload_table: read_u32_be(bytes, 20)?,
-            prx_resident_table: read_u32_be(bytes, 24)?,
-            sys_process_param_ptr: read_u32_be(bytes, 28)?,
-            flags: read_u32_be(bytes, 32)?,
-            reserved1: read_u32_be(bytes, 36)?,
+            unk0: read_u32_be(bytes, 12)?,
+            libent_start: read_u32_be(bytes, 16)?,
+            libent_end: read_u32_be(bytes, 20)?,
+            libstub_start: read_u32_be(bytes, 24)?,
+            libstub_end: read_u32_be(bytes, 28)?,
+            ver: read_u16_be(bytes, 32)?,
+            unk1: read_u16_be(bytes, 34)?,
+            unk2: read_u32_be(bytes, 36)?,
+        })
+    }
+}
+
+/// R9.1g.5 — single libstub entry describing one imported PRX
+/// module. Each entry is **44 bytes** in the `.libstub` section.
+/// Field layout mirrors RPCS3 C++ `struct ppu_prx_module_info`
+/// (PPUModule.cpp:675). All multi-byte fields are big-endian.
+///
+/// The `addrs` field points to an array of `num_func` u32 slots
+/// that the loader is expected to **populate at startup** with
+/// the resolved function descriptor pointers for each imported
+/// function (identified by the parallel NID array at `nids`).
+/// This is the mechanism R9.1f's crash exposed as missing — the
+/// addrs[] slots contain unresolved data until R9.1g.6 populates
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PpuPrxModuleInfo {
+    /// Self-reported size (always 0x2C = 44).
+    pub size: u8,
+    /// Reserved (typically 0).
+    pub unk0: u8,
+    /// Library version code.
+    pub version: u16,
+    /// Library attributes bitfield.
+    pub attributes: u16,
+    /// Number of imported functions (parallel to `nids` / `addrs`).
+    pub num_func: u16,
+    /// Number of imported variables.
+    pub num_var: u16,
+    /// Number of imported TLS variables.
+    pub num_tlsvar: u16,
+    pub info_hash: u8,
+    pub info_tlshash: u8,
+    /// Reserved (2 bytes).
+    pub unk1: [u8; 2],
+    /// vaddr of the null-terminated module name string.
+    pub name: u32,
+    /// vaddr of the NID array (`num_func` × u32 BE).
+    pub nids: u32,
+    /// vaddr of the address array (`num_func` × u32 BE) — the
+    /// loader writes resolved FD pointers here at startup.
+    pub addrs: u32,
+    /// vaddr of the imported-variable NID array.
+    pub vnids: u32,
+    /// vaddr of the imported-variable stub array.
+    pub vstubs: u32,
+    pub unk4: u32,
+    pub unk5: u32,
+}
+
+pub const PPU_PRX_MODULE_INFO_SIZE: usize = 44;
+
+impl PpuPrxModuleInfo {
+    /// Parse a single 44-byte BE-encoded libstub entry from the
+    /// given slice. Errors if the slice is shorter than
+    /// `PPU_PRX_MODULE_INFO_SIZE` or the self-reported `size`
+    /// byte disagrees.
+    pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() < PPU_PRX_MODULE_INFO_SIZE {
+            return Err(Error::TooShort);
+        }
+        let size = bytes[0];
+        if size as usize != PPU_PRX_MODULE_INFO_SIZE {
+            return Err(Error::Malformed(format!(
+                "ppu_prx_module_info size {size} != expected {}",
+                PPU_PRX_MODULE_INFO_SIZE
+            )));
+        }
+        Ok(Self {
+            size,
+            unk0: bytes[1],
+            version: read_u16_be(bytes, 2)?,
+            attributes: read_u16_be(bytes, 4)?,
+            num_func: read_u16_be(bytes, 6)?,
+            num_var: read_u16_be(bytes, 8)?,
+            num_tlsvar: read_u16_be(bytes, 10)?,
+            info_hash: bytes[12],
+            info_tlshash: bytes[13],
+            unk1: [bytes[14], bytes[15]],
+            name: read_u32_be(bytes, 16)?,
+            nids: read_u32_be(bytes, 20)?,
+            addrs: read_u32_be(bytes, 24)?,
+            vnids: read_u32_be(bytes, 28)?,
+            vstubs: read_u32_be(bytes, 32)?,
+            unk4: read_u32_be(bytes, 36)?,
+            unk5: read_u32_be(bytes, 40)?,
         })
     }
 }
@@ -647,13 +739,23 @@ mod tests {
         assert_eq!(p.size, 0x28);
         assert_eq!(p.magic, SYS_PROC_PRX_PARAM_MAGIC);
         assert_eq!(p.version, 2);
-        assert_eq!(p.reserved0, 0);
-        assert_eq!(p.prx_load_table, 0x2BE94);
-        assert_eq!(p.prx_unload_table, 0x2BE94);
-        assert_eq!(p.prx_resident_table, 0x2BE94);
-        assert_eq!(p.sys_process_param_ptr, 0x2BEC0);
-        assert_eq!(p.flags, 0x0101_0000);
-        assert_eq!(p.reserved1, 0);
+        assert_eq!(p.unk0, 0);
+        // R9.1g.5 — corrected field names (libent/libstub) per
+        // RPCS3 C++ reference layout. mailbox_v1 has:
+        //   libent: empty range (no exports)
+        //   libstub: 0x2BE94..0x2BEC0 (single 44-byte entry = 1 imported module)
+        assert_eq!(p.libent_start, 0x2BE94);
+        assert_eq!(p.libent_end, 0x2BE94, "no exports — empty range");
+        assert_eq!(p.libstub_start, 0x2BE94);
+        assert_eq!(
+            p.libstub_end - p.libstub_start,
+            PPU_PRX_MODULE_INFO_SIZE as u32,
+            "exactly one 44-byte libstub entry",
+        );
+        assert_eq!(p.libstub_end, 0x2BEC0);
+        assert_eq!(p.ver, 0x0101);
+        assert_eq!(p.unk1, 0x0000);
+        assert_eq!(p.unk2, 0);
     }
 
     #[test]
@@ -681,6 +783,73 @@ mod tests {
         bytes[0..4].copy_from_slice(&0x100u32.to_be_bytes());
         assert!(matches!(
             SysProcPrxParam::parse(&bytes),
+            Err(Error::Malformed(_))
+        ));
+    }
+
+    // -- R9.1g.5 PpuPrxModuleInfo (libstub entry) parser -----------
+
+    /// Empirical bytes from `single_spu_mailbox_v1.self` at
+    /// vaddr 0x2BE94 (first libstub entry). 119 imported
+    /// functions; module name + NID array + addrs array all
+    /// in PHDR[0] (.text + .rodata) and PHDR[1] (.data).
+    const MAILBOX_V1_LIBSTUB_ENTRY_BYTES: [u8; 44] = [
+        0x2C, 0x00,             // size + unk0
+        0x00, 0x01,             // version
+        0x00, 0x09,             // attributes
+        0x00, 0x77,             // num_func = 119
+        0x00, 0x00,             // num_var
+        0x00, 0x00,             // num_tlsvar
+        0x00, 0x00,             // info_hash + info_tlshash
+        0x00, 0x00,             // unk1
+        0x00, 0x02, 0xBC, 0xA8, // name
+        0x00, 0x02, 0xBC, 0xB8, // nids
+        0x00, 0x03, 0x00, 0x40, // addrs ← loader populates this
+        0x00, 0x00, 0x00, 0x00, // vnids
+        0x00, 0x00, 0x00, 0x00, // vstubs
+        0x00, 0x00, 0x00, 0x00, // unk4
+        0x00, 0x00, 0x00, 0x20, // unk5
+    ];
+
+    #[test]
+    fn ppu_prx_module_info_parses_mailbox_v1_entry() {
+        let m = PpuPrxModuleInfo::parse(&MAILBOX_V1_LIBSTUB_ENTRY_BYTES).unwrap();
+        assert_eq!(m.size, 0x2C);
+        assert_eq!(m.unk0, 0);
+        assert_eq!(m.version, 0x0001);
+        assert_eq!(m.attributes, 0x0009);
+        assert_eq!(m.num_func, 119);
+        assert_eq!(m.num_var, 0);
+        assert_eq!(m.num_tlsvar, 0);
+        assert_eq!(m.name, 0x0002BCA8);
+        assert_eq!(m.nids, 0x0002BCB8);
+        assert_eq!(m.addrs, 0x00030040,
+            "addrs[] table is where the loader writes resolved FDs");
+        // `addrs` start is at 0x30040; ends at 0x30040 + 119*4 = 0x301BC.
+        // The R9.1f crash site read mem[0x30108] which is
+        // addrs[(0x30108 - 0x30040) / 4] = addrs[50].
+        let crash_index = (0x30108u32 - m.addrs) / 4;
+        assert_eq!(crash_index, 50);
+        assert!(crash_index < m.num_func as u32);
+        assert_eq!(m.vnids, 0);
+        assert_eq!(m.vstubs, 0);
+    }
+
+    #[test]
+    fn ppu_prx_module_info_rejects_short_input() {
+        let bytes = [0u8; 20];
+        assert!(matches!(
+            PpuPrxModuleInfo::parse(&bytes),
+            Err(Error::TooShort)
+        ));
+    }
+
+    #[test]
+    fn ppu_prx_module_info_rejects_wrong_size_byte() {
+        let mut bytes = MAILBOX_V1_LIBSTUB_ENTRY_BYTES;
+        bytes[0] = 0x40; // claim 64 bytes, not 44
+        assert!(matches!(
+            PpuPrxModuleInfo::parse(&bytes),
             Err(Error::Malformed(_))
         ));
     }
