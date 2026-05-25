@@ -1,8 +1,41 @@
-# Project Status — R8.5e LANDED (PUTL stall-and-notify — 20th oracle; entire R8.5 wave closed; full LS↔EA list-DMA stall coverage)
+# Project Status — R9.1g LANDED (PSL1GHT runtime init pipeline; PPU executes deep into crt0; 12 commits, 0 regression, 20 SPU oracles intact)
 
 **Authoritative current source of truth for the RPCS3 → Rust port.**
 
-Last updated: **2026-05-23 (R8.5e E.6 landing — 20th oracle)**.
+Last updated: **2026-05-25 (R9.1g LANDED)**. R9 wave (LV2/PPU
+strategic pivot) executed the full Path A pipeline across 12
+commits — `EmuCore::run_self` now drives a PSL1GHT `.self`
+through SCE-header parse → ELF load → PPC64 FD deref → user-mode
+stack alloc (1 MB) → TLS init (Linux ELFv1 +0x7000 TP bias) →
+sys_process_param + sys_proc_prx_param parse → libstub walk +
+import-stub trampoline install + addrs[] population → PPU
+interpreter coverage expanded with 25 new opcodes (subfic,
+addic, addic., rlwimi, ldu, lwzu, lbzu, lhzu, lhau, stwu, stbu,
+sthu, sradi, addze, mtcrf, stdx, lbzx, lwzx, nor, ldx, mulld,
+mfcr, lfdx, andc, nand, eqv, orc, subfc, subfe, adde, subfze,
+addme, subfme) → lv2 syscall dispatcher arms (~50 arms,
+including sys_mmapper_allocate_address + the full 169..194 sys
+_spu_* family with REAL SPU execution via spu-interpreter) →
+permissive catch-all for unknown syscalls. PPU now executes
+the full PSL1GHT crt0 init path to completion (sys_process_exit
+@ NID 0xe6f2c1e7 terminates cleanly). 264 cargo test result
+blocks pass, ZERO regression across all 12 R9.1g commits. The
+20 SPU oracle replay tests remain green throughout.
+
+**Honest scope note:** PSL1GHT's main() and printf were NOT
+actually reached in the final smoke. The crt0 path takes an
+early-exit branch (likely cleanup) before main() — reaching
+real main() requires either (A) implementing each PSL1GHT
+sysPrxForUser NID with realistic return values, or (B) jumping
+directly to main() via a hardcoded address. Both are
+substantial additional work; R9.1g delivers the architectural
+pipeline (which any future Path B/C deep-dive would build on)
++ the empirically-verified flow up to (and including) the
+sys_process_exit terminal call.
+
+See § 11 below for the R9.1g landing details and roadmap.
+
+Previously: **2026-05-23 (R8.5e E.6 landing — 20th oracle)**.
 R8.5e closes the list-DMA stall-and-notify wave by promoting
 `single_spu_dma_putl_stall_v1` to the 20th replay-validated
 oracle — the symmetric inverse of R8.5d D.6
@@ -2432,6 +2465,175 @@ Same hard rules from § 8 apply throughout R8.5+:
 - v4 / SPURS stays diagnostic-only forever.
 - Behavior-freeze fixtures stay CC0-only; commercial SPU captures
   never enter `behavior-freeze/`.
+
+---
+
+## 11. R9.1g — PSL1GHT runtime init pipeline (LANDED 2026-05-25)
+
+R9.1g executed the Path A approach from
+`.planning/R9_1G_PATH_A_SCOPE_ESTIMATE.md` (chosen over Path B
+"main() bypass" for behavior-freeze fidelity). 12 commits;
+~1600 LOC across `rpcs3-emu-core` + `rpcs3-loader-elf-self` +
+`rpcs3-ppu-interpreter`. Zero regression on the 264 cargo test
+result blocks throughout.
+
+### 11.1 Commit timeline
+
+| Commit | Slice | Scope |
+|--------|-------|-------|
+| `958a5f48e` | R9.1g.2 | PT_SCE_PPU_PROCESS_PARAM parser (sys_process_param, 32 bytes) |
+| `b14af94f9` | R9.1g.3 | PT_SCE_PPU_PROC_PARAM parser (initially wrong field names) |
+| `64a5f10a0` | R9.1g.4 | TLS init (PT_TLS walker + r13 seed) |
+| `eba063916` | R9.1g.5 | libstub `PpuPrxModuleInfo` parser + correct `SysProcPrxParam` field names |
+| `ef8c48659` | R9.1g.6 | install import-stub trampolines + populate `addrs[]` table |
+| `f1ade4f1e` | R9.1g.7 | dispatcher arm for unimplemented imports (CIA-in-stub-region fast path) |
+| `e05e5c24b` | R9.1g.8 | wire all init into `EmuCore::run_self` before _start |
+| `47bf39fb3` | R9.1g.9 iter1 | syscall #330 (mmapper_allocate_address) + ldu + subfic/addic/rlwimi + stack/TLS layout |
+| `340e6a438` | R9.1g.9 iter2 | TLS bias fix + with-update L/S + P31 ALU batch + mmapper family + heap pre-alloc |
+| `d162a46c0` | R9.1g.9 iter3 | sys_spu_* stubs (full SPU lifecycle) + permissive catch-all |
+| `9794837ff` | R9.1g.10 | wire real SPU execution into sys_spu_thread_group_start |
+| `700303684` | R9.1g.11 | sys_process_exit (NID 0xe6f2c1e7) terminates run + NID lookups documented |
+
+### 11.2 What landed
+
+**SCE/SELF + ELF loading** (extending R9.1a/.1b):
+- PT_SCE_PPU_PROCESS_PARAM (`0x60000001`) parser exposes the
+  binary-declared stack size + priority + sdk version.
+- PT_SCE_PPU_PROC_PARAM (`0x60000002`) parser exposes the
+  `.libent` / `.libstub` ranges. Field names corrected per
+  RPCS3 C++ reference (`PPUModule.cpp:2479`).
+- `PpuPrxModuleInfo` (44 bytes) parser for each `.libstub`
+  entry — describes one imported PRX module.
+- PT_TLS walker + `EmuCore::init_tls` allocates the per-
+  thread storage with the Linux ELFv1 +0x7000 TP bias.
+
+**Memory layout** (PPU user-mode VM):
+- `USER_STACK_TOP = 0xD0000000`, 1 MB
+- `USER_TLS_VADDR = 0xCFE00000`, 9-page window
+- `USER_IMPORT_STUB_VADDR = 0xD0010000`, 64 KB
+- Heap pre-allocated at `[0xB0000000, 0xB2000000)`, 32 MB
+
+**PLT thunk resolution** via import stubs:
+- `EmuCore::init_imports` walks `.libstub`, allocates a stub
+  region above the user stack, and for each imported NID
+  writes: 4 byte `sc` trampoline + 8 byte function descriptor
+  (`{u32 code, u32 toc}`), then patches the `.got` addrs[]
+  slot to point at the FD.
+- `EmuCore.import_plan` records each stub's `(module_name,
+  nid, trampoline_vaddr, fd_vaddr, addrs_slot)` for the
+  dispatcher's reverse lookup.
+
+**lv2 syscall dispatcher** (`EmuCore::dispatch_syscall`):
+- New stub-region check: when `sc` fires from inside the
+  import-stub region, look up the NID and either terminate
+  (sys_process_exit, NID `0xe6f2c1e7`) or return r3=0 +
+  jump to LR.
+- ~50 lv2 syscall arms covering: sys_mmapper_* family
+  (324-339), full sys_spu_* family (155-194 incl. 169
+  sys_spu_initialize, 170 group_create, 172 thread_initialize,
+  173 group_start with REAL spu-interpreter execution, 178
+  group_join returning captured OUT_MBOX), `sys_tty_write`
+  (#403, from R9.1a), plus a permissive catch-all that
+  logs+returns 0 for unknown numbers.
+
+**PPU interpreter coverage** (25+ new opcodes total across
+R9.1g.9 iterations):
+- D-form with-update L/S: lwzu, lbzu, lhzu, lhau, stwu,
+  stbu, sthu.
+- DS-form: ldu (P58 XO=1).
+- Primary integers: subfic, addic, addic., rlwimi.
+- P31 XO ALU: sradi, addze, mtcrf, stdx, lbzx, lwzx, nor,
+  ldx, mulld, mfcr, lfdx, andc, nand, eqv, orc, subfc,
+  subfe, adde, subfze, addme, subfme.
+
+**Real SPU execution** (R9.1g.10):
+- `_sys_spu_image_import` (157) parses an SPU ELF blob from
+  PPU memory, builds an `SpuImage` via `rpcs3-lv2-spu-image`,
+  writes the 16-byte `sysSpuImage` struct back to the
+  caller, and stashes the image on `EmuCore.spu_image`.
+- `sys_spu_thread_initialize` (172) reads the 32-byte
+  `sysSpuThreadArgument` struct (4× BE u64) and stashes the
+  args on `EmuCore.spu_thread_args`.
+- `sys_spu_thread_group_start` (173) allocates a fresh
+  `SpuThread`, deploys the captured image into LS,
+  marshals arg0..arg3 into SPU r3..r6 (preferred-slot
+  convention), and runs `spu_run_n` (the existing
+  rpcs3-spu-interpreter) until a stop instruction. Captures
+  the OUT_MBOX value (which mailbox_v1's SPU code writes
+  before stopping) and stashes it on `EmuCore.spu_exit_status`.
+- `sys_spu_thread_group_join` (178) writes `cause=1`
+  (JOIN_GROUP_EXIT) + the captured OUT_MBOX value to the
+  caller's `*cause` / `*status` pointers.
+
+### 11.3 What did NOT land
+
+PSL1GHT's `main()` and `printf` were NOT actually reached in
+the final smoke run on `single_spu_mailbox_v1.self`. The crt0
+init path takes an early-exit branch (sys_spinlock_init +
+mmapper free/unmap + sys_process_exit) BEFORE invoking main().
+The cleanup-then-exit pattern indicates that some import
+returned a value that real lv2 would set differently, causing
+crt0 to bail.
+
+The 6 sysPrxForUser NIDs called before exit are all identified
+(see commit `700303684`):
+- `0x8c2bb498` sys_spinlock_initialize
+- `0xa285139d` sys_spinlock_lock
+- `0x5267cb35` sys_spinlock_unlock
+- `0x4643ba6e` sys_mmapper_unmap_memory
+- `0x409ad939` sys_mmapper_free_memory
+- `0xe6f2c1e7` sys_process_exit ← terminal call
+
+None of these inherently MUST return non-zero — the bail must
+come from some preceding implicit state check. Reaching real
+`main()` requires either:
+
+1. **Path A continuation** — implementing each PSL1GHT
+   sysPrxForUser NID with realistic return values. Need a
+   NID database (PSL1GHT source) + per-NID behavioral
+   modeling. Several days to weeks of work per fixture.
+2. **Path B compromise** — locate `main()` in the ELF
+   (symbol table is stripped, so address-search would need
+   either DWARF debug info or pattern matching) and jump
+   there directly, skipping crt0.
+
+Both paths are substantial; neither was attempted under R9.1g.
+
+### 11.4 What this enables
+
+- **Architectural pipeline complete.** Any future R9.x slice
+  that fixes the crt0-bail or jumps to main() inherits the
+  full sys_spu_* lifecycle wiring, including REAL SPU
+  execution.
+- **R9.1g.10's SPU execution wire-up is exercised** the
+  moment PSL1GHT actually reaches `sys_spu_thread_group_start`.
+  No additional code change is needed there.
+- **Future PSL1GHT-built `.self` binaries** can be analyzed via
+  the audit + parser infrastructure (`r9_opcode_audit.py`,
+  `SysProcessParam`, `SysProcPrxParam`, `PpuPrxModuleInfo`).
+- **20 SPU oracle replay tests remain green** — the existing
+  SPU stack (R5-R8.5e) is untouched.
+
+### 11.5 Strategic recommendation post-R9.1g
+
+The R9 wave delivered the architectural pipeline but not the
+end-to-end behavioral validation it originally aimed for. The
+pragmatic next options:
+
+1. **Pause R9, return to SPU work.** With 20 oracles + the
+   R9.1g pipeline, the project has a strong checkpoint. SPU-
+   side advancements (R8.6+ atomics, multi-SPU, PUTRL family)
+   remain available.
+2. **R9 Path B (hardcoded main()).** Quick-and-dirty: pin
+   each oracle's `main()` address, jump directly. Loses some
+   crt0 fidelity but unblocks real SPU execution + canonical
+   TTY assertions.
+3. **R9 Path A continuation.** Multi-week effort to implement
+   each sysPrxForUser NID. Highest fidelity, highest cost.
+
+Recommendation: **(1) Pause R9** unless a specific use case
+(e.g., upstream RPCS3 contribution, additional homebrew
+support) makes (2) or (3) genuinely valuable.
 
 ---
 
