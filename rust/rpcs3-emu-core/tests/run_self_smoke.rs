@@ -80,6 +80,64 @@ fn r9_1a_run_self_parses_mailbox_v1_and_executes_ppu() {
 
     let result = core.run_self(&self_bytes);
 
+    // R9.1k — scan PHDR[3] data segment post-run for the
+    // `__syscalls` table (~41 sequential u32 BE function-
+    // pointers, each pointing into .text 0x10000..0x2C000 or
+    // the .opd FD area near 0x10000000).
+    {
+        const DATA_BASE: u32 = 0x10010000;
+        const DATA_SIZE: u32 = 0x14D8;
+        let mut buf = vec![0u8; DATA_SIZE as usize];
+        if core.mem.read(DATA_BASE, &mut buf).is_ok() {
+            let mut best_start = 0u32;
+            let mut best_len = 0usize;
+            let mut run_start = 0u32;
+            let mut run_len = 0usize;
+            let mut i = 0usize;
+            while i + 4 <= buf.len() {
+                let v = u32::from_be_bytes([
+                    buf[i], buf[i + 1], buf[i + 2], buf[i + 3],
+                ]);
+                let looks_like_text_ptr = (0x10000..0x2_C000).contains(&v);
+                if looks_like_text_ptr {
+                    if run_len == 0 {
+                        run_start = DATA_BASE + i as u32;
+                    }
+                    run_len += 1;
+                    if run_len > best_len {
+                        best_len = run_len;
+                        best_start = run_start;
+                    }
+                } else {
+                    run_len = 0;
+                }
+                i += 4;
+            }
+            if best_len > 0 {
+                eprintln!(
+                    "[R9.1k scan] longest text-ptr run in .data: \
+                     start=0x{best_start:08x} len={best_len} u32s",
+                );
+                // Print first ~16 ptrs.
+                let mut sub = vec![0u8; (best_len.min(16) * 4) as usize];
+                if core.mem.read(best_start, &mut sub).is_ok() {
+                    for k in 0..(sub.len() / 4) {
+                        let v = u32::from_be_bytes([
+                            sub[k * 4], sub[k * 4 + 1],
+                            sub[k * 4 + 2], sub[k * 4 + 3],
+                        ]);
+                        eprintln!(
+                            "[R9.1k scan]   [{k:02}] +0x{:04x}: 0x{v:08x}",
+                            k * 4,
+                        );
+                    }
+                }
+            } else {
+                eprintln!("[R9.1k scan] NO text-pointer runs in .data — __syscalls not populated; constructors likely did NOT run");
+            }
+        }
+    }
+
     // R9.1h slice 2 — dump full import plan AFTER run_self
     // initializes it.
     if let Some(plan) = core.import_plan.as_ref() {
