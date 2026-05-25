@@ -247,6 +247,14 @@ pub struct EmuCore {
     /// fires from a stub trampoline, the dispatcher looks up the
     /// stub here to either dispatch the import or return-to-caller.
     pub import_plan: Option<ImportPlan>,
+    /// R9.1g.9 — when true, unknown syscall numbers log + return
+    /// CELL_OK instead of bubbling as Error::UnsupportedSyscall.
+    /// `run_self` sets this so PSL1GHT binaries can advance
+    /// through unimplemented syscalls during the iterative
+    /// R9.1g.9 loop. Unit tests that intentionally probe the
+    /// strict-fail path (e.g. `unsupported_syscall_bubbles_up_as_error`)
+    /// keep the default `false`.
+    pub permissive_unknown_syscalls: bool,
     /// Maximum steps per `run` invocation. 0 = unbounded.
     pub step_budget: usize,
 }
@@ -266,6 +274,7 @@ impl EmuCore {
             process: TestProcessState::default(),
             tty: SysTty::new(),
             import_plan: None,
+            permissive_unknown_syscalls: false,
             step_budget: 100_000,
         }
     }
@@ -394,6 +403,12 @@ impl EmuCore {
     /// The `.self` files captured for the R8.x oracles
     /// (`single_spu_*_v1.self`) match that pattern.
     pub fn run_self(&mut self, self_bytes: &[u8]) -> Result<RunReport, Error> {
+        // R9.1g.9 — enable permissive-syscall mode so unknown
+        // lv2 syscalls log + return 0 instead of crashing the
+        // PPU. PSL1GHT binaries hit many syscalls beyond the
+        // ones we have explicit arms for.
+        self.permissive_unknown_syscalls = true;
+
         let sce = parse_sce_header(self_bytes)?;
         let elf_start = sce.header_length as usize;
         if elf_start >= self_bytes.len() {
@@ -893,6 +908,82 @@ impl EmuCore {
                 self.mem.write(out_addr_ptr, &MMAPPER_FIXED_BASE.to_be_bytes())?;
                 self.ppu.gpr[3] = 0;
             }
+            // R9.1g.9 — SPU lifecycle syscalls (the integration
+            // target). Minimal stubs that satisfy PSL1GHT's
+            // expectations. Full end-to-end SPU execution wiring
+            // is the next slice; for now we return CELL_OK with
+            // sentinel IDs so the PPU's main() advances through
+            // the full lifecycle.
+            169 => {
+                // sys_spu_initialize(max_usable_spu, max_raw_spu)
+                // — PSL1GHT calls this once per process.
+                self.ppu.gpr[3] = 0;
+            }
+            170 => {
+                // sys_spu_thread_group_create(*group_id, num, prio, *attr)
+                let group_id_ptr = r3 as u32;
+                const STUB_GROUP_ID: u32 = 0x1000_0001;
+                self.mem.write(group_id_ptr, &STUB_GROUP_ID.to_be_bytes())?;
+                self.ppu.gpr[3] = 0;
+            }
+            171 => {
+                // sys_spu_thread_group_destroy(group_id)
+                self.ppu.gpr[3] = 0;
+            }
+            172 => {
+                // sys_spu_thread_initialize(*thread_id, group_id,
+                //   thread_index, *image, *attr, *args)
+                let thread_id_ptr = r3 as u32;
+                const STUB_THREAD_ID: u32 = 0x1000_0002;
+                self.mem.write(thread_id_ptr, &STUB_THREAD_ID.to_be_bytes())?;
+                self.ppu.gpr[3] = 0;
+            }
+            173 => {
+                // sys_spu_thread_group_start(group_id)
+                // FULL E2E execution of the SPU happens here in a
+                // future slice. For now, return 0 — the matching
+                // sys_spu_thread_group_join (178) writes hardcoded
+                // sentinel cause/status so PSL1GHT continues to
+                // its printf without faulting.
+                self.ppu.gpr[3] = 0;
+            }
+            178 => {
+                // sys_spu_thread_group_join(group_id, *cause, *status)
+                // Stub: cause=1 (JOIN_GROUP_EXIT), status=0 (CELL_OK).
+                // Real execution of the SPU image (which would
+                // produce the genuine OUT_MBOX value) deferred.
+                let cause_ptr = r4 as u32;
+                let status_ptr = self.ppu.gpr[5] as u32;
+                self.mem.write(cause_ptr, &1u32.to_be_bytes())?;
+                self.mem.write(status_ptr, &0u32.to_be_bytes())?;
+                self.ppu.gpr[3] = 0;
+            }
+            155 | 156 | 157 | 158 | 159 | 160 | 161 |
+            165 | 166 | 167 |
+            174 | 175 | 176 | 177 |
+            179 | 180 | 181 | 182 | 184 | 185 | 186 |
+            187 | 188 | 190 | 191 | 192 | 193 | 194 => {
+                // R9.1g.9 — SPU support syscalls (image
+                // open/import/close, raw_spu, group state queries
+                // + write_ls / read_ls / write_snr / event_connect).
+                // PSL1GHT may call these from libsysmodule init or
+                // mailbox setup paths. Stub all with CELL_OK +
+                // write a sentinel into any obvious out-pointer
+                // slot (r3 for *image_id, *out_addr).
+                eprintln!(
+                    "[R9.1g.9] sys_spu_* syscall #{number} stubbed \
+                     (r3=0x{:x} r4=0x{:x} r5=0x{:x} r6=0x{:x})",
+                    r3, r4, self.ppu.gpr[5], self.ppu.gpr[6],
+                );
+                // For syscalls that write an OUT_ID to r3 (e.g.
+                // _sys_spu_image_import), provide a sentinel.
+                if matches!(number, 156 | 157) {
+                    const STUB_IMAGE_ID: u32 = 0x2000_0001;
+                    let out_ptr = r3 as u32;
+                    self.mem.write(out_ptr, &STUB_IMAGE_ID.to_be_bytes())?;
+                }
+                self.ppu.gpr[3] = 0;
+            }
             324 | 325 | 326 | 327 | 328 | 329 | 331 | 332 | 333 |
             334 | 335 | 336 | 337 | 338 | 339 => {
                 // R9.1g.9 — mmapper / memory-container family.
@@ -987,7 +1078,26 @@ impl EmuCore {
                 }
             }
             _ => {
-                return Err(Error::UnsupportedSyscall { number, cia: cia_at_sc });
+                if self.permissive_unknown_syscalls {
+                    // R9.1g.9 permissive mode: log + return CELL_OK
+                    // so the PPU's main() can proceed past
+                    // unrecognized syscalls. `run_self` enables
+                    // this; strict-mode tests leave the default
+                    // off and hit the Error::UnsupportedSyscall
+                    // bubble-up below.
+                    eprintln!(
+                        "[R9.1g.9] catch-all syscall #{number} at CIA \
+                         0x{cia_at_sc:08x} stubbed (r3=0x{:x} r4=0x{:x} \
+                         r5=0x{:x} r6=0x{:x}) — returning 0",
+                        r3, r4, self.ppu.gpr[5], self.ppu.gpr[6],
+                    );
+                    self.ppu.gpr[3] = 0;
+                } else {
+                    return Err(Error::UnsupportedSyscall {
+                        number,
+                        cia: cia_at_sc,
+                    });
+                }
             }
         }
         Ok(None)
