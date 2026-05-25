@@ -144,12 +144,13 @@ impl std::error::Error for Error {}
 /// `.data` ranges of PSL1GHT-built binaries, which top out around
 /// 0x10100000 per the empirical PHDR layouts).
 pub const USER_STACK_TOP: u32 = 0xD000_0000;
-pub const USER_STACK_SIZE: u32 = 0x0001_0000; // 64 KB
+pub const USER_STACK_SIZE: u32 = 0x0010_0000; // R9.1g.9 — 1 MB (PSL1GHT crt0 needs more than 64 KB)
 
 /// R9.1g.4 — default virtual address for the per-thread TLS
 /// region. Sits below the user-mode stack with plenty of headroom
-/// (PSL1GHT fixtures observed need at most ~2 KB).
-pub const USER_TLS_VADDR: u32 = 0xCFFE_0000;
+/// (PSL1GHT fixtures observed need at most ~2 KB). R9.1g.9
+/// repositioned this below the 1 MB stack region to avoid overlap.
+pub const USER_TLS_VADDR: u32 = 0xCFE0_0000;
 
 /// R9.1g.4 — chosen TLS region (returned by [`EmuCore::init_tls`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -406,8 +407,14 @@ impl EmuCore {
         // process state lv2 normally provides before _start.
 
         // Step 1: parse sys_process_param (PT_SCE_PPU_PROCESS_PARAM)
-        // to extract the configured stack size + priority. Fall back
-        // to USER_STACK_SIZE if the segment is missing.
+        // to extract the configured stack size. **R9.1g.9 caveat:**
+        // PSL1GHT binaries declare `primary_stacksize = 0x10000`
+        // (64 KB, per SYS_PROCESS_PARAM macro), but the actual
+        // crt0 + libc + main paths reliably exceed that. Honor a
+        // floor of USER_STACK_SIZE (1 MB) regardless of binary
+        // declaration to avoid frame-overflow MissingFlags faults
+        // that look like memory bugs but are really just under-
+        // sized stack.
         let stack_size = if let Some(ph) = info.pt_proc_param() {
             let off = ph.p_offset as usize;
             let end = off
@@ -421,12 +428,7 @@ impl EmuCore {
                 ));
             }
             let pp = SysProcessParam::parse(&elf_bytes[off..end])?;
-            // Honor the binary-declared stack size if non-zero.
-            if pp.primary_stacksize > 0 {
-                pp.primary_stacksize
-            } else {
-                USER_STACK_SIZE
-            }
+            pp.primary_stacksize.max(USER_STACK_SIZE)
         } else {
             USER_STACK_SIZE
         };
@@ -837,6 +839,28 @@ impl EmuCore {
             }
             43 => {
                 // sys_ppu_thread_yield — no-op in single-thread mode.
+            }
+            330 => {
+                // R9.1g.9 — sys_mmapper_allocate_address(size, flags,
+                // alignment, *out_addr). PSL1GHT crt0 calls this very
+                // early to reserve a virtual-address range for its
+                // heap. We return a fixed sentinel address; the caller
+                // will follow up with sys_mmapper_allocate_shared_memory
+                // + sys_mmapper_map_shared_memory to populate it.
+                //
+                // The SparseBackend is lazy — pages get allocated on
+                // first touch, so returning a sentinel without
+                // actually mapping pages is safe for now.
+                let _size = r3 as u32;
+                let _flags = r4 as u32;
+                let _alignment = self.ppu.gpr[5] as u32;
+                let out_addr_ptr = self.ppu.gpr[6] as u32;
+                // Pick 0xB0000000 — well above PSL1GHT .data
+                // (0x10010000..0x100514D8) and below the stack
+                // region (0xCFFF0000+).
+                const MMAPPER_FIXED_BASE: u32 = 0xB000_0000;
+                self.mem.write(out_addr_ptr, &MMAPPER_FIXED_BASE.to_be_bytes())?;
+                self.ppu.gpr[3] = 0; // CELL_OK
             }
             403 => {
                 // R9.1a — sys_tty_write(ch, buf_ptr, len, *pwritelen)

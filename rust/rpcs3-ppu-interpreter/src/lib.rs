@@ -395,6 +395,60 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
             let sum = ra_or_zero(ppu, op.ra()).wrapping_add(imm);
             ppu.gpr[op.rd() as usize] = sum;
         }
+        primary::SUBFIC => {
+            // R9.1g.9 — subfic rd, ra, simm16
+            // rd = simm16 - ra; XER[CA] = carry of (~ra + simm16 + 1)
+            let a = ppu.gpr[op.ra() as usize];
+            let imm = op.simm16() as i64 as u64;
+            // Subtract via two's complement to get carry-out cleanly.
+            let (sum, c1) = (!a).overflowing_add(imm);
+            let (r, c2) = sum.overflowing_add(1);
+            ppu.gpr[op.rd() as usize] = r;
+            ppu.xer.ca = c1 || c2;
+        }
+        primary::ADDIC => {
+            // R9.1g.9 — addic rd, ra, simm16 — rd = ra + simm16;
+            // XER[CA] = carry-out.
+            let a = ppu.gpr[op.ra() as usize];
+            let imm = op.simm16() as i64 as u64;
+            let (r, c) = a.overflowing_add(imm);
+            ppu.gpr[op.rd() as usize] = r;
+            ppu.xer.ca = c;
+        }
+        primary::ADDIC_D => {
+            // R9.1g.9 — addic. rd, ra, simm16 — same as addic
+            // but also updates CR0.
+            let a = ppu.gpr[op.ra() as usize];
+            let imm = op.simm16() as i64 as u64;
+            let (r, c) = a.overflowing_add(imm);
+            ppu.gpr[op.rd() as usize] = r;
+            ppu.xer.ca = c;
+            update_cr0(ppu, r);
+        }
+        primary::RLWIMI => {
+            // R9.1g.9 — rlwimi ra, rs, sh, mb, me
+            // Rotate-left-word of rs by sh, mask via [mb..me],
+            // INSERT into ra (preserving bits outside mask).
+            // The mask wraps if mb > me.
+            let rs = ppu.gpr[op.rs() as usize] as u32;
+            let ra = ppu.gpr[op.ra() as usize] as u32;
+            let sh = op.sh32();
+            let mb = op.mb32();
+            let me = op.me32();
+            let rot = rs.rotate_left(sh);
+            // Build mask: bits MSB-first from mb..=me inclusive.
+            let mask = ppu_rotate_mask(mb, me);
+            let mask32 = mask as u32;
+            let r = (rot & mask32) | (ra & !mask32);
+            // PPC ELFv1: ra is 64-bit; upper 32 of result is
+            // unchanged (rlwimi only touches low 32 of ra).
+            let upper = ppu.gpr[op.ra() as usize] & 0xFFFF_FFFF_0000_0000;
+            let combined = upper | (r as u64);
+            ppu.gpr[op.ra() as usize] = combined;
+            if op.rc() != 0 {
+                update_cr0(ppu, combined);
+            }
+        }
         primary::MULLI => {
             // rd = gpr[ra] * simm16 (signed, low 64 bits)
             let a = ppu.gpr[op.ra() as usize] as i64;
@@ -998,13 +1052,20 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
 
         // ---- DS-form loads/stores (primary 58 / 62) ---------------
         primary::LD => {
-            // XO is in bits 30..31 (low 2 bits). 0 = ld.
+            // XO is in bits 30..31 (low 2 bits). 0=ld, 1=ldu, 2=lwa.
             let xo = inst & 0x3;
             match xo {
                 0 => {
                     // ld rd, ds(ra)
                     let ea = effective_address_ds(ppu, op);
                     ppu.gpr[op.rd() as usize] = mem_read_u64_be(mem, ea)?;
+                }
+                1 => {
+                    // R9.1g.9 — ldu rd, ds(ra): load + update RA = EA
+                    let ea = effective_address_ds(ppu, op);
+                    let v = mem_read_u64_be(mem, ea)?;
+                    ppu.gpr[op.rd() as usize] = v;
+                    ppu.gpr[op.ra() as usize] = ea as u64;
                 }
                 2 => {
                     // lwa rd, ds(ra) — load word algebraic (sign-extend)
