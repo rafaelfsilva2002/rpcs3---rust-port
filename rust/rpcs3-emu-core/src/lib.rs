@@ -29,7 +29,8 @@
 use rpcs3_emu_types::CellError;
 use rpcs3_loader_elf_self::{
     parse_elf, parse_sce_header, ElfInfo, Error as ElfError,
-    PpuPrxModuleInfo, SysProcPrxParam, PPU_PRX_MODULE_INFO_SIZE,
+    PpuPrxModuleInfo, SysProcessParam, SysProcPrxParam,
+    PPU_PRX_MODULE_INFO_SIZE,
 };
 use rpcs3_memory::PageFlags;
 use rpcs3_memory_backing::{Error as MemError, SparseBackend};
@@ -398,8 +399,76 @@ impl EmuCore {
             return Err(Error::ElfNotLoadable("SCE header_length past end of file"));
         }
         let elf_bytes = &self_bytes[elf_start..];
-        self.load_elf(elf_bytes)?;
-        self.init_user_stack(USER_STACK_TOP, USER_STACK_SIZE)?;
+        let info = self.load_elf(elf_bytes)?;
+
+        // R9.1g.8 — PSL1GHT runtime init pipeline. Parses the
+        // PSL1GHT-specific PT_SCE segments and wires up the
+        // process state lv2 normally provides before _start.
+
+        // Step 1: parse sys_process_param (PT_SCE_PPU_PROCESS_PARAM)
+        // to extract the configured stack size + priority. Fall back
+        // to USER_STACK_SIZE if the segment is missing.
+        let stack_size = if let Some(ph) = info.pt_proc_param() {
+            let off = ph.p_offset as usize;
+            let end = off
+                .checked_add(ph.p_filesz as usize)
+                .ok_or(Error::ElfNotLoadable(
+                    "run_self: sys_process_param offset overflow",
+                ))?;
+            if end > elf_bytes.len() {
+                return Err(Error::ElfNotLoadable(
+                    "run_self: sys_process_param past ELF end",
+                ));
+            }
+            let pp = SysProcessParam::parse(&elf_bytes[off..end])?;
+            // Honor the binary-declared stack size if non-zero.
+            if pp.primary_stacksize > 0 {
+                pp.primary_stacksize
+            } else {
+                USER_STACK_SIZE
+            }
+        } else {
+            USER_STACK_SIZE
+        };
+
+        // Step 2: allocate the user-mode stack + seed r1.
+        self.init_user_stack(USER_STACK_TOP, stack_size)?;
+
+        // Step 3: TLS init if the binary has a PT_TLS segment.
+        // R9.1g.4: ignores empty TLS, sets r13 to a sentinel.
+        self.init_tls(&info, elf_bytes, USER_TLS_VADDR)?;
+
+        // Step 4: parse proc_prx_param + install import stubs
+        // (R9.1g.5/.6). The PSL1GHT crt0 dereferences the
+        // resolved addrs[] table immediately on entry to its
+        // first imported library call, so this must happen
+        // BEFORE we begin PPU execution.
+        if let Some(ph) = info.pt_proc_proc_param() {
+            let off = ph.p_offset as usize;
+            let end = off
+                .checked_add(ph.p_filesz as usize)
+                .ok_or(Error::ElfNotLoadable(
+                    "run_self: proc_prx_param offset overflow",
+                ))?;
+            if end > elf_bytes.len() {
+                return Err(Error::ElfNotLoadable(
+                    "run_self: proc_prx_param past ELF end",
+                ));
+            }
+            let prx = SysProcPrxParam::parse(&elf_bytes[off..end])?;
+            let plan = self.init_imports(&prx)?;
+            eprintln!(
+                "[R9.1g.8] init_imports installed {} stubs across \
+                 [0x{:08x}..0x{:08x})",
+                plan.stubs.len(),
+                USER_IMPORT_STUB_VADDR,
+                USER_IMPORT_STUB_VADDR.wrapping_add(USER_IMPORT_STUB_SIZE),
+            );
+            self.import_plan = Some(plan);
+        }
+
+        // Step 5: run the PPU from the entry point (set by
+        // load_elf, with R9.1b FD-deref already applied).
         let exit_status = self.run()?;
         Ok(RunReport {
             exit_status,
