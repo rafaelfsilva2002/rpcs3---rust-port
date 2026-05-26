@@ -37,7 +37,7 @@ use rpcs3_memory_backing::{Error as MemError, SparseBackend};
 use rpcs3_ppu_interpreter::{step, Error as InterpError, StepOutcome};
 use rpcs3_ppu_thread::{PpuThread, PPU_ID_BASE};
 use rpcs3_lv2_tty::SysTty;
-use rpcs3_lv2_sync::{BlockOutcome, Lv2SyncState, MutexAttr, SyncTable};
+use rpcs3_lv2_sync::{BlockOutcome, Lv2SyncState, MutexAttr, SemaAttr, SyncTable};
 use rpcs3_lv2_lwmutex::{
     sys_lwmutex_create as lv2_lwmutex_create,
     sys_lwmutex_lock as lv2_lwmutex_lock,
@@ -1521,6 +1521,90 @@ impl EmuCore {
             43 => {
                 // sys_ppu_thread_yield — no-op in single-thread mode.
             }
+            // R10.1.e — kernel sys_semaphore family (#90-#94 + #114).
+            // PSL1GHT exposes these via <sys/sem.h>. Same single-PPU
+            // model as sys_mutex: MustBlock from sema_wait surfaces
+            // as ETIMEDOUT (would-block-forever on a single thread).
+            90 => {
+                // sys_semaphore_create(*sem_out, *attr, initial, max)
+                let sem_out = r3 as u32;
+                let attr_ptr = r4 as u32;
+                let initial = self.ppu.gpr[5] as i32;
+                let max = self.ppu.gpr[6] as i32;
+                let attr = match Self::read_sys_sem_attr(&self.mem, attr_ptr) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        self.ppu.gpr[3] = e.0 as u64;
+                        return Ok(None);
+                    }
+                };
+                match self.lv2_sync_state.sema_create(attr, initial, max) {
+                    Ok(id) => {
+                        self.mem.write(sem_out, &id.to_be_bytes())?;
+                        self.ppu.gpr[3] = 0;
+                    }
+                    Err(e) => {
+                        self.ppu.gpr[3] = e.0 as u64;
+                    }
+                }
+            }
+            91 => {
+                // sys_semaphore_destroy(sem_id)
+                let id = r3 as u32;
+                self.ppu.gpr[3] = match self.lv2_sync_state.sema_destroy(id) {
+                    Ok(()) => 0,
+                    Err(e) => e.0 as u64,
+                };
+            }
+            92 => {
+                // sys_semaphore_wait(sem_id, timeout_us)
+                let id = r3 as u32;
+                let _timeout = r4;
+                self.ppu.gpr[3] = match self.lv2_sync_state.sema_wait(id) {
+                    Ok(BlockOutcome::Acquired) => 0,
+                    Ok(BlockOutcome::MustBlock) => {
+                        // Single-PPU: value==0 and no other thread to
+                        // post → would block forever. Surface as
+                        // ETIMEDOUT honestly.
+                        CellError::ETIMEDOUT.0 as u64
+                    }
+                    Ok(BlockOutcome::Timeout) => CellError::ETIMEDOUT.0 as u64,
+                    Err(e) => e.0 as u64,
+                };
+            }
+            93 => {
+                // sys_semaphore_trywait(sem_id)
+                let id = r3 as u32;
+                self.ppu.gpr[3] = match self.lv2_sync_state.sema_trywait(id) {
+                    Ok(()) => 0,
+                    Err(e) => e.0 as u64,
+                };
+            }
+            94 => {
+                // sys_semaphore_post(sem_id, count)
+                let id = r3 as u32;
+                let count = r4 as i32;
+                self.ppu.gpr[3] = match self.lv2_sync_state.sema_post(id, count) {
+                    Ok(()) => 0,
+                    Err(e) => e.0 as u64,
+                };
+            }
+            114 => {
+                // sys_semaphore_get_value(sem_id, *count_out).
+                // Lives outside the 90-95 band — PSL1GHT puts it after
+                // the rwlock family.
+                let id = r3 as u32;
+                let out_ptr = r4 as u32;
+                match self.lv2_sync_state.sema_get_value(id) {
+                    Ok(value) => {
+                        self.mem.write(out_ptr, &value.to_be_bytes())?;
+                        self.ppu.gpr[3] = 0;
+                    }
+                    Err(e) => {
+                        self.ppu.gpr[3] = e.0 as u64;
+                    }
+                }
+            }
             // R10.1.d — kernel sys_mutex family (#100-#104). PSL1GHT
             // exposes these via <sys/mutex.h>. The arms route into the
             // Lv2SyncState SyncTable impl (R10.2). Single-PPU model:
@@ -2103,6 +2187,37 @@ impl EmuCore {
             _ => return Err(CellError::EINVAL),
         }
         Ok(MutexAttr { protocol, recursive })
+    }
+
+    /// R10.1.e — Decode the 32-byte BE `sys_sem_attr_t` at `attr_ptr`
+    /// into a host-side [`SemaAttr`]. Only the protocol is
+    /// semantically modeled; the others (pshared, key, flags, name)
+    /// are read for validation but not stored.
+    ///
+    /// Layout (PSL1GHT `<sys/sem.h>`):
+    /// ```text
+    /// 0x00  attr_protocol  u32 BE  (1=FIFO, 2=PRIO, 3=PRIO_INHERIT)
+    /// 0x04  attr_pshared   u32 BE  (0x200=PSHARED default)
+    /// 0x08  key            u64 BE
+    /// 0x10  flags          s32 BE
+    /// 0x14  pad            u32 BE
+    /// 0x18  name[8]        char
+    /// ```
+    fn read_sys_sem_attr(
+        mem: &SparseBackend,
+        attr_ptr: u32,
+    ) -> Result<SemaAttr, CellError> {
+        if attr_ptr == 0 {
+            return Ok(SemaAttr::default());
+        }
+        let mut buf = [0u8; 32];
+        mem.read(attr_ptr, &mut buf).map_err(|_| CellError::EFAULT)?;
+        let protocol = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        match protocol {
+            1 | 2 | 3 => {}
+            _ => return Err(CellError::EINVAL),
+        }
+        Ok(SemaAttr { protocol })
     }
 
     /// Read 32 bytes from guest memory at `ctrl_ptr` and decode into a
