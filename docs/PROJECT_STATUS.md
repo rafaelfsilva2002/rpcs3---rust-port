@@ -2506,6 +2506,7 @@ the entire R9 wave.
 | `18f22d3bd` | R9.1k | __syscalls .data scan (incorrect — limited to p_filesz) |
 | `(folded)` | R9.1m | __syscalls .data scan corrected to p_memsz — table IS populated at 0x100511A0 |
 | `(folded)` | R9.1n | 31 FD codes mapped; slot[04] = __librt_write_r @ 0x11168 |
+| `5b51b7b46` | R9 closure | folds R9.1m + R9.1n diagnostic changes + R9_FINAL_CLOSURE.md + this PROJECT_STATUS rewrite + R9_1L_ROOT_CAUSE SUPERSEDED stamp |
 
 ### 11.2 What landed
 

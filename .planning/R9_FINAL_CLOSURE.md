@@ -5,7 +5,7 @@
 end-to-end via Rust).
 **Status:** Architecturally complete. End-user TTY emit from
 PSL1GHT main() printf deferred to a future newlib-binding wave.
-**Commits:** 21 across R9.1.a → R9.1.n.
+**Commits:** 22 across R9.1.a → R9.1.n (closure commit `5b51b7b46`).
 
 ## Goal recap (from `.planning/R9_LV2_PPU_INTEGRATION_PLAN.md`)
 
@@ -200,8 +200,10 @@ lives only in newlib's installed headers).
 ## Commit ledger
 
 ```
-r9.1n     (uncommitted) deeper write-path trace — 31 FD codes mapped
-r9.1m     (uncommitted) __syscalls .data scan — corrected for p_memsz
+5b51b7b46 r9 closure: architecturally complete (LV2/PPU integration; TTY emit deferred)
+          ↑ bundles R9.1m + R9.1n diagnostic test changes
+          + R9_FINAL_CLOSURE.md + PROJECT_STATUS rewrite
+          + R9_1L_ROOT_CAUSE SUPERSEDED stamp
 18f22d3bd r9.1k: __syscalls .data scan — constructor confirmation
 a73c17b4d r9.1j: post-fstat disassembly proves static-newlib blocker
 c4bbb312b r9.1i: 8 stdio NID handlers + sys_fs_fstat/write + full NID map
@@ -217,7 +219,7 @@ d162a46c0 r9.1g.9 iter3: sys_spu_* stubs (full SPU lifecycle) + catch-all
 
 (Final two slices R9.1m + R9.1n included only diagnostic
 modifications to `tests/run_self_smoke.rs`; they are folded into
-this R9 closure commit.)
+the closure commit `5b51b7b46`.)
 
 ## Strategic next directions
 
