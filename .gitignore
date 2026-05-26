@@ -67,6 +67,10 @@ behavior-freeze/fixtures/spu/sources/*/*_bin.s
 behavior-freeze/fixtures/spu/sources/*/*_bin.o
 behavior-freeze/fixtures/spu/sources/*/*.bin
 
+# R10.1.d — LV2 (PPU-only) fixtures, same convention as SPU above.
+behavior-freeze/fixtures/lv2/sources/*/*.elf
+behavior-freeze/fixtures/lv2/sources/*/*.self
+
 # =============================================================================
 # Original upstream .gitignore patterns below
 # =============================================================================
@@ -137,6 +141,10 @@ rpcs3/git-version.h
 
 # cmake
 Makefile
+# R10.1.d — fixture Makefiles ARE the build recipe; negate the global
+# `Makefile` rule for them. (Comment at line 58 documents the intent.)
+!behavior-freeze/fixtures/spu/sources/*/Makefile
+!behavior-freeze/fixtures/lv2/sources/*/Makefile
 *CMakeFiles*
 CMakeCache.txt
 *cmake_install.cmake*

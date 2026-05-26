@@ -1,4 +1,4 @@
-# single_lwmutex_v1 — License
+# single_mutex_v1 — License
 
 This fixture (PPU source `main.c`, build script `Makefile`,
 accompanying docs) is original work authored for the RPCS3 → Rust
@@ -18,9 +18,10 @@ text.
 
 This fixture is the first PPU-only (non-SPU) entry in the
 behavior-freeze fixture set. Its purpose is to exercise the LV2
-lwmutex syscall path end-to-end through `rpcs3-emu-core::run_self`,
-validating the R10.1.b NID handler wiring against a real
-PSL1GHT-compiled binary. Public-domain dedication maximises
+kernel sys_mutex syscall path end-to-end through
+`rpcs3-emu-core::run_self`, validating the R10.2 trait impl and
+its dispatcher arms (#100-#104) against a real PSL1GHT-compiled
+binary. Public-domain dedication maximises
 redistribution freedom for the fixture source and its derived `.self`
 binary.
 

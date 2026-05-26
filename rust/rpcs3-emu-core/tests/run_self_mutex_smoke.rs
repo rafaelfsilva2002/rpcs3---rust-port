@@ -1,22 +1,26 @@
 //! R10.1.d smoke test — `EmuCore::run_self` drives a PSL1GHT
-//! `.self` that exercises the lwmutex syscall family
-//! end-to-end (create → lock → unlock → destroy → return
-//! `0xC0DE`).
+//! `.self` that exercises the kernel `sys_mutex_*` syscall family
+//! end-to-end (create → lock → unlock → trylock → unlock →
+//! destroy → return `0xC0DE`).
 //!
-//! This is a behavioural smoke against the R10.1.b NID wiring,
-//! not a byte-exact replay oracle (no JSONL trace; that work
-//! requires extending the C++ capture writer, deferred).
+//! Targets syscalls #100-#104, wired into the dispatcher by this
+//! same slice on top of the R10.2 `SyncTable for Lv2SyncState`
+//! impl.
 //!
-//! Skips gracefully when the fixture `.self` is absent — the
-//! file is gitignored (`.self` extension blocked by the
-//! path-lock hook) and built locally via the Docker toolchain
-//! described in `behavior-freeze/fixtures/lv2/sources/single_lwmutex_v1/README.md`.
+//! This is a behavioural smoke against the dispatcher + SyncTable
+//! integration, not a byte-exact replay oracle (no JSONL trace;
+//! that work requires extending the C++ capture writer, deferred).
+//!
+//! Skips gracefully when the fixture `.self` is absent — the file
+//! is gitignored (`.self` extension blocked by the path-lock hook)
+//! and built locally via the Docker toolchain described in
+//! `behavior-freeze/fixtures/lv2/sources/single_mutex_v1/README.md`.
 
 use std::path::PathBuf;
 
 use rpcs3_emu_core::{EmuCore, Error};
 
-fn lwmutex_self_path() -> PathBuf {
+fn mutex_self_path() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop(); // rust/
     p.pop(); // rpcs3-master/
@@ -24,14 +28,14 @@ fn lwmutex_self_path() -> PathBuf {
     p.push("fixtures");
     p.push("lv2");
     p.push("sources");
-    p.push("single_lwmutex_v1");
-    p.push("single_lwmutex_v1.self");
+    p.push("single_mutex_v1");
+    p.push("single_mutex_v1.self");
     p
 }
 
 #[test]
-fn r10_1d_lwmutex_round_trip_returns_canonical_status() {
-    let self_path = lwmutex_self_path();
+fn r10_1d_kernel_mutex_round_trip_returns_canonical_status() {
+    let self_path = mutex_self_path();
     if !self_path.exists() {
         eprintln!(
             "[R10.1.d smoke] skip: {} not present (run Docker build first)",
@@ -48,8 +52,8 @@ fn r10_1d_lwmutex_round_trip_returns_canonical_status() {
 
     let mut core = EmuCore::new();
     // Give the PPU enough budget to run PSL1GHT's crt0 + main.
-    // The R9 mailbox_v1 path hit ~1M steps; lwmutex is shorter
-    // (no SPU lifecycle) but the budget stays generous.
+    // The R9 mailbox_v1 path hit ~1M steps; kernel-mutex round-trip
+    // is shorter (no SPU lifecycle) but the budget stays generous.
     core.step_budget = 2_000_000;
 
     let result = core.run_self(&self_bytes);
@@ -70,19 +74,20 @@ fn r10_1d_lwmutex_round_trip_returns_canonical_status() {
             // Canonical success: main returned 0xC0DE.
             assert_eq!(
                 report.exit_status.status, 0xC0DE,
-                "expected 0xC0DE canonical exit, got 0x{:x} (1=create, \
-                 2=lock, 3=unlock, 4=destroy failure)",
+                "expected 0xC0DE canonical exit, got 0x{:x} \
+                 (1=create, 2=lock, 3=unlock, 4=trylock, \
+                 5=unlock2, 6=destroy failure)",
                 report.exit_status.status,
             );
         }
         Err(Error::UnsupportedSyscall { number, cia }) => {
-            // R10.1.b only wired the lwmutex NIDs; if PSL1GHT crt0
-            // takes a path through another unimplemented syscall,
-            // surface it here so future slices know where to wire.
+            // R10.1.d wired #100-#104; if PSL1GHT crt0 takes a
+            // path through another unimplemented syscall, surface
+            // it here so future slices know where to wire.
             panic!(
                 "[R10.1.d smoke] reached unimplemented syscall #{number} \
-                 at CIA 0x{cia:08x}. R10.1.b should have covered \
-                 lwmutex_*; this is a new gap."
+                 at CIA 0x{cia:08x}. R10.1.d covered sys_mutex_*; \
+                 this is a new gap."
             );
         }
         Err(Error::Interpreter(ie)) => {
@@ -96,7 +101,7 @@ fn r10_1d_lwmutex_round_trip_returns_canonical_status() {
         Err(Error::StepsExhausted) => {
             panic!(
                 "[R10.1.d smoke] PPU ran 2M steps without exiting. \
-                 Boot loop or lwmutex contention block suspected."
+                 Boot loop or mutex contention block suspected."
             );
         }
         Err(e) => {

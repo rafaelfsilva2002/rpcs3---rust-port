@@ -37,7 +37,7 @@ use rpcs3_memory_backing::{Error as MemError, SparseBackend};
 use rpcs3_ppu_interpreter::{step, Error as InterpError, StepOutcome};
 use rpcs3_ppu_thread::{PpuThread, PPU_ID_BASE};
 use rpcs3_lv2_tty::SysTty;
-use rpcs3_lv2_sync::Lv2SyncState;
+use rpcs3_lv2_sync::{BlockOutcome, Lv2SyncState, MutexAttr, SyncTable};
 use rpcs3_lv2_lwmutex::{
     sys_lwmutex_create as lv2_lwmutex_create,
     sys_lwmutex_lock as lv2_lwmutex_lock,
@@ -158,6 +158,14 @@ impl std::error::Error for Error {}
 /// 0x10100000 per the empirical PHDR layouts).
 pub const USER_STACK_TOP: u32 = 0xD000_0000;
 pub const USER_STACK_SIZE: u32 = 0x0010_0000; // R9.1g.9 — 1 MB (PSL1GHT crt0 needs more than 64 KB)
+
+/// R10.1.d — synthetic thread id used for every LV2 sync syscall in
+/// the single-PPU model. PSL1GHT crt0 only exercises one PPU thread;
+/// this constant is what gets passed as `tid` to `Lv2SyncState`
+/// `mutex_lock`/`mutex_unlock`/etc so the registry's ownership /
+/// reentrancy checks pass. When R11+ adds multi-PPU support, this
+/// becomes per-PpuThread.
+pub const PPU_THREAD_TID: u32 = 1;
 
 /// R9.1g.4 — default virtual address for the per-thread TLS
 /// region. Sits below the user-mode stack with plenty of headroom
@@ -1513,6 +1521,75 @@ impl EmuCore {
             43 => {
                 // sys_ppu_thread_yield — no-op in single-thread mode.
             }
+            // R10.1.d — kernel sys_mutex family (#100-#104). PSL1GHT
+            // exposes these via <sys/mutex.h>. The arms route into the
+            // Lv2SyncState SyncTable impl (R10.2). Single-PPU model:
+            // we hardcode tid = PPU_THREAD_TID. MustBlock on a
+            // single-thread fixture means the fixture deadlocked
+            // itself — we surface it as EDEADLK.
+            100 => {
+                // sys_mutex_create(*mutex_out, *attr).
+                let mutex_out = r3 as u32;
+                let attr_ptr = r4 as u32;
+                let attr = match Self::read_sys_mutex_attr(&self.mem, attr_ptr) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        self.ppu.gpr[3] = e.0 as u64;
+                        return Ok(None);
+                    }
+                };
+                match self.lv2_sync_state.mutex_create(attr) {
+                    Ok(id) => {
+                        self.mem.write(mutex_out, &id.to_be_bytes())?;
+                        self.ppu.gpr[3] = 0;
+                    }
+                    Err(e) => {
+                        self.ppu.gpr[3] = e.0 as u64;
+                    }
+                }
+            }
+            101 => {
+                // sys_mutex_destroy(mutex_id).
+                let id = r3 as u32;
+                self.ppu.gpr[3] = match self.lv2_sync_state.mutex_destroy(id) {
+                    Ok(()) => 0,
+                    Err(e) => e.0 as u64,
+                };
+            }
+            102 => {
+                // sys_mutex_lock(mutex_id, timeout_us).
+                let id = r3 as u32;
+                let _timeout = r4;
+                let outcome = self.lv2_sync_state.mutex_lock(id, PPU_THREAD_TID);
+                self.ppu.gpr[3] = match outcome {
+                    Ok(BlockOutcome::Acquired) => 0,
+                    Ok(BlockOutcome::MustBlock) => {
+                        // Single-PPU: this is a deadlock on this fixture
+                        // (would-be parker is the only thread).
+                        CellError::EDEADLK.0 as u64
+                    }
+                    Ok(BlockOutcome::Timeout) => CellError::ETIMEDOUT.0 as u64,
+                    Err(e) => e.0 as u64,
+                };
+            }
+            103 => {
+                // sys_mutex_trylock(mutex_id).
+                let id = r3 as u32;
+                self.ppu.gpr[3] =
+                    match self.lv2_sync_state.mutex_trylock(id, PPU_THREAD_TID) {
+                        Ok(()) => 0,
+                        Err(e) => e.0 as u64,
+                    };
+            }
+            104 => {
+                // sys_mutex_unlock(mutex_id).
+                let id = r3 as u32;
+                self.ppu.gpr[3] =
+                    match self.lv2_sync_state.mutex_unlock(id, PPU_THREAD_TID) {
+                        Ok(()) => 0,
+                        Err(e) => e.0 as u64,
+                    };
+            }
             330 => {
                 // R9.1g.9 — sys_mmapper_allocate_address(size, flags,
                 // alignment, *out_addr). PSL1GHT crt0 reserves a
@@ -1987,6 +2064,45 @@ impl EmuCore {
         let mut buf = [0u8; LwMutexAttribute::SIZE];
         self.mem.read(attr_ptr, &mut buf)?;
         LwMutexAttribute::parse(&buf).map_err(Error::SyscallEinval)
+    }
+
+    /// R10.1.d — Decode the 40-byte BE `sys_mutex_attr_t` at `attr_ptr`
+    /// into a host-side [`MutexAttr`]. Only the protocol + recursive
+    /// fields are semantically modeled; the others (pshared, adaptive,
+    /// key, flags, name) are read for validation but not stored.
+    ///
+    /// Layout (PSL1GHT `<sys/mutex.h>`):
+    /// ```text
+    /// 0x00  attr_protocol  u32 BE  (1=FIFO, 2=PRIO, 3=PRIO_INHERIT)
+    /// 0x04  attr_recursive u32 BE  (0x10=recursive, 0x20=not_recursive)
+    /// 0x08  attr_pshared   u32 BE  (0x200=NOT_PSHARED default)
+    /// 0x0C  attr_adaptive  u32 BE  (0x1000 / 0x2000)
+    /// 0x10  key            u64 BE
+    /// 0x18  flags          s32 BE
+    /// 0x1C  _pad           u32 BE
+    /// 0x20  name[8]        char
+    /// ```
+    fn read_sys_mutex_attr(
+        mem: &SparseBackend,
+        attr_ptr: u32,
+    ) -> Result<MutexAttr, CellError> {
+        if attr_ptr == 0 {
+            return Ok(MutexAttr::default());
+        }
+        let mut buf = [0u8; 40];
+        mem.read(attr_ptr, &mut buf).map_err(|_| CellError::EFAULT)?;
+        let protocol = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let recursive_raw = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let recursive = match recursive_raw {
+            0x10 => true,
+            0x20 | 0 => false,
+            _ => return Err(CellError::EINVAL),
+        };
+        match protocol {
+            1 | 2 | 3 => {}
+            _ => return Err(CellError::EINVAL),
+        }
+        Ok(MutexAttr { protocol, recursive })
     }
 
     /// Read 32 bytes from guest memory at `ctrl_ptr` and decode into a
