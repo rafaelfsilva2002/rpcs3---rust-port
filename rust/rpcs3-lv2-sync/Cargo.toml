@@ -15,6 +15,7 @@ crate-type = ["staticlib", "rlib"]
 rpcs3-emu-types = { path = "../rpcs3-emu-types" }
 rpcs3-lv2-lwmutex = { path = "../rpcs3-lv2-lwmutex" }
 rpcs3-lv2-cond = { path = "../rpcs3-lv2-cond" }
+rpcs3-lv2-event-flag = { path = "../rpcs3-lv2-event-flag" }
 
 [lints]
 workspace = true

@@ -40,6 +40,10 @@ use std::collections::{BTreeMap, VecDeque};
 
 use rpcs3_emu_types::CellError;
 use rpcs3_lv2_cond::{CondAttr, CondRegistry, WaitOutcome};
+use rpcs3_lv2_event_flag::{
+    EventFlagAttr, EventFlagRegistry, WaitOutcome as EvfWaitOutcome,
+    WAIT_AND, WAIT_CLEAR, WAIT_CLEAR_ALL, WAIT_OR, WAITER_SINGLE,
+};
 use rpcs3_lv2_lwmutex::LwMutexTable;
 
 use crate::{BlockOutcome, MutexAttr, SemaAttr, SyncTable};
@@ -191,6 +195,27 @@ pub struct Sema {
 // Kernel sys_cond entry (R10.3)
 // ====================================================================
 
+// ====================================================================
+// Kernel sys_event_flag entry (R10.5)
+// ====================================================================
+
+/// One parked waiter on a `sys_event_flag_t`. Carries the bit pattern
+/// and mode it was waiting on so a subsequent `evflag_set` can match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventFlagWaiter {
+    pub tid: u32,
+    pub bitptn: u64,
+    pub mode: u32,
+}
+
+/// Kernel-side state for one `sys_event_flag_t`.
+#[derive(Debug, Clone, Default)]
+pub struct EventFlag {
+    pub attr: EventFlagAttr,
+    pub pattern: u64,
+    pub waiters: Vec<EventFlagWaiter>,
+}
+
 /// Kernel-side state for one `sys_cond_t` (condition variable) handle.
 ///
 /// Conds are always tied to a mutex (`mutex_id_untagged` is the raw
@@ -222,9 +247,9 @@ enum Entry {
     Mutex(Mutex),
     Sema(Sema),
     Cond(Cond),
+    EventFlag(EventFlag),
     // Variants below are placeholders the future slices flesh out.
     LwCond,
-    EventFlag,
     EventQueue,
     EventPort,
     RwLock,
@@ -237,8 +262,8 @@ impl Entry {
             Entry::Mutex(_) => Lv2SyncKind::Mutex,
             Entry::Sema(_) => Lv2SyncKind::Sema,
             Entry::Cond(_) => Lv2SyncKind::Cond,
+            Entry::EventFlag(_) => Lv2SyncKind::EventFlag,
             Entry::LwCond => Lv2SyncKind::LwCond,
-            Entry::EventFlag => Lv2SyncKind::EventFlag,
             Entry::EventQueue => Lv2SyncKind::EventQueue,
             Entry::EventPort => Lv2SyncKind::EventPort,
             Entry::RwLock => Lv2SyncKind::RwLock,
@@ -251,8 +276,8 @@ impl Entry {
             Lv2SyncKind::Mutex => Entry::Mutex(Mutex::default()),
             Lv2SyncKind::Sema => Entry::Sema(Sema::default()),
             Lv2SyncKind::Cond => Entry::Cond(Cond::default()),
+            Lv2SyncKind::EventFlag => Entry::EventFlag(EventFlag::default()),
             Lv2SyncKind::LwCond => Entry::LwCond,
-            Lv2SyncKind::EventFlag => Entry::EventFlag,
             Lv2SyncKind::EventQueue => Entry::EventQueue,
             Lv2SyncKind::EventPort => Entry::EventPort,
             Lv2SyncKind::RwLock => Entry::RwLock,
@@ -424,6 +449,27 @@ impl Lv2SyncState {
             Some(_) => Err(CellError::EINVAL),
         }
     }
+
+    // -- EventFlag accessors (R10.5) -------------------------------
+
+    pub fn event_flag(&self, raw: u32) -> Result<&EventFlag, CellError> {
+        match self.entries.get(&raw) {
+            None => Err(CellError::ESRCH),
+            Some(Entry::EventFlag(f)) => Ok(f),
+            Some(_) => Err(CellError::EINVAL),
+        }
+    }
+
+    pub fn event_flag_mut(
+        &mut self,
+        raw: u32,
+    ) -> Result<&mut EventFlag, CellError> {
+        match self.entries.get_mut(&raw) {
+            None => Err(CellError::ESRCH),
+            Some(Entry::EventFlag(f)) => Ok(f),
+            Some(_) => Err(CellError::EINVAL),
+        }
+    }
 }
 
 // ====================================================================
@@ -504,6 +550,30 @@ pub const SEMA_ID_BASE: u32 = 0x9600_0000;
 /// High-byte tag for kernel sys_cond IDs (RPCS3 C++
 /// `lv2_cond::id_base = 0x86000000`).
 pub const COND_ID_BASE: u32 = 0x8600_0000;
+/// High-byte tag for kernel sys_event_flag IDs (RPCS3 C++
+/// `lv2_event_flag::id_base = 0x98000000`).
+pub const EVENT_FLAG_ID_BASE: u32 = 0x9800_0000;
+
+// Helpers duplicated from `rpcs3-lv2-event-flag` (private there) —
+// kept inline so we don't widen that crate's public API just for the
+// Lv2SyncState impl. Kept tiny by design: changes there should be
+// mirrored here.
+#[inline]
+fn evf_pattern_matches(pattern: u64, bitptn: u64, mode: u32) -> bool {
+    match mode & 0xF {
+        WAIT_AND => (pattern & bitptn) == bitptn,
+        WAIT_OR => (pattern & bitptn) != 0,
+        _ => false,
+    }
+}
+#[inline]
+fn evf_apply_clear(pattern: u64, bitptn: u64, mode: u32) -> u64 {
+    match mode & !0xF {
+        WAIT_CLEAR => pattern & !bitptn,
+        WAIT_CLEAR_ALL => 0,
+        _ => pattern,
+    }
+}
 
 const TAG_MASK: u32 = 0x00FF_FFFF;
 
@@ -789,6 +859,99 @@ impl CondRegistry for Lv2SyncState {
         c.waiters.remove(idx);
         c.awakened.push_back(tid);
         Ok(())
+    }
+}
+
+// ====================================================================
+// EventFlagRegistry bridge (R10.5)
+// ====================================================================
+
+impl EventFlagRegistry for Lv2SyncState {
+    fn evflag_create(&mut self, attr: EventFlagAttr) -> Result<u32, CellError> {
+        let id = self.allocate(Lv2SyncKind::EventFlag);
+        let f = self.event_flag_mut(id.raw())?;
+        f.attr = attr;
+        f.pattern = attr.initial_pattern;
+        Ok(tag(EVENT_FLAG_ID_BASE, id.raw()))
+    }
+
+    fn evflag_destroy(&mut self, id: u32) -> Result<(), CellError> {
+        let raw = untag(id);
+        if !self.event_flag(raw)?.waiters.is_empty() {
+            return Err(CellError::EBUSY);
+        }
+        self.destroy(raw, Lv2SyncKind::EventFlag)
+    }
+
+    fn evflag_wait(
+        &mut self,
+        id: u32,
+        tid: u32,
+        bitptn: u64,
+        mode: u32,
+        _timeout_us: u64,
+    ) -> Result<EvfWaitOutcome, CellError> {
+        let f = self.event_flag_mut(untag(id))?;
+        // Single-waiter type: refuse if someone is already parked.
+        if f.attr.waiter_type == WAITER_SINGLE as i32 && !f.waiters.is_empty() {
+            return Err(CellError::EPERM);
+        }
+        if evf_pattern_matches(f.pattern, bitptn, mode) {
+            let snapshot = f.pattern;
+            f.pattern = evf_apply_clear(f.pattern, bitptn, mode);
+            return Ok(EvfWaitOutcome::Satisfied(snapshot));
+        }
+        f.waiters.push(EventFlagWaiter { tid, bitptn, mode });
+        Ok(EvfWaitOutcome::MustBlock)
+    }
+
+    fn evflag_trywait(
+        &mut self,
+        id: u32,
+        bitptn: u64,
+        mode: u32,
+    ) -> Result<EvfWaitOutcome, CellError> {
+        let f = self.event_flag_mut(untag(id))?;
+        if evf_pattern_matches(f.pattern, bitptn, mode) {
+            let snapshot = f.pattern;
+            f.pattern = evf_apply_clear(f.pattern, bitptn, mode);
+            Ok(EvfWaitOutcome::Satisfied(snapshot))
+        } else {
+            Ok(EvfWaitOutcome::NotSatisfied)
+        }
+    }
+
+    fn evflag_set(&mut self, id: u32, bits: u64) -> Result<Vec<u32>, CellError> {
+        let f = self.event_flag_mut(untag(id))?;
+        f.pattern |= bits;
+        let mut woken = Vec::new();
+        let mut i = 0;
+        while i < f.waiters.len() {
+            let w = f.waiters[i].clone();
+            if evf_pattern_matches(f.pattern, w.bitptn, w.mode) {
+                f.pattern = evf_apply_clear(f.pattern, w.bitptn, w.mode);
+                f.waiters.remove(i);
+                woken.push(w.tid);
+            } else {
+                i += 1;
+            }
+        }
+        Ok(woken)
+    }
+
+    fn evflag_clear(&mut self, id: u32, bits: u64) -> Result<(), CellError> {
+        let f = self.event_flag_mut(untag(id))?;
+        f.pattern &= bits;
+        Ok(())
+    }
+
+    fn evflag_get(&self, id: u32) -> Result<u64, CellError> {
+        Ok(self.event_flag(untag(id))?.pattern)
+    }
+
+    fn evflag_cancel(&mut self, id: u32) -> Result<Vec<u32>, CellError> {
+        let f = self.event_flag_mut(untag(id))?;
+        Ok(f.waiters.drain(..).map(|w| w.tid).collect())
     }
 }
 
@@ -1294,6 +1457,135 @@ mod tests {
     fn condreg_destroy_when_empty() {
         let (mut s, _m, c) = setup_cond();
         assert_eq!(s.cond_destroy(c), Ok(()));
+    }
+
+    // -- EventFlagRegistry impl (R10.5) ----------------------------
+
+    fn evf_attr(initial: u64) -> EventFlagAttr {
+        EventFlagAttr { initial_pattern: initial, ..EventFlagAttr::default() }
+    }
+
+    #[test]
+    fn evfreg_create_returns_tagged_id() {
+        let mut s = Lv2SyncState::new();
+        let id =
+            EventFlagRegistry::evflag_create(&mut s, evf_attr(0)).unwrap();
+        assert_eq!(id & 0xFF00_0000, EVENT_FLAG_ID_BASE);
+    }
+
+    #[test]
+    fn evfreg_initial_pattern_round_trips() {
+        let mut s = Lv2SyncState::new();
+        let id =
+            EventFlagRegistry::evflag_create(&mut s, evf_attr(0xDEAD_BEEF))
+                .unwrap();
+        assert_eq!(s.evflag_get(id), Ok(0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn evfreg_trywait_and_with_matching_pattern_clears_when_requested() {
+        let mut s = Lv2SyncState::new();
+        let id =
+            EventFlagRegistry::evflag_create(&mut s, evf_attr(0xFF)).unwrap();
+        // WAIT_AND with bitptn=0x0F: requires all bits set.
+        let res = s.evflag_trywait(id, 0x0F, WAIT_AND | WAIT_CLEAR);
+        assert_eq!(res, Ok(EvfWaitOutcome::Satisfied(0xFF)));
+        // After clear, pattern is 0xF0.
+        assert_eq!(s.evflag_get(id), Ok(0xF0));
+    }
+
+    #[test]
+    fn evfreg_trywait_or_matches_any_bit() {
+        let mut s = Lv2SyncState::new();
+        let id =
+            EventFlagRegistry::evflag_create(&mut s, evf_attr(0x10)).unwrap();
+        let res = s.evflag_trywait(id, 0xFF, WAIT_OR);
+        assert_eq!(res, Ok(EvfWaitOutcome::Satisfied(0x10)));
+    }
+
+    #[test]
+    fn evfreg_trywait_not_satisfied_returns_not_satisfied() {
+        let mut s = Lv2SyncState::new();
+        let id =
+            EventFlagRegistry::evflag_create(&mut s, evf_attr(0)).unwrap();
+        assert_eq!(
+            s.evflag_trywait(id, 0xFF, WAIT_AND),
+            Ok(EvfWaitOutcome::NotSatisfied)
+        );
+    }
+
+    #[test]
+    fn evfreg_wait_parks_when_pattern_does_not_match() {
+        let mut s = Lv2SyncState::new();
+        let id =
+            EventFlagRegistry::evflag_create(&mut s, evf_attr(0)).unwrap();
+        let res = s.evflag_wait(id, 100, 0x01, WAIT_AND, 0);
+        assert_eq!(res, Ok(EvfWaitOutcome::MustBlock));
+        // Waiter is recorded.
+        assert_eq!(s.event_flag(untag(id)).unwrap().waiters.len(), 1);
+    }
+
+    #[test]
+    fn evfreg_set_wakes_matching_waiter() {
+        let mut s = Lv2SyncState::new();
+        let id =
+            EventFlagRegistry::evflag_create(&mut s, evf_attr(0)).unwrap();
+        s.evflag_wait(id, 100, 0x01, WAIT_AND, 0).unwrap();
+        let woken = s.evflag_set(id, 0x01).unwrap();
+        assert_eq!(woken, vec![100u32]);
+        // Default mode had no CLEAR; pattern stays 0x01.
+        assert_eq!(s.evflag_get(id), Ok(0x01));
+    }
+
+    #[test]
+    fn evfreg_set_with_clear_drops_matched_bits_after_wake() {
+        let mut s = Lv2SyncState::new();
+        let id =
+            EventFlagRegistry::evflag_create(&mut s, evf_attr(0)).unwrap();
+        s.evflag_wait(id, 100, 0x01, WAIT_AND | WAIT_CLEAR, 0)
+            .unwrap();
+        let woken = s.evflag_set(id, 0x03).unwrap();
+        assert_eq!(woken, vec![100u32]);
+        // WAIT_CLEAR took out the matched bit; 0x03 & !0x01 = 0x02.
+        assert_eq!(s.evflag_get(id), Ok(0x02));
+    }
+
+    #[test]
+    fn evfreg_clear_masks_pattern() {
+        let mut s = Lv2SyncState::new();
+        let id =
+            EventFlagRegistry::evflag_create(&mut s, evf_attr(0xFF)).unwrap();
+        s.evflag_clear(id, 0x0F).unwrap();
+        assert_eq!(s.evflag_get(id), Ok(0x0F));
+    }
+
+    #[test]
+    fn evfreg_cancel_returns_all_waiters() {
+        let mut s = Lv2SyncState::new();
+        let id =
+            EventFlagRegistry::evflag_create(&mut s, evf_attr(0)).unwrap();
+        s.evflag_wait(id, 100, 0x01, WAIT_AND, 0).unwrap();
+        s.evflag_wait(id, 200, 0x02, WAIT_AND, 0).unwrap();
+        let cancelled = s.evflag_cancel(id).unwrap();
+        assert_eq!(cancelled, vec![100u32, 200u32]);
+        assert!(s.event_flag(untag(id)).unwrap().waiters.is_empty());
+    }
+
+    #[test]
+    fn evfreg_destroy_with_waiters_is_ebusy() {
+        let mut s = Lv2SyncState::new();
+        let id =
+            EventFlagRegistry::evflag_create(&mut s, evf_attr(0)).unwrap();
+        s.evflag_wait(id, 100, 0x01, WAIT_AND, 0).unwrap();
+        assert_eq!(s.evflag_destroy(id), Err(CellError::EBUSY));
+    }
+
+    #[test]
+    fn evfreg_destroy_when_empty() {
+        let mut s = Lv2SyncState::new();
+        let id =
+            EventFlagRegistry::evflag_create(&mut s, evf_attr(0)).unwrap();
+        assert_eq!(s.evflag_destroy(id), Ok(()));
     }
 
     // -- Reserved kinds compile and round-trip without crash ------
