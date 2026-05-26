@@ -45,6 +45,9 @@ use rpcs3_lv2_event_flag::{
     WAIT_AND, WAIT_CLEAR, WAIT_CLEAR_ALL, WAIT_OR, WAITER_SINGLE,
 };
 use rpcs3_lv2_lwmutex::LwMutexTable;
+use rpcs3_lv2_rwlock::{
+    LockOutcome as RwLockOutcome, RwlockAttr, RwlockRegistry,
+};
 
 use crate::{BlockOutcome, MutexAttr, SemaAttr, SyncTable};
 
@@ -216,6 +219,23 @@ pub struct EventFlag {
     pub waiters: Vec<EventFlagWaiter>,
 }
 
+// ====================================================================
+// Kernel sys_rwlock entry (R10.7)
+// ====================================================================
+
+/// Kernel-side state for one `sys_rwlock_t`. Tracks reader list +
+/// optional writer + separate FIFO queues for read/write waiters.
+/// PS3 LV2 is writer-priority — readers must block when a writer is
+/// queued.
+#[derive(Debug, Clone, Default)]
+pub struct Rwlock {
+    pub attr: RwlockAttr,
+    pub readers: Vec<u32>,
+    pub writer: Option<u32>,
+    pub read_waiters: VecDeque<u32>,
+    pub write_waiters: VecDeque<u32>,
+}
+
 /// Kernel-side state for one `sys_cond_t` (condition variable) handle.
 ///
 /// Conds are always tied to a mutex (`mutex_id_untagged` is the raw
@@ -248,11 +268,11 @@ enum Entry {
     Sema(Sema),
     Cond(Cond),
     EventFlag(EventFlag),
+    RwLock(Rwlock),
     // Variants below are placeholders the future slices flesh out.
     LwCond,
     EventQueue,
     EventPort,
-    RwLock,
 }
 
 impl Entry {
@@ -263,10 +283,10 @@ impl Entry {
             Entry::Sema(_) => Lv2SyncKind::Sema,
             Entry::Cond(_) => Lv2SyncKind::Cond,
             Entry::EventFlag(_) => Lv2SyncKind::EventFlag,
+            Entry::RwLock(_) => Lv2SyncKind::RwLock,
             Entry::LwCond => Lv2SyncKind::LwCond,
             Entry::EventQueue => Lv2SyncKind::EventQueue,
             Entry::EventPort => Lv2SyncKind::EventPort,
-            Entry::RwLock => Lv2SyncKind::RwLock,
         }
     }
 
@@ -277,10 +297,10 @@ impl Entry {
             Lv2SyncKind::Sema => Entry::Sema(Sema::default()),
             Lv2SyncKind::Cond => Entry::Cond(Cond::default()),
             Lv2SyncKind::EventFlag => Entry::EventFlag(EventFlag::default()),
+            Lv2SyncKind::RwLock => Entry::RwLock(Rwlock::default()),
             Lv2SyncKind::LwCond => Entry::LwCond,
             Lv2SyncKind::EventQueue => Entry::EventQueue,
             Lv2SyncKind::EventPort => Entry::EventPort,
-            Lv2SyncKind::RwLock => Entry::RwLock,
         }
     }
 }
@@ -470,6 +490,24 @@ impl Lv2SyncState {
             Some(_) => Err(CellError::EINVAL),
         }
     }
+
+    // -- Rwlock accessors (R10.7) ----------------------------------
+
+    pub fn rwlock(&self, raw: u32) -> Result<&Rwlock, CellError> {
+        match self.entries.get(&raw) {
+            None => Err(CellError::ESRCH),
+            Some(Entry::RwLock(r)) => Ok(r),
+            Some(_) => Err(CellError::EINVAL),
+        }
+    }
+
+    pub fn rwlock_mut(&mut self, raw: u32) -> Result<&mut Rwlock, CellError> {
+        match self.entries.get_mut(&raw) {
+            None => Err(CellError::ESRCH),
+            Some(Entry::RwLock(r)) => Ok(r),
+            Some(_) => Err(CellError::EINVAL),
+        }
+    }
 }
 
 // ====================================================================
@@ -553,6 +591,9 @@ pub const COND_ID_BASE: u32 = 0x8600_0000;
 /// High-byte tag for kernel sys_event_flag IDs (RPCS3 C++
 /// `lv2_event_flag::id_base = 0x98000000`).
 pub const EVENT_FLAG_ID_BASE: u32 = 0x9800_0000;
+/// High-byte tag for kernel sys_rwlock IDs (RPCS3 C++
+/// `lv2_rwlock::id_base = 0x88000000`).
+pub const RWLOCK_ID_BASE: u32 = 0x8800_0000;
 
 // Helpers duplicated from `rpcs3-lv2-event-flag` (private there) —
 // kept inline so we don't widen that crate's public API just for the
@@ -952,6 +993,131 @@ impl EventFlagRegistry for Lv2SyncState {
     fn evflag_cancel(&mut self, id: u32) -> Result<Vec<u32>, CellError> {
         let f = self.event_flag_mut(untag(id))?;
         Ok(f.waiters.drain(..).map(|w| w.tid).collect())
+    }
+}
+
+// ====================================================================
+// RwlockRegistry bridge (R10.7)
+// ====================================================================
+
+impl RwlockRegistry for Lv2SyncState {
+    fn rwlock_create(&mut self, attr: RwlockAttr) -> Result<u32, CellError> {
+        let id = self.allocate(Lv2SyncKind::RwLock);
+        self.rwlock_mut(id.raw())?.attr = attr;
+        Ok(tag(RWLOCK_ID_BASE, id.raw()))
+    }
+
+    fn rwlock_destroy(&mut self, id: u32) -> Result<(), CellError> {
+        let raw = untag(id);
+        {
+            let r = self.rwlock(raw)?;
+            if !r.readers.is_empty()
+                || r.writer.is_some()
+                || !r.read_waiters.is_empty()
+                || !r.write_waiters.is_empty()
+            {
+                return Err(CellError::EBUSY);
+            }
+        }
+        self.destroy(raw, Lv2SyncKind::RwLock)
+    }
+
+    fn rwlock_rlock(
+        &mut self,
+        id: u32,
+        tid: u32,
+        _timeout_us: u64,
+    ) -> Result<RwLockOutcome, CellError> {
+        let r = self.rwlock_mut(untag(id))?;
+        // Writer-priority: block if a writer holds or any write waiter
+        // is queued (so new readers can't starve writers).
+        if r.writer.is_some() || !r.write_waiters.is_empty() {
+            r.read_waiters.push_back(tid);
+            Ok(RwLockOutcome::MustBlock)
+        } else {
+            r.readers.push(tid);
+            Ok(RwLockOutcome::Acquired)
+        }
+    }
+
+    fn rwlock_tryrlock(
+        &mut self,
+        id: u32,
+        tid: u32,
+    ) -> Result<RwLockOutcome, CellError> {
+        let r = self.rwlock_mut(untag(id))?;
+        if r.writer.is_some() || !r.write_waiters.is_empty() {
+            Ok(RwLockOutcome::Busy)
+        } else {
+            r.readers.push(tid);
+            Ok(RwLockOutcome::Acquired)
+        }
+    }
+
+    fn rwlock_runlock(&mut self, id: u32, tid: u32) -> Result<(), CellError> {
+        let r = self.rwlock_mut(untag(id))?;
+        let idx = r
+            .readers
+            .iter()
+            .position(|&t| t == tid)
+            .ok_or(CellError::EPERM)?;
+        r.readers.remove(idx);
+        // If we just drained the last reader and a writer is queued,
+        // hand the lock to the writer at the head of the queue.
+        if r.readers.is_empty() && r.writer.is_none() {
+            if let Some(next) = r.write_waiters.pop_front() {
+                r.writer = Some(next);
+            }
+        }
+        Ok(())
+    }
+
+    fn rwlock_wlock(
+        &mut self,
+        id: u32,
+        tid: u32,
+        _timeout_us: u64,
+    ) -> Result<RwLockOutcome, CellError> {
+        let r = self.rwlock_mut(untag(id))?;
+        if r.writer.is_none() && r.readers.is_empty() {
+            r.writer = Some(tid);
+            Ok(RwLockOutcome::Acquired)
+        } else {
+            r.write_waiters.push_back(tid);
+            Ok(RwLockOutcome::MustBlock)
+        }
+    }
+
+    fn rwlock_trywlock(
+        &mut self,
+        id: u32,
+        tid: u32,
+    ) -> Result<RwLockOutcome, CellError> {
+        let r = self.rwlock_mut(untag(id))?;
+        if r.writer.is_none() && r.readers.is_empty() {
+            r.writer = Some(tid);
+            Ok(RwLockOutcome::Acquired)
+        } else {
+            Ok(RwLockOutcome::Busy)
+        }
+    }
+
+    fn rwlock_wunlock(&mut self, id: u32, tid: u32) -> Result<(), CellError> {
+        let r = self.rwlock_mut(untag(id))?;
+        if r.writer != Some(tid) {
+            return Err(CellError::EPERM);
+        }
+        r.writer = None;
+        // Hand off: another writer first (writer-priority), else drain
+        // all pending readers.
+        if let Some(next) = r.write_waiters.pop_front() {
+            r.writer = Some(next);
+        } else {
+            while let Some(reader) = r.read_waiters.pop_front() {
+                r.readers.push(reader);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1586,6 +1752,138 @@ mod tests {
         let id =
             EventFlagRegistry::evflag_create(&mut s, evf_attr(0)).unwrap();
         assert_eq!(s.evflag_destroy(id), Ok(()));
+    }
+
+    // -- RwlockRegistry impl (R10.7) -------------------------------
+
+    fn make_rwlock(s: &mut Lv2SyncState) -> u32 {
+        RwlockRegistry::rwlock_create(s, RwlockAttr::default()).unwrap()
+    }
+
+    #[test]
+    fn rwlockreg_create_returns_tagged_id() {
+        let mut s = Lv2SyncState::new();
+        let id = make_rwlock(&mut s);
+        assert_eq!(id & 0xFF00_0000, RWLOCK_ID_BASE);
+    }
+
+    #[test]
+    fn rwlockreg_rlock_acquires_when_free() {
+        let mut s = Lv2SyncState::new();
+        let id = make_rwlock(&mut s);
+        assert_eq!(s.rwlock_rlock(id, 100, 0), Ok(RwLockOutcome::Acquired));
+        assert_eq!(s.rwlock(untag(id)).unwrap().readers, vec![100u32]);
+    }
+
+    #[test]
+    fn rwlockreg_two_readers_can_share() {
+        let mut s = Lv2SyncState::new();
+        let id = make_rwlock(&mut s);
+        s.rwlock_rlock(id, 100, 0).unwrap();
+        assert_eq!(s.rwlock_rlock(id, 200, 0), Ok(RwLockOutcome::Acquired));
+        assert_eq!(s.rwlock(untag(id)).unwrap().readers, vec![100u32, 200u32]);
+    }
+
+    #[test]
+    fn rwlockreg_wlock_blocks_with_readers() {
+        let mut s = Lv2SyncState::new();
+        let id = make_rwlock(&mut s);
+        s.rwlock_rlock(id, 100, 0).unwrap();
+        assert_eq!(s.rwlock_wlock(id, 200, 0), Ok(RwLockOutcome::MustBlock));
+        assert_eq!(s.rwlock(untag(id)).unwrap().write_waiters.len(), 1);
+    }
+
+    #[test]
+    fn rwlockreg_writer_priority_blocks_new_readers() {
+        let mut s = Lv2SyncState::new();
+        let id = make_rwlock(&mut s);
+        s.rwlock_rlock(id, 100, 0).unwrap();
+        // Writer queues up.
+        s.rwlock_wlock(id, 200, 0).unwrap(); // MustBlock
+        // New reader must NOT slip in — writer-priority.
+        assert_eq!(s.rwlock_rlock(id, 300, 0), Ok(RwLockOutcome::MustBlock));
+    }
+
+    #[test]
+    fn rwlockreg_runlock_drains_to_writer() {
+        let mut s = Lv2SyncState::new();
+        let id = make_rwlock(&mut s);
+        s.rwlock_rlock(id, 100, 0).unwrap();
+        s.rwlock_wlock(id, 200, 0).unwrap();
+        s.rwlock_runlock(id, 100).unwrap();
+        let r = s.rwlock(untag(id)).unwrap();
+        assert!(r.readers.is_empty());
+        assert_eq!(r.writer, Some(200));
+        assert!(r.write_waiters.is_empty());
+    }
+
+    #[test]
+    fn rwlockreg_runlock_not_holder_is_eperm() {
+        let mut s = Lv2SyncState::new();
+        let id = make_rwlock(&mut s);
+        s.rwlock_rlock(id, 100, 0).unwrap();
+        assert_eq!(s.rwlock_runlock(id, 200), Err(CellError::EPERM));
+    }
+
+    #[test]
+    fn rwlockreg_wunlock_hands_off_to_next_writer() {
+        let mut s = Lv2SyncState::new();
+        let id = make_rwlock(&mut s);
+        s.rwlock_wlock(id, 100, 0).unwrap(); // 100 holds
+        s.rwlock_wlock(id, 200, 0).unwrap(); // 200 queues
+        s.rwlock_wlock(id, 300, 0).unwrap(); // 300 queues
+        s.rwlock_wunlock(id, 100).unwrap();
+        let r = s.rwlock(untag(id)).unwrap();
+        assert_eq!(r.writer, Some(200));
+        assert_eq!(r.write_waiters.len(), 1);
+    }
+
+    #[test]
+    fn rwlockreg_wunlock_drains_all_readers_when_no_writer_queued() {
+        let mut s = Lv2SyncState::new();
+        let id = make_rwlock(&mut s);
+        s.rwlock_wlock(id, 100, 0).unwrap();
+        // Readers queue (blocked by the writer).
+        s.rwlock_rlock(id, 200, 0).unwrap();
+        s.rwlock_rlock(id, 300, 0).unwrap();
+        s.rwlock_wunlock(id, 100).unwrap();
+        let r = s.rwlock(untag(id)).unwrap();
+        assert_eq!(r.writer, None);
+        assert_eq!(r.readers, vec![200u32, 300u32]);
+        assert!(r.read_waiters.is_empty());
+    }
+
+    #[test]
+    fn rwlockreg_wunlock_not_holder_is_eperm() {
+        let mut s = Lv2SyncState::new();
+        let id = make_rwlock(&mut s);
+        s.rwlock_wlock(id, 100, 0).unwrap();
+        assert_eq!(s.rwlock_wunlock(id, 200), Err(CellError::EPERM));
+    }
+
+    #[test]
+    fn rwlockreg_try_paths_match_lock_paths() {
+        let mut s = Lv2SyncState::new();
+        let id = make_rwlock(&mut s);
+        assert_eq!(s.rwlock_tryrlock(id, 100), Ok(RwLockOutcome::Acquired));
+        assert_eq!(s.rwlock_trywlock(id, 200), Ok(RwLockOutcome::Busy));
+        s.rwlock_runlock(id, 100).unwrap();
+        assert_eq!(s.rwlock_trywlock(id, 200), Ok(RwLockOutcome::Acquired));
+    }
+
+    #[test]
+    fn rwlockreg_destroy_held_is_ebusy() {
+        let mut s = Lv2SyncState::new();
+        let id = make_rwlock(&mut s);
+        s.rwlock_wlock(id, 100, 0).unwrap();
+        assert_eq!(s.rwlock_destroy(id), Err(CellError::EBUSY));
+    }
+
+    #[test]
+    fn rwlockreg_destroy_when_free() {
+        let mut s = Lv2SyncState::new();
+        let id = make_rwlock(&mut s);
+        assert_eq!(s.rwlock_destroy(id), Ok(()));
     }
 
     // -- Reserved kinds compile and round-trip without crash ------
