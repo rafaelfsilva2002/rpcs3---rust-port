@@ -1003,6 +1003,206 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                     ppu.fpr[op.frd() as usize] = f64::from_bits(bits);
                 }
 
+                // ---- R11.3: indexed load/store (X-form) ------------
+                // EA = (ra|0) + rb. "u"-variants also write EA back to
+                // ra (update form). Loads use op.rd(); stores op.rs().
+                55 => {
+                    // lwzux rt, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    ppu.gpr[op.rd() as usize] = mem_read_u32_be(mem, ea)? as u64;
+                    ppu.gpr[op.ra() as usize] = ea as u64;
+                }
+                119 => {
+                    // lbzux rt, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    ppu.gpr[op.rd() as usize] = mem_read_u8(mem, ea)? as u64;
+                    ppu.gpr[op.ra() as usize] = ea as u64;
+                }
+                279 => {
+                    // lhzx rt, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    ppu.gpr[op.rd() as usize] = mem_read_u16_be(mem, ea)? as u64;
+                }
+                311 => {
+                    // lhzux rt, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    ppu.gpr[op.rd() as usize] = mem_read_u16_be(mem, ea)? as u64;
+                    ppu.gpr[op.ra() as usize] = ea as u64;
+                }
+                343 => {
+                    // lhax rt, ra, rb — load halfword algebraic (sign-ext)
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    let v = mem_read_u16_be(mem, ea)? as i16 as i64;
+                    ppu.gpr[op.rd() as usize] = v as u64;
+                }
+                375 => {
+                    // lhaux rt, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    let v = mem_read_u16_be(mem, ea)? as i16 as i64;
+                    ppu.gpr[op.rd() as usize] = v as u64;
+                    ppu.gpr[op.ra() as usize] = ea as u64;
+                }
+                341 => {
+                    // lwax rt, ra, rb — load word algebraic (sign-ext)
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    let v = mem_read_u32_be(mem, ea)? as i32 as i64;
+                    ppu.gpr[op.rd() as usize] = v as u64;
+                }
+                373 => {
+                    // lwaux rt, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    let v = mem_read_u32_be(mem, ea)? as i32 as i64;
+                    ppu.gpr[op.rd() as usize] = v as u64;
+                    ppu.gpr[op.ra() as usize] = ea as u64;
+                }
+                53 => {
+                    // ldux rt, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    ppu.gpr[op.rd() as usize] = mem_read_u64_be(mem, ea)?;
+                    ppu.gpr[op.ra() as usize] = ea as u64;
+                }
+                151 => {
+                    // stwx rs, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    mem_write_u32_be(mem, ea, ppu.gpr[op.rs() as usize] as u32)?;
+                }
+                183 => {
+                    // stwux rs, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    mem_write_u32_be(mem, ea, ppu.gpr[op.rs() as usize] as u32)?;
+                    ppu.gpr[op.ra() as usize] = ea as u64;
+                }
+                215 => {
+                    // stbx rs, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    mem_write_u8(mem, ea, ppu.gpr[op.rs() as usize] as u8)?;
+                }
+                247 => {
+                    // stbux rs, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    mem_write_u8(mem, ea, ppu.gpr[op.rs() as usize] as u8)?;
+                    ppu.gpr[op.ra() as usize] = ea as u64;
+                }
+                407 => {
+                    // sthx rs, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    mem_write_u16_be(mem, ea, ppu.gpr[op.rs() as usize] as u16)?;
+                }
+                439 => {
+                    // sthux rs, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    mem_write_u16_be(mem, ea, ppu.gpr[op.rs() as usize] as u16)?;
+                    ppu.gpr[op.ra() as usize] = ea as u64;
+                }
+                181 => {
+                    // stdux rs, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    mem_write_u64_be(mem, ea, ppu.gpr[op.rs() as usize])?;
+                    ppu.gpr[op.ra() as usize] = ea as u64;
+                }
+                534 => {
+                    // lwbrx rt, ra, rb — load word byte-reversed
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    let v = mem_read_u32_be(mem, ea)?.swap_bytes();
+                    ppu.gpr[op.rd() as usize] = v as u64;
+                }
+                790 => {
+                    // lhbrx rt, ra, rb — load halfword byte-reversed
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    let v = mem_read_u16_be(mem, ea)?.swap_bytes();
+                    ppu.gpr[op.rd() as usize] = v as u64;
+                }
+                662 => {
+                    // stwbrx rs, ra, rb — store word byte-reversed
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    let v = (ppu.gpr[op.rs() as usize] as u32).swap_bytes();
+                    mem_write_u32_be(mem, ea, v)?;
+                }
+                918 => {
+                    // sthbrx rs, ra, rb — store halfword byte-reversed
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    let v = (ppu.gpr[op.rs() as usize] as u16).swap_bytes();
+                    mem_write_u16_be(mem, ea, v)?;
+                }
+                535 => {
+                    // lfsx frt, ra, rb — load fp single indexed
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    let bits = mem_read_u32_be(mem, ea)?;
+                    ppu.fpr[op.frd() as usize] = f32::from_bits(bits) as f64;
+                }
+                567 => {
+                    // lfsux frt, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    let bits = mem_read_u32_be(mem, ea)?;
+                    ppu.fpr[op.frd() as usize] = f32::from_bits(bits) as f64;
+                    ppu.gpr[op.ra() as usize] = ea as u64;
+                }
+                631 => {
+                    // lfdux frt, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    ppu.fpr[op.frd() as usize] =
+                        f64::from_bits(mem_read_u64_be(mem, ea)?);
+                    ppu.gpr[op.ra() as usize] = ea as u64;
+                }
+                663 => {
+                    // stfsx frs, ra, rb — store fp single indexed
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    let v = (ppu.fpr[op.frs() as usize] as f32).to_bits();
+                    mem_write_u32_be(mem, ea, v)?;
+                }
+                695 => {
+                    // stfsux frs, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    let v = (ppu.fpr[op.frs() as usize] as f32).to_bits();
+                    mem_write_u32_be(mem, ea, v)?;
+                    ppu.gpr[op.ra() as usize] = ea as u64;
+                }
+                727 => {
+                    // stfdx frs, ra, rb — store fp double indexed
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    mem_write_u64_be(mem, ea, ppu.fpr[op.frs() as usize].to_bits())?;
+                }
+                759 => {
+                    // stfdux frs, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    mem_write_u64_be(mem, ea, ppu.fpr[op.frs() as usize].to_bits())?;
+                    ppu.gpr[op.ra() as usize] = ea as u64;
+                }
+                983 => {
+                    // stfiwx frs, ra, rb — store the low word of frs as-is
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    let v = ppu.fpr[op.frs() as usize].to_bits() as u32;
+                    mem_write_u32_be(mem, ea, v)?;
+                }
+
                 // R9.1g.9 — additional P31 XO additions found via
                 // iterative smoke runs.
                 60 => {
@@ -2387,6 +2587,109 @@ pub mod encode {
             | ((rb & 0x1F) << 11)
             | ((xo & 0x3FF) << 1)
     }
+
+    // -- R11.3 indexed load/store (X-form, XO via xo31_dar) --------
+    // rt/rs/frt/frs all occupy the same 5-bit field at bits 6..10.
+
+    /// `lwzx rt, ra, rb` (handler pre-existed; encoder added R11.3).
+    #[must_use]
+    pub const fn lwzx(rt: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rt, ra, rb, 23) }
+    /// `lbzx rt, ra, rb`.
+    #[must_use]
+    pub const fn lbzx(rt: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rt, ra, rb, 87) }
+    /// `ldx rt, ra, rb`.
+    #[must_use]
+    pub const fn ldx(rt: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rt, ra, rb, 21) }
+    /// `stdx rs, ra, rb`.
+    #[must_use]
+    pub const fn stdx(rs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rs, ra, rb, 149) }
+    /// `lfdx frt, ra, rb`.
+    #[must_use]
+    pub const fn lfdx(frt: u32, ra: u32, rb: u32) -> u32 { xo31_dar(frt, ra, rb, 599) }
+    /// `lwzux rt, ra, rb`.
+    #[must_use]
+    pub const fn lwzux(rt: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rt, ra, rb, 55) }
+    /// `lbzux rt, ra, rb`.
+    #[must_use]
+    pub const fn lbzux(rt: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rt, ra, rb, 119) }
+    /// `lhzx rt, ra, rb`.
+    #[must_use]
+    pub const fn lhzx(rt: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rt, ra, rb, 279) }
+    /// `lhzux rt, ra, rb`.
+    #[must_use]
+    pub const fn lhzux(rt: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rt, ra, rb, 311) }
+    /// `lhax rt, ra, rb`.
+    #[must_use]
+    pub const fn lhax(rt: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rt, ra, rb, 343) }
+    /// `lhaux rt, ra, rb`.
+    #[must_use]
+    pub const fn lhaux(rt: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rt, ra, rb, 375) }
+    /// `lwax rt, ra, rb`.
+    #[must_use]
+    pub const fn lwax(rt: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rt, ra, rb, 341) }
+    /// `lwaux rt, ra, rb`.
+    #[must_use]
+    pub const fn lwaux(rt: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rt, ra, rb, 373) }
+    /// `ldux rt, ra, rb`.
+    #[must_use]
+    pub const fn ldux(rt: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rt, ra, rb, 53) }
+    /// `stwx rs, ra, rb`.
+    #[must_use]
+    pub const fn stwx(rs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rs, ra, rb, 151) }
+    /// `stwux rs, ra, rb`.
+    #[must_use]
+    pub const fn stwux(rs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rs, ra, rb, 183) }
+    /// `stbx rs, ra, rb`.
+    #[must_use]
+    pub const fn stbx(rs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rs, ra, rb, 215) }
+    /// `stbux rs, ra, rb`.
+    #[must_use]
+    pub const fn stbux(rs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rs, ra, rb, 247) }
+    /// `sthx rs, ra, rb`.
+    #[must_use]
+    pub const fn sthx(rs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rs, ra, rb, 407) }
+    /// `sthux rs, ra, rb`.
+    #[must_use]
+    pub const fn sthux(rs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rs, ra, rb, 439) }
+    /// `stdux rs, ra, rb`.
+    #[must_use]
+    pub const fn stdux(rs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rs, ra, rb, 181) }
+    /// `lwbrx rt, ra, rb`.
+    #[must_use]
+    pub const fn lwbrx(rt: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rt, ra, rb, 534) }
+    /// `lhbrx rt, ra, rb`.
+    #[must_use]
+    pub const fn lhbrx(rt: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rt, ra, rb, 790) }
+    /// `stwbrx rs, ra, rb`.
+    #[must_use]
+    pub const fn stwbrx(rs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rs, ra, rb, 662) }
+    /// `sthbrx rs, ra, rb`.
+    #[must_use]
+    pub const fn sthbrx(rs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rs, ra, rb, 918) }
+    /// `lfsx frt, ra, rb`.
+    #[must_use]
+    pub const fn lfsx(frt: u32, ra: u32, rb: u32) -> u32 { xo31_dar(frt, ra, rb, 535) }
+    /// `lfsux frt, ra, rb`.
+    #[must_use]
+    pub const fn lfsux(frt: u32, ra: u32, rb: u32) -> u32 { xo31_dar(frt, ra, rb, 567) }
+    /// `lfdux frt, ra, rb`.
+    #[must_use]
+    pub const fn lfdux(frt: u32, ra: u32, rb: u32) -> u32 { xo31_dar(frt, ra, rb, 631) }
+    /// `stfsx frs, ra, rb`.
+    #[must_use]
+    pub const fn stfsx(frs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(frs, ra, rb, 663) }
+    /// `stfsux frs, ra, rb`.
+    #[must_use]
+    pub const fn stfsux(frs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(frs, ra, rb, 695) }
+    /// `stfdx frs, ra, rb`.
+    #[must_use]
+    pub const fn stfdx(frs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(frs, ra, rb, 727) }
+    /// `stfdux frs, ra, rb`.
+    #[must_use]
+    pub const fn stfdux(frs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(frs, ra, rb, 759) }
+    /// `stfiwx frs, ra, rb`.
+    #[must_use]
+    pub const fn stfiwx(frs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(frs, ra, rb, 983) }
 
     // -- rlwinm (primary 21) --------------------------------------
 
@@ -4799,5 +5102,101 @@ mod tests {
         ppu.fpscr = 0;
         step_ok(&mut ppu, &mut mem); // mtfsf all fields back
         assert_eq!(ppu.fpscr, 0x0420_0000);
+    }
+
+    // ---- R11.3: indexed load/store (X-form) -----------------------
+
+    #[test]
+    fn stwx_then_lwzx_round_trip() {
+        // r4 = base, r5 = offset. store r6 at base+off, load into r3.
+        let prog = [encode::stwx(6, 4, 5), encode::lwzx(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        alloc_data(&mut mem, DATA_BASE);
+        ppu.gpr[4] = DATA_BASE as u64;
+        ppu.gpr[5] = 8;
+        ppu.gpr[6] = 0xDEAD_BEEF;
+        step_ok(&mut ppu, &mut mem);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.gpr[3], 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn lwzux_updates_ra() {
+        let prog = [encode::stwx(6, 4, 5), encode::lwzux(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        alloc_data(&mut mem, DATA_BASE);
+        ppu.gpr[4] = DATA_BASE as u64;
+        ppu.gpr[5] = 12;
+        ppu.gpr[6] = 0x1234_5678;
+        step_ok(&mut ppu, &mut mem); // stwx at base+12
+        step_ok(&mut ppu, &mut mem); // lwzux: load + ra := base+12
+        assert_eq!(ppu.gpr[3], 0x1234_5678);
+        assert_eq!(ppu.gpr[4], DATA_BASE as u64 + 12);
+    }
+
+    #[test]
+    fn lhax_sign_extends() {
+        let prog = [encode::sthx(6, 4, 5), encode::lhax(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        alloc_data(&mut mem, DATA_BASE);
+        ppu.gpr[4] = DATA_BASE as u64;
+        ppu.gpr[5] = 0;
+        ppu.gpr[6] = 0xFFFF; // -1 as i16
+        step_ok(&mut ppu, &mut mem);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.gpr[3], u64::MAX); // sign-extended -1
+    }
+
+    #[test]
+    fn lwbrx_byte_reverses() {
+        let prog = [encode::stwx(6, 4, 5), encode::lwbrx(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        alloc_data(&mut mem, DATA_BASE);
+        ppu.gpr[4] = DATA_BASE as u64;
+        ppu.gpr[5] = 0;
+        ppu.gpr[6] = 0x1122_3344;
+        step_ok(&mut ppu, &mut mem);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.gpr[3], 0x4433_2211);
+    }
+
+    #[test]
+    fn lfsx_stfsx_single_round_trip() {
+        let prog = [encode::stfsx(6, 4, 5), encode::lfsx(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        alloc_data(&mut mem, DATA_BASE);
+        ppu.gpr[4] = DATA_BASE as u64;
+        ppu.gpr[5] = 0;
+        ppu.fpr[6] = 1.5;
+        step_ok(&mut ppu, &mut mem);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.fpr[3], 1.5);
+    }
+
+    #[test]
+    fn lfdx_stfdx_double_round_trip() {
+        let prog = [encode::stfdx(6, 4, 5), encode::lfdx(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        alloc_data(&mut mem, DATA_BASE);
+        ppu.gpr[4] = DATA_BASE as u64;
+        ppu.gpr[5] = 16;
+        ppu.fpr[6] = std::f64::consts::PI;
+        step_ok(&mut ppu, &mut mem);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.fpr[3], std::f64::consts::PI);
+    }
+
+    #[test]
+    fn stfiwx_stores_low_word() {
+        let prog = [encode::stfiwx(6, 4, 5), encode::lwzx(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        alloc_data(&mut mem, DATA_BASE);
+        ppu.gpr[4] = DATA_BASE as u64;
+        ppu.gpr[5] = 0;
+        // raw bits whose low word is 0xCAFEF00D
+        ppu.fpr[6] = f64::from_bits(0x0000_0000_CAFE_F00D);
+        step_ok(&mut ppu, &mut mem);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.gpr[3], 0xCAFE_F00D);
     }
 }
