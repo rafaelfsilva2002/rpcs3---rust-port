@@ -1471,6 +1471,68 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                     ppu.fpr[op.frd() as usize] = r;
                     fpscr_update_from_result(ppu, r);
                 }
+                22 => {
+                    // fsqrts frD, frB
+                    let b = ppu.fpr[op.frb() as usize];
+                    let r = b.sqrt() as f32 as f64;
+                    ppu.fpr[op.frd() as usize] = r;
+                    fpscr_update_from_result(ppu, r);
+                }
+                24 => {
+                    // fres frD, frB — single-precision reciprocal
+                    // estimate. We compute the exact reciprocal then
+                    // round to single; PPC only guarantees ~1/4096
+                    // relative accuracy but exact is within spec.
+                    let b = ppu.fpr[op.frb() as usize];
+                    let r = (1.0_f64 / b) as f32 as f64;
+                    ppu.fpr[op.frd() as usize] = r;
+                    fpscr_update_from_result(ppu, r);
+                }
+                26 => {
+                    // frsqrtes frD, frB — reciprocal square-root est.
+                    let b = ppu.fpr[op.frb() as usize];
+                    let r = (1.0_f64 / b.sqrt()) as f32 as f64;
+                    ppu.fpr[op.frd() as usize] = r;
+                    fpscr_update_from_result(ppu, r);
+                }
+                29 => {
+                    // fmadds frD, frA, frC, frB — (frA*frC)+frB.
+                    // mul_add is a fused multiply-add (single round)
+                    // matching PPC semantics; then round to single.
+                    let a = ppu.fpr[op.fra() as usize];
+                    let b = ppu.fpr[op.frb() as usize];
+                    let c = ppu.fpr[op.frc() as usize];
+                    let r = a.mul_add(c, b) as f32 as f64;
+                    ppu.fpr[op.frd() as usize] = r;
+                    fpscr_update_from_result(ppu, r);
+                }
+                28 => {
+                    // fmsubs frD, frA, frC, frB — (frA*frC)-frB
+                    let a = ppu.fpr[op.fra() as usize];
+                    let b = ppu.fpr[op.frb() as usize];
+                    let c = ppu.fpr[op.frc() as usize];
+                    let r = a.mul_add(c, -b) as f32 as f64;
+                    ppu.fpr[op.frd() as usize] = r;
+                    fpscr_update_from_result(ppu, r);
+                }
+                31 => {
+                    // fnmadds frD, frA, frC, frB — -((frA*frC)+frB)
+                    let a = ppu.fpr[op.fra() as usize];
+                    let b = ppu.fpr[op.frb() as usize];
+                    let c = ppu.fpr[op.frc() as usize];
+                    let r = (-a.mul_add(c, b)) as f32 as f64;
+                    ppu.fpr[op.frd() as usize] = r;
+                    fpscr_update_from_result(ppu, r);
+                }
+                30 => {
+                    // fnmsubs frD, frA, frC, frB — -((frA*frC)-frB)
+                    let a = ppu.fpr[op.fra() as usize];
+                    let b = ppu.fpr[op.frb() as usize];
+                    let c = ppu.fpr[op.frc() as usize];
+                    let r = (-a.mul_add(c, -b)) as f32 as f64;
+                    ppu.fpr[op.frd() as usize] = r;
+                    fpscr_update_from_result(ppu, r);
+                }
                 _ => {
                     return Err(Error::Unimplemented {
                         inst,
@@ -1519,6 +1581,72 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                     let b = ppu.fpr[op.frb() as usize];
                     ppu.fpr[op.frd() as usize] = a / b;
                     fpscr_update_from_result(ppu, ppu.fpr[op.frd() as usize]);
+                }
+                22 => {
+                    // fsqrt frD, frB
+                    let r = ppu.fpr[op.frb() as usize].sqrt();
+                    ppu.fpr[op.frd() as usize] = r;
+                    fpscr_update_from_result(ppu, r);
+                }
+                23 => {
+                    // fsel frD, frA, frC, frB — frD = frA>=0 ? frC : frB.
+                    // NaN compares false → selects frB (per PPC spec).
+                    let a = ppu.fpr[op.fra() as usize];
+                    let r = if a >= 0.0 {
+                        ppu.fpr[op.frc() as usize]
+                    } else {
+                        ppu.fpr[op.frb() as usize]
+                    };
+                    // fsel does NOT touch FPSCR (it's a select, not arith).
+                    ppu.fpr[op.frd() as usize] = r;
+                }
+                24 => {
+                    // fre frD, frB — double reciprocal estimate.
+                    let r = 1.0_f64 / ppu.fpr[op.frb() as usize];
+                    ppu.fpr[op.frd() as usize] = r;
+                    fpscr_update_from_result(ppu, r);
+                }
+                26 => {
+                    // frsqrte frD, frB — double recip-sqrt estimate.
+                    let r = 1.0_f64 / ppu.fpr[op.frb() as usize].sqrt();
+                    ppu.fpr[op.frd() as usize] = r;
+                    fpscr_update_from_result(ppu, r);
+                }
+                29 => {
+                    // fmadd frD, frA, frC, frB — (frA*frC)+frB
+                    let a = ppu.fpr[op.fra() as usize];
+                    let b = ppu.fpr[op.frb() as usize];
+                    let c = ppu.fpr[op.frc() as usize];
+                    let r = a.mul_add(c, b);
+                    ppu.fpr[op.frd() as usize] = r;
+                    fpscr_update_from_result(ppu, r);
+                }
+                28 => {
+                    // fmsub frD, frA, frC, frB — (frA*frC)-frB
+                    let a = ppu.fpr[op.fra() as usize];
+                    let b = ppu.fpr[op.frb() as usize];
+                    let c = ppu.fpr[op.frc() as usize];
+                    let r = a.mul_add(c, -b);
+                    ppu.fpr[op.frd() as usize] = r;
+                    fpscr_update_from_result(ppu, r);
+                }
+                31 => {
+                    // fnmadd frD, frA, frC, frB — -((frA*frC)+frB)
+                    let a = ppu.fpr[op.fra() as usize];
+                    let b = ppu.fpr[op.frb() as usize];
+                    let c = ppu.fpr[op.frc() as usize];
+                    let r = -a.mul_add(c, b);
+                    ppu.fpr[op.frd() as usize] = r;
+                    fpscr_update_from_result(ppu, r);
+                }
+                30 => {
+                    // fnmsub frD, frA, frC, frB — -((frA*frC)-frB)
+                    let a = ppu.fpr[op.fra() as usize];
+                    let b = ppu.fpr[op.frb() as usize];
+                    let c = ppu.fpr[op.frc() as usize];
+                    let r = -a.mul_add(c, -b);
+                    ppu.fpr[op.frd() as usize] = r;
+                    fpscr_update_from_result(ppu, r);
                 }
                 _ => match xo10 {
                     72 => {
@@ -2345,6 +2473,54 @@ pub mod encode {
         fp_x_form(frd, frb, 136, 0)
     }
 
+    /// `fsqrt frD, frB` — double square root.
+    #[must_use]
+    pub const fn fsqrt(frd: u32, frb: u32) -> u32 {
+        fp_a_form(frd, 0, frb, 0, 22, 0)
+    }
+
+    /// `fre frD, frB` — double reciprocal estimate.
+    #[must_use]
+    pub const fn fre(frd: u32, frb: u32) -> u32 {
+        fp_a_form(frd, 0, frb, 0, 24, 0)
+    }
+
+    /// `frsqrte frD, frB` — double reciprocal-sqrt estimate.
+    #[must_use]
+    pub const fn frsqrte(frd: u32, frb: u32) -> u32 {
+        fp_a_form(frd, 0, frb, 0, 26, 0)
+    }
+
+    /// `fsel frD, frA, frC, frB` — frD = frA>=0 ? frC : frB.
+    #[must_use]
+    pub const fn fsel(frd: u32, fra: u32, frc: u32, frb: u32) -> u32 {
+        fp_a_form(frd, fra, frb, frc, 23, 0)
+    }
+
+    /// `fmadd frD, frA, frC, frB` — (frA*frC)+frB.
+    #[must_use]
+    pub const fn fmadd(frd: u32, fra: u32, frc: u32, frb: u32) -> u32 {
+        fp_a_form(frd, fra, frb, frc, 29, 0)
+    }
+
+    /// `fmsub frD, frA, frC, frB` — (frA*frC)-frB.
+    #[must_use]
+    pub const fn fmsub(frd: u32, fra: u32, frc: u32, frb: u32) -> u32 {
+        fp_a_form(frd, fra, frb, frc, 28, 0)
+    }
+
+    /// `fnmadd frD, frA, frC, frB` — -((frA*frC)+frB).
+    #[must_use]
+    pub const fn fnmadd(frd: u32, fra: u32, frc: u32, frb: u32) -> u32 {
+        fp_a_form(frd, fra, frb, frc, 31, 0)
+    }
+
+    /// `fnmsub frD, frA, frC, frB` — -((frA*frC)-frB).
+    #[must_use]
+    pub const fn fnmsub(frd: u32, fra: u32, frc: u32, frb: u32) -> u32 {
+        fp_a_form(frd, fra, frb, frc, 30, 0)
+    }
+
     // ---- Single-precision arithmetic (primary 59) -------------------
 
     const fn fp_sp_a_form(frd: u32, fra: u32, frb: u32, frc: u32, xo: u32) -> u32 {
@@ -2378,6 +2554,36 @@ pub mod encode {
     #[must_use]
     pub const fn fdivs(frd: u32, fra: u32, frb: u32) -> u32 {
         fp_sp_a_form(frd, fra, frb, 0, 18)
+    }
+
+    /// `fsqrts frD, frB` — single-precision square root.
+    #[must_use]
+    pub const fn fsqrts(frd: u32, frb: u32) -> u32 {
+        fp_sp_a_form(frd, 0, frb, 0, 22)
+    }
+
+    /// `fmadds frD, frA, frC, frB` — single (frA*frC)+frB.
+    #[must_use]
+    pub const fn fmadds(frd: u32, fra: u32, frc: u32, frb: u32) -> u32 {
+        fp_sp_a_form(frd, fra, frb, frc, 29)
+    }
+
+    /// `fmsubs frD, frA, frC, frB` — single (frA*frC)-frB.
+    #[must_use]
+    pub const fn fmsubs(frd: u32, fra: u32, frc: u32, frb: u32) -> u32 {
+        fp_sp_a_form(frd, fra, frb, frc, 28)
+    }
+
+    /// `fnmadds frD, frA, frC, frB` — single -((frA*frC)+frB).
+    #[must_use]
+    pub const fn fnmadds(frd: u32, fra: u32, frc: u32, frb: u32) -> u32 {
+        fp_sp_a_form(frd, fra, frb, frc, 31)
+    }
+
+    /// `fnmsubs frD, frA, frC, frB` — single -((frA*frC)-frB).
+    #[must_use]
+    pub const fn fnmsubs(frd: u32, fra: u32, frc: u32, frb: u32) -> u32 {
+        fp_sp_a_form(frd, fra, frb, frc, 30)
     }
 
     // ---- Altivec/VMX (primary 4) ---------------------------------
@@ -4215,5 +4421,120 @@ mod tests {
             ppu.vr[3],
             0xAAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA,
         );
+    }
+
+    // ---- R11.1: FP arithmetic (fmadd family, fsel, fsqrt, fre) ----
+
+    #[test]
+    fn fmadd_double_fused() {
+        let prog = [encode::fmadd(3, 4, 5, 6)]; // frD=(frA*frC)+frB
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.fpr[4] = 2.0;
+        ppu.fpr[5] = 3.0;
+        ppu.fpr[6] = 1.0;
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.fpr[3], 7.0); // 2*3+1
+    }
+
+    #[test]
+    fn fmsub_double() {
+        let prog = [encode::fmsub(3, 4, 5, 6)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.fpr[4] = 2.0;
+        ppu.fpr[5] = 3.0;
+        ppu.fpr[6] = 1.0;
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.fpr[3], 5.0); // 2*3-1
+    }
+
+    #[test]
+    fn fnmadd_double() {
+        let prog = [encode::fnmadd(3, 4, 5, 6)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.fpr[4] = 2.0;
+        ppu.fpr[5] = 3.0;
+        ppu.fpr[6] = 1.0;
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.fpr[3], -7.0); // -(2*3+1)
+    }
+
+    #[test]
+    fn fnmsub_double() {
+        let prog = [encode::fnmsub(3, 4, 5, 6)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.fpr[4] = 2.0;
+        ppu.fpr[5] = 3.0;
+        ppu.fpr[6] = 1.0;
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.fpr[3], -5.0); // -(2*3-1)
+    }
+
+    #[test]
+    fn fmadds_single_rounds_to_f32() {
+        let prog = [encode::fmadds(3, 4, 5, 6)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.fpr[4] = 2.0;
+        ppu.fpr[5] = 3.0;
+        ppu.fpr[6] = 1.0;
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.fpr[3], 7.0);
+    }
+
+    #[test]
+    fn fsel_selects_frc_when_fra_nonneg() {
+        let prog = [encode::fsel(3, 4, 5, 6)]; // frA>=0 ? frC : frB
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.fpr[4] = 0.0; // >= 0 → pick frC
+        ppu.fpr[5] = 111.0;
+        ppu.fpr[6] = 222.0;
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.fpr[3], 111.0);
+    }
+
+    #[test]
+    fn fsel_selects_frb_when_fra_negative() {
+        let prog = [encode::fsel(3, 4, 5, 6)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.fpr[4] = -1.0; // < 0 → pick frB
+        ppu.fpr[5] = 111.0;
+        ppu.fpr[6] = 222.0;
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.fpr[3], 222.0);
+    }
+
+    #[test]
+    fn fsqrt_double() {
+        let prog = [encode::fsqrt(3, 4)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.fpr[4] = 16.0;
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.fpr[3], 4.0);
+    }
+
+    #[test]
+    fn fsqrts_single() {
+        let prog = [encode::fsqrts(3, 4)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.fpr[4] = 9.0;
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.fpr[3], 3.0);
+    }
+
+    #[test]
+    fn fre_double_reciprocal() {
+        let prog = [encode::fre(3, 4)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.fpr[4] = 4.0;
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.fpr[3], 0.25);
+    }
+
+    #[test]
+    fn frsqrte_double_recip_sqrt() {
+        let prog = [encode::frsqrte(3, 4)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.fpr[4] = 16.0;
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.fpr[3], 0.25); // 1/sqrt(16)
     }
 }
