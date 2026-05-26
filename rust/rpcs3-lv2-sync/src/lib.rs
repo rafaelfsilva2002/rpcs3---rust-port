@@ -31,6 +31,10 @@
 
 use rpcs3_emu_types::CellError;
 
+pub mod state;
+
+pub use state::{LwMutex, LwMutexAttr, Lv2SyncId, Lv2SyncKind, Lv2SyncState};
+
 // =====================================================================
 // Attribute constants
 // =====================================================================
