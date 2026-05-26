@@ -39,6 +39,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use rpcs3_emu_types::CellError;
+use rpcs3_lv2_cond::{CondAttr, CondRegistry, WaitOutcome};
 use rpcs3_lv2_lwmutex::LwMutexTable;
 
 use crate::{BlockOutcome, MutexAttr, SemaAttr, SyncTable};
@@ -187,6 +188,26 @@ pub struct Sema {
 }
 
 // ====================================================================
+// Kernel sys_cond entry (R10.3)
+// ====================================================================
+
+/// Kernel-side state for one `sys_cond_t` (condition variable) handle.
+///
+/// Conds are always tied to a mutex (`mutex_id_untagged` is the raw
+/// Lv2SyncState counter of the bound [`Mutex`]). `waiters` are threads
+/// currently parked in `cond_wait`; `awakened` is threads a signal has
+/// moved off the wait queue but which haven't yet successfully
+/// reacquired the mutex.
+#[derive(Debug, Clone, Default)]
+pub struct Cond {
+    pub attr: CondAttr,
+    /// Untagged registry id of the bound mutex.
+    pub mutex_id_untagged: u32,
+    pub waiters: VecDeque<u32>,
+    pub awakened: VecDeque<u32>,
+}
+
+// ====================================================================
 // Registry entry — one per allocated handle
 // ====================================================================
 
@@ -200,8 +221,8 @@ enum Entry {
     LwMutex(LwMutex),
     Mutex(Mutex),
     Sema(Sema),
+    Cond(Cond),
     // Variants below are placeholders the future slices flesh out.
-    Cond,
     LwCond,
     EventFlag,
     EventQueue,
@@ -215,7 +236,7 @@ impl Entry {
             Entry::LwMutex(_) => Lv2SyncKind::LwMutex,
             Entry::Mutex(_) => Lv2SyncKind::Mutex,
             Entry::Sema(_) => Lv2SyncKind::Sema,
-            Entry::Cond => Lv2SyncKind::Cond,
+            Entry::Cond(_) => Lv2SyncKind::Cond,
             Entry::LwCond => Lv2SyncKind::LwCond,
             Entry::EventFlag => Lv2SyncKind::EventFlag,
             Entry::EventQueue => Lv2SyncKind::EventQueue,
@@ -229,7 +250,7 @@ impl Entry {
             Lv2SyncKind::LwMutex => Entry::LwMutex(LwMutex::default()),
             Lv2SyncKind::Mutex => Entry::Mutex(Mutex::default()),
             Lv2SyncKind::Sema => Entry::Sema(Sema::default()),
-            Lv2SyncKind::Cond => Entry::Cond,
+            Lv2SyncKind::Cond => Entry::Cond(Cond::default()),
             Lv2SyncKind::LwCond => Entry::LwCond,
             Lv2SyncKind::EventFlag => Entry::EventFlag,
             Lv2SyncKind::EventQueue => Entry::EventQueue,
@@ -385,6 +406,24 @@ impl Lv2SyncState {
             Some(_) => Err(CellError::EINVAL),
         }
     }
+
+    // -- Cond accessors (R10.3) ------------------------------------
+
+    pub fn cond(&self, raw: u32) -> Result<&Cond, CellError> {
+        match self.entries.get(&raw) {
+            None => Err(CellError::ESRCH),
+            Some(Entry::Cond(c)) => Ok(c),
+            Some(_) => Err(CellError::EINVAL),
+        }
+    }
+
+    pub fn cond_mut(&mut self, raw: u32) -> Result<&mut Cond, CellError> {
+        match self.entries.get_mut(&raw) {
+            None => Err(CellError::ESRCH),
+            Some(Entry::Cond(c)) => Ok(c),
+            Some(_) => Err(CellError::EINVAL),
+        }
+    }
 }
 
 // ====================================================================
@@ -462,6 +501,9 @@ pub const MUTEX_ID_BASE: u32 = 0x8500_0000;
 /// High-byte tag for kernel sys_semaphore IDs (RPCS3 C++
 /// `lv2_sema::id_base = 0x96000000`).
 pub const SEMA_ID_BASE: u32 = 0x9600_0000;
+/// High-byte tag for kernel sys_cond IDs (RPCS3 C++
+/// `lv2_cond::id_base = 0x86000000`).
+pub const COND_ID_BASE: u32 = 0x8600_0000;
 
 const TAG_MASK: u32 = 0x00FF_FFFF;
 
@@ -623,6 +665,130 @@ impl SyncTable for Lv2SyncState {
 
     fn sema_get_value(&self, id: u32) -> Result<i32, CellError> {
         Ok(self.sema(untag(id))?.value)
+    }
+}
+
+// ====================================================================
+// CondRegistry bridge (R10.3)
+// ====================================================================
+
+impl CondRegistry for Lv2SyncState {
+    fn cond_create(&mut self, attr: CondAttr, mutex_id: u32) -> Result<u32, CellError> {
+        // The mutex_id passed in is a tagged guest-visible id. Untag
+        // it before storing so we can dispatch lookups via mutex_mut.
+        let mutex_untagged = untag(mutex_id);
+        // Validate the mutex actually exists + is the right kind.
+        let _ = self.mutex(mutex_untagged)?;
+        let id = self.allocate(Lv2SyncKind::Cond);
+        let c = self.cond_mut(id.raw())?;
+        c.attr = attr;
+        c.mutex_id_untagged = mutex_untagged;
+        Ok(tag(COND_ID_BASE, id.raw()))
+    }
+
+    fn cond_destroy(&mut self, id: u32) -> Result<(), CellError> {
+        let raw = untag(id);
+        {
+            let c = self.cond(raw)?;
+            if !c.waiters.is_empty() || !c.awakened.is_empty() {
+                return Err(CellError::EBUSY);
+            }
+        }
+        self.destroy(raw, Lv2SyncKind::Cond)
+    }
+
+    fn cond_wait(
+        &mut self,
+        id: u32,
+        tid: u32,
+        _timeout_us: u64,
+    ) -> Result<WaitOutcome, CellError> {
+        let raw = untag(id);
+        // Resolve the cv's bound mutex_id first (so we can drop the
+        // cond borrow before we mutate the mutex).
+        let mutex_untagged = self.cond(raw)?.mutex_id_untagged;
+        // Caller must own the mutex.
+        {
+            let m = self.mutex(mutex_untagged)?;
+            if m.owner != Some(tid) {
+                return Err(CellError::EPERM);
+            }
+        }
+        // Atomic release+enqueue.
+        // Release the mutex; if there are mutex waiters, hand off
+        // ownership to the next one (FIFO) — matches mutex_unlock
+        // semantics in this crate.
+        {
+            let m = self.mutex_mut(mutex_untagged)?;
+            if let Some(next) = m.waiters.pop_front() {
+                m.owner = Some(next);
+                m.recursion_count = 1;
+            } else {
+                m.owner = None;
+                m.recursion_count = 0;
+            }
+        }
+        // Enqueue the calling tid on the cv.
+        self.cond_mut(raw)?.waiters.push_back(tid);
+        Ok(WaitOutcome::MustBlock)
+    }
+
+    fn cond_resume_waiter(&mut self, id: u32, tid: u32) -> Result<WaitOutcome, CellError> {
+        let raw = untag(id);
+        let mutex_untagged = self.cond(raw)?.mutex_id_untagged;
+        // The waiter must have been moved to `awakened` by a previous
+        // signal/signal_all/signal_to call.
+        {
+            let c = self.cond_mut(raw)?;
+            let idx = c
+                .awakened
+                .iter()
+                .position(|&t| t == tid)
+                .ok_or(CellError::EPERM)?;
+            c.awakened.remove(idx);
+        }
+        // Try to take the mutex; if held, park on its waiter queue.
+        let m = self.mutex_mut(mutex_untagged)?;
+        if m.owner.is_none() {
+            m.owner = Some(tid);
+            m.recursion_count = 1;
+            Ok(WaitOutcome::Woken)
+        } else {
+            // Stay parked — push to mutex waiter queue if not already there.
+            if !m.waiters.iter().any(|&t| t == tid) {
+                m.waiters.push_back(tid);
+            }
+            Ok(WaitOutcome::MustBlock)
+        }
+    }
+
+    fn cond_signal(&mut self, id: u32) -> Result<Option<u32>, CellError> {
+        let c = self.cond_mut(untag(id))?;
+        if let Some(t) = c.waiters.pop_front() {
+            c.awakened.push_back(t);
+            Ok(Some(t))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn cond_signal_all(&mut self, id: u32) -> Result<Vec<u32>, CellError> {
+        let c = self.cond_mut(untag(id))?;
+        let drained: Vec<u32> = c.waiters.drain(..).collect();
+        c.awakened.extend(drained.iter().copied());
+        Ok(drained)
+    }
+
+    fn cond_signal_to(&mut self, id: u32, tid: u32) -> Result<(), CellError> {
+        let c = self.cond_mut(untag(id))?;
+        let idx = c
+            .waiters
+            .iter()
+            .position(|&t| t == tid)
+            .ok_or(CellError::EPERM)?;
+        c.waiters.remove(idx);
+        c.awakened.push_back(tid);
+        Ok(())
     }
 }
 
@@ -991,6 +1157,143 @@ mod tests {
         // And lookups via the wrong kind fail with EINVAL.
         assert_eq!(s.sema(untag(m)), Err(CellError::EINVAL));
         assert_eq!(s.mutex(untag(q)), Err(CellError::EINVAL));
+    }
+
+    // -- CondRegistry impl (R10.3) --------------------------------
+
+    fn setup_cond() -> (Lv2SyncState, u32, u32) {
+        // Returns (state, mutex_id, cond_id) for tests that need a
+        // bound (mutex, cv) pair.
+        let mut s = Lv2SyncState::new();
+        let m = SyncTable::mutex_create(&mut s, MutexAttr::default()).unwrap();
+        let c = CondRegistry::cond_create(&mut s, CondAttr::default(), m).unwrap();
+        (s, m, c)
+    }
+
+    #[test]
+    fn condreg_create_returns_tagged_id() {
+        let (_s, _m, c) = setup_cond();
+        assert_eq!(c & 0xFF00_0000, COND_ID_BASE);
+    }
+
+    #[test]
+    fn condreg_create_rejects_unknown_mutex() {
+        let mut s = Lv2SyncState::new();
+        let bogus_mutex = MUTEX_ID_BASE | 0xFE;
+        assert_eq!(
+            CondRegistry::cond_create(&mut s, CondAttr::default(), bogus_mutex),
+            Err(CellError::ESRCH)
+        );
+    }
+
+    #[test]
+    fn condreg_wait_requires_caller_to_own_mutex() {
+        let (mut s, m, c) = setup_cond();
+        // Nobody has acquired the mutex yet → cond_wait → EPERM.
+        assert_eq!(
+            s.cond_wait(c, 100, 0),
+            Err(CellError::EPERM)
+        );
+        // Acquire the mutex; now cond_wait must succeed and park.
+        let _ = m;
+        s.mutex_lock(m, 100).unwrap();
+        assert_eq!(s.cond_wait(c, 100, 0), Ok(WaitOutcome::MustBlock));
+        // Mutex was released by cond_wait.
+        assert_eq!(s.mutex(untag(m)).unwrap().owner, None);
+    }
+
+    #[test]
+    fn condreg_signal_moves_waiter_to_awakened() {
+        let (mut s, m, c) = setup_cond();
+        s.mutex_lock(m, 100).unwrap();
+        s.cond_wait(c, 100, 0).unwrap();
+        assert_eq!(s.cond_signal(c), Ok(Some(100)));
+        // Now in `awakened`, not `waiters`.
+        let cond = s.cond(untag(c)).unwrap();
+        assert!(cond.waiters.is_empty());
+        assert_eq!(cond.awakened, vec![100u32]);
+    }
+
+    #[test]
+    fn condreg_signal_empty_queue_returns_none() {
+        let (mut s, _m, c) = setup_cond();
+        assert_eq!(s.cond_signal(c), Ok(None));
+    }
+
+    #[test]
+    fn condreg_signal_all_drains_to_awakened() {
+        let (mut s, m, c) = setup_cond();
+        // tid 100 waits.
+        s.mutex_lock(m, 100).unwrap();
+        s.cond_wait(c, 100, 0).unwrap();
+        // tid 200 also waits (after 100 released the mutex through wait).
+        s.mutex_lock(m, 200).unwrap();
+        s.cond_wait(c, 200, 0).unwrap();
+        let woken = s.cond_signal_all(c).unwrap();
+        assert_eq!(woken, vec![100, 200]);
+        let cond = s.cond(untag(c)).unwrap();
+        assert!(cond.waiters.is_empty());
+        assert_eq!(cond.awakened.len(), 2);
+    }
+
+    #[test]
+    fn condreg_signal_to_specific_thread() {
+        let (mut s, m, c) = setup_cond();
+        s.mutex_lock(m, 100).unwrap();
+        s.cond_wait(c, 100, 0).unwrap();
+        s.mutex_lock(m, 200).unwrap();
+        s.cond_wait(c, 200, 0).unwrap();
+        assert_eq!(s.cond_signal_to(c, 200), Ok(()));
+        let cond = s.cond(untag(c)).unwrap();
+        // 100 stays in waiters; 200 moves to awakened.
+        assert_eq!(cond.waiters, vec![100u32]);
+        assert_eq!(cond.awakened, vec![200u32]);
+    }
+
+    #[test]
+    fn condreg_signal_to_unparked_thread_is_eperm() {
+        let (mut s, _m, c) = setup_cond();
+        assert_eq!(s.cond_signal_to(c, 999), Err(CellError::EPERM));
+    }
+
+    #[test]
+    fn condreg_resume_waiter_acquires_free_mutex() {
+        let (mut s, m, c) = setup_cond();
+        s.mutex_lock(m, 100).unwrap();
+        s.cond_wait(c, 100, 0).unwrap();
+        // After cond_wait, mutex is free.
+        s.cond_signal(c).unwrap();
+        // Resume: mutex is free → acquire + return Woken.
+        assert_eq!(s.cond_resume_waiter(c, 100), Ok(WaitOutcome::Woken));
+        assert_eq!(s.mutex(untag(m)).unwrap().owner, Some(100));
+    }
+
+    #[test]
+    fn condreg_resume_waiter_parks_on_held_mutex() {
+        let (mut s, m, c) = setup_cond();
+        s.mutex_lock(m, 100).unwrap();
+        s.cond_wait(c, 100, 0).unwrap();
+        // Some other thread grabs the mutex before 100 resumes.
+        s.mutex_lock(m, 200).unwrap();
+        s.cond_signal(c).unwrap();
+        // 100 wakes but mutex is held → must park.
+        assert_eq!(s.cond_resume_waiter(c, 100), Ok(WaitOutcome::MustBlock));
+        // And 100 should be in the mutex waiters now.
+        assert_eq!(s.mutex(untag(m)).unwrap().waiters, vec![100u32]);
+    }
+
+    #[test]
+    fn condreg_destroy_with_waiters_is_ebusy() {
+        let (mut s, m, c) = setup_cond();
+        s.mutex_lock(m, 100).unwrap();
+        s.cond_wait(c, 100, 0).unwrap();
+        assert_eq!(s.cond_destroy(c), Err(CellError::EBUSY));
+    }
+
+    #[test]
+    fn condreg_destroy_when_empty() {
+        let (mut s, _m, c) = setup_cond();
+        assert_eq!(s.cond_destroy(c), Ok(()));
     }
 
     // -- Reserved kinds compile and round-trip without crash ------

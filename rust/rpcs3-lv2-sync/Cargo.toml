@@ -14,6 +14,7 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 rpcs3-emu-types = { path = "../rpcs3-emu-types" }
 rpcs3-lv2-lwmutex = { path = "../rpcs3-lv2-lwmutex" }
+rpcs3-lv2-cond = { path = "../rpcs3-lv2-cond" }
 
 [lints]
 workspace = true
