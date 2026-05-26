@@ -39,6 +39,7 @@ use rpcs3_ppu_thread::{PpuThread, PPU_ID_BASE};
 use rpcs3_lv2_tty::SysTty;
 use rpcs3_lv2_sync::{BlockOutcome, Lv2SyncState, MutexAttr, SemaAttr, SyncTable};
 use rpcs3_lv2_event::{EventRegistry, QueueAttr, ReceiveOutcome};
+use rpcs3_lv2_cond::{CondAttr, CondRegistry, WaitOutcome as CondWaitOutcome};
 use rpcs3_lv2_lwmutex::{
     sys_lwmutex_create as lv2_lwmutex_create,
     sys_lwmutex_lock as lv2_lwmutex_lock,
@@ -1522,6 +1523,70 @@ impl EmuCore {
             43 => {
                 // sys_ppu_thread_yield — no-op in single-thread mode.
             }
+            // R10.1.g — sys_cond family (#105-#109). PSL1GHT exposes
+            // these via <sys/cond.h>. Routes into the R10.3
+            // CondRegistry impl on Lv2SyncState. cond_wait (#107) is
+            // wired but unexercisable single-PPU (MustBlock →
+            // ETIMEDOUT).
+            105 => {
+                // sys_cond_create(*cond_out, mutex_id, *attr)
+                let cond_out = r3 as u32;
+                let mutex_id = r4 as u32;
+                let attr_ptr = self.ppu.gpr[5] as u32;
+                let attr = match Self::read_sys_cond_attr(&self.mem, attr_ptr) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        self.ppu.gpr[3] = e.0 as u64;
+                        return Ok(None);
+                    }
+                };
+                match self.lv2_sync_state.cond_create(attr, mutex_id) {
+                    Ok(id) => {
+                        self.mem.write(cond_out, &id.to_be_bytes())?;
+                        self.ppu.gpr[3] = 0;
+                    }
+                    Err(e) => self.ppu.gpr[3] = e.0 as u64,
+                }
+            }
+            106 => {
+                // sys_cond_destroy(cond_id)
+                let id = r3 as u32;
+                self.ppu.gpr[3] = match self.lv2_sync_state.cond_destroy(id) {
+                    Ok(()) => 0,
+                    Err(e) => e.0 as u64,
+                };
+            }
+            107 => {
+                // sys_cond_wait(cond_id, timeout). Single-PPU can't
+                // park; nobody can signal → ETIMEDOUT honestly.
+                let id = r3 as u32;
+                let _timeout = r4;
+                self.ppu.gpr[3] =
+                    match self.lv2_sync_state.cond_wait(id, PPU_THREAD_TID, 0) {
+                        Ok(CondWaitOutcome::Woken) => 0,
+                        Ok(CondWaitOutcome::MustBlock)
+                        | Ok(CondWaitOutcome::Timeout) => {
+                            CellError::ETIMEDOUT.0 as u64
+                        }
+                        Err(e) => e.0 as u64,
+                    };
+            }
+            108 => {
+                // sys_cond_signal(cond_id). None on empty queue → OK.
+                let id = r3 as u32;
+                self.ppu.gpr[3] = match self.lv2_sync_state.cond_signal(id) {
+                    Ok(_) => 0,
+                    Err(e) => e.0 as u64,
+                };
+            }
+            109 => {
+                // sys_cond_signal_all / broadcast(cond_id).
+                let id = r3 as u32;
+                self.ppu.gpr[3] = match self.lv2_sync_state.cond_signal_all(id) {
+                    Ok(_) => 0,
+                    Err(e) => e.0 as u64,
+                };
+            }
             // R10.1.f — sys_event_queue + sys_event_port family
             // (#128-#130, #134-#138). PSL1GHT exposes these via
             // <sys/event_queue.h>. Routes into the R10.6
@@ -2372,6 +2437,35 @@ impl EmuCore {
             _ => return Err(CellError::EINVAL),
         }
         Ok(QueueAttr { protocol, queue_type })
+    }
+
+    /// R10.1.g — Decode the 24-byte BE `sys_cond_attr_t` at
+    /// `attr_ptr` into a host-side [`CondAttr`]. Only `pshared` is
+    /// validated (must be 0x100 or 0x200); the cond's protocol comes
+    /// from its bound mutex, not the cond attr.
+    ///
+    /// Layout (PSL1GHT `<sys/cond.h>`):
+    /// ```text
+    /// 0x00  attr_pshared  u32 BE  (0x200=NOT_PROCESS_SHARED default)
+    /// 0x04  flags         s32 BE
+    /// 0x08  key           u64 BE
+    /// 0x10  name[8]       char
+    /// ```
+    fn read_sys_cond_attr(
+        mem: &SparseBackend,
+        attr_ptr: u32,
+    ) -> Result<CondAttr, CellError> {
+        if attr_ptr == 0 {
+            return Ok(CondAttr::default());
+        }
+        let mut buf = [0u8; 24];
+        mem.read(attr_ptr, &mut buf).map_err(|_| CellError::EFAULT)?;
+        let pshared = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        match pshared {
+            0x100 | 0x200 => {}
+            _ => return Err(CellError::EINVAL),
+        }
+        Ok(CondAttr { pshared, ..CondAttr::default() })
     }
 
     /// Read 32 bytes from guest memory at `ctrl_ptr` and decode into a

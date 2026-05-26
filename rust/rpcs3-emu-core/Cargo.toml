@@ -28,6 +28,7 @@ rpcs3-lv2-tty          = { path = "../rpcs3-lv2-tty" }
 rpcs3-lv2-sync         = { path = "../rpcs3-lv2-sync" }
 rpcs3-lv2-lwmutex      = { path = "../rpcs3-lv2-lwmutex" }
 rpcs3-lv2-event        = { path = "../rpcs3-lv2-event" }
+rpcs3-lv2-cond         = { path = "../rpcs3-lv2-cond" }
 
 [lints]
 workspace = true
