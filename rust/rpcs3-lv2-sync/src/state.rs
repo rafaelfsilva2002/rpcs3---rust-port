@@ -41,6 +41,8 @@ use std::collections::{BTreeMap, VecDeque};
 use rpcs3_emu_types::CellError;
 use rpcs3_lv2_lwmutex::LwMutexTable;
 
+use crate::{BlockOutcome, MutexAttr, SemaAttr, SyncTable};
+
 /// High-byte tag for kernel lwmutex IDs. Matches RPCS3 C++'s
 /// `lv2_lwmutex::id_base = 0x95000000`. Used by the [`LwMutexTable`]
 /// impl on [`Lv2SyncState`] to tag the registry's internal counter
@@ -151,6 +153,40 @@ pub struct LwMutex {
 }
 
 // ====================================================================
+// Kernel sys_mutex entry (R10.2)
+// ====================================================================
+
+/// Kernel-side state for one `sys_mutex_t` handle.
+///
+/// Unlike [`LwMutex`], the entire state lives in the kernel — there is
+/// no userspace control word. Ownership, recursion depth, and waiter
+/// queue all live here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Mutex {
+    pub attr: MutexAttr,
+    pub owner: Option<u32>,
+    pub recursion_count: u32,
+    pub waiters: VecDeque<u32>,
+}
+
+// ====================================================================
+// Kernel sys_semaphore entry (R10.4)
+// ====================================================================
+
+/// Kernel-side state for one `sys_semaphore_t` handle.
+///
+/// Counting semaphore. `value` decrements on wait, increments on post.
+/// `max` is the cap enforced by `sys_semaphore_post` (overflow returns
+/// `EAGAIN`). Waiters parked when `value == 0` go in FIFO order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sema {
+    pub attr: SemaAttr,
+    pub value: i32,
+    pub max: i32,
+    pub waiters: VecDeque<u32>,
+}
+
+// ====================================================================
 // Registry entry — one per allocated handle
 // ====================================================================
 
@@ -162,12 +198,9 @@ pub struct LwMutex {
 #[derive(Debug)]
 enum Entry {
     LwMutex(LwMutex),
+    Mutex(Mutex),
+    Sema(Sema),
     // Variants below are placeholders the future slices flesh out.
-    // They are populated by the registry once the corresponding R10.x
-    // slice lands; until then they're unreachable in production code
-    // because no `allocate(Lv2SyncKind::X)` callers exist yet.
-    Mutex,
-    Sema,
     Cond,
     LwCond,
     EventFlag,
@@ -180,8 +213,8 @@ impl Entry {
     fn kind(&self) -> Lv2SyncKind {
         match self {
             Entry::LwMutex(_) => Lv2SyncKind::LwMutex,
-            Entry::Mutex => Lv2SyncKind::Mutex,
-            Entry::Sema => Lv2SyncKind::Sema,
+            Entry::Mutex(_) => Lv2SyncKind::Mutex,
+            Entry::Sema(_) => Lv2SyncKind::Sema,
             Entry::Cond => Lv2SyncKind::Cond,
             Entry::LwCond => Lv2SyncKind::LwCond,
             Entry::EventFlag => Lv2SyncKind::EventFlag,
@@ -194,8 +227,8 @@ impl Entry {
     fn new(kind: Lv2SyncKind) -> Self {
         match kind {
             Lv2SyncKind::LwMutex => Entry::LwMutex(LwMutex::default()),
-            Lv2SyncKind::Mutex => Entry::Mutex,
-            Lv2SyncKind::Sema => Entry::Sema,
+            Lv2SyncKind::Mutex => Entry::Mutex(Mutex::default()),
+            Lv2SyncKind::Sema => Entry::Sema(Sema::default()),
             Lv2SyncKind::Cond => Entry::Cond,
             Lv2SyncKind::LwCond => Entry::LwCond,
             Lv2SyncKind::EventFlag => Entry::EventFlag,
@@ -316,6 +349,42 @@ impl Lv2SyncState {
             Some(_) => Err(CellError::EINVAL),
         }
     }
+
+    // -- Mutex accessors (R10.2) -----------------------------------
+
+    pub fn mutex(&self, raw: u32) -> Result<&Mutex, CellError> {
+        match self.entries.get(&raw) {
+            None => Err(CellError::ESRCH),
+            Some(Entry::Mutex(m)) => Ok(m),
+            Some(_) => Err(CellError::EINVAL),
+        }
+    }
+
+    pub fn mutex_mut(&mut self, raw: u32) -> Result<&mut Mutex, CellError> {
+        match self.entries.get_mut(&raw) {
+            None => Err(CellError::ESRCH),
+            Some(Entry::Mutex(m)) => Ok(m),
+            Some(_) => Err(CellError::EINVAL),
+        }
+    }
+
+    // -- Sema accessors (R10.4) ------------------------------------
+
+    pub fn sema(&self, raw: u32) -> Result<&Sema, CellError> {
+        match self.entries.get(&raw) {
+            None => Err(CellError::ESRCH),
+            Some(Entry::Sema(s)) => Ok(s),
+            Some(_) => Err(CellError::EINVAL),
+        }
+    }
+
+    pub fn sema_mut(&mut self, raw: u32) -> Result<&mut Sema, CellError> {
+        match self.entries.get_mut(&raw) {
+            None => Err(CellError::ESRCH),
+            Some(Entry::Sema(s)) => Ok(s),
+            Some(_) => Err(CellError::EINVAL),
+        }
+    }
 }
 
 // ====================================================================
@@ -380,6 +449,180 @@ impl LwMutexTable for Lv2SyncState {
         let n = self.lw_mutex(raw)?.waiters.len();
         // u32 cast is safe: lwmutex queues are PPU-thread-bounded.
         Ok(n as u32)
+    }
+}
+
+// ====================================================================
+// SyncTable bridge (R10.2 + R10.4)
+// ====================================================================
+
+/// High-byte tag for kernel sys_mutex IDs (RPCS3 C++
+/// `lv2_mutex::id_base = 0x85000000`).
+pub const MUTEX_ID_BASE: u32 = 0x8500_0000;
+/// High-byte tag for kernel sys_semaphore IDs (RPCS3 C++
+/// `lv2_sema::id_base = 0x96000000`).
+pub const SEMA_ID_BASE: u32 = 0x9600_0000;
+
+const TAG_MASK: u32 = 0x00FF_FFFF;
+
+#[inline]
+fn tag(base: u32, raw: u32) -> u32 {
+    base | (raw & TAG_MASK)
+}
+#[inline]
+fn untag(id: u32) -> u32 {
+    id & TAG_MASK
+}
+
+impl SyncTable for Lv2SyncState {
+    // -- Mutex ---------------------------------------------------
+
+    fn mutex_create(&mut self, attr: MutexAttr) -> Result<u32, CellError> {
+        let id = self.allocate(Lv2SyncKind::Mutex);
+        self.mutex_mut(id.raw())?.attr = attr;
+        Ok(tag(MUTEX_ID_BASE, id.raw()))
+    }
+
+    fn mutex_destroy(&mut self, id: u32) -> Result<(), CellError> {
+        let raw = untag(id);
+        {
+            let m = self.mutex(raw)?;
+            if !m.waiters.is_empty() || m.owner.is_some() {
+                return Err(CellError::EBUSY);
+            }
+        }
+        self.destroy(raw, Lv2SyncKind::Mutex)
+    }
+
+    fn mutex_lock(&mut self, id: u32, tid: u32) -> Result<BlockOutcome, CellError> {
+        let m = self.mutex_mut(untag(id))?;
+        match m.owner {
+            None => {
+                m.owner = Some(tid);
+                m.recursion_count = 1;
+                Ok(BlockOutcome::Acquired)
+            }
+            Some(owner) if owner == tid => {
+                if m.attr.recursive {
+                    m.recursion_count = m
+                        .recursion_count
+                        .checked_add(1)
+                        .ok_or(CellError::EKRESOURCE)?;
+                    Ok(BlockOutcome::Acquired)
+                } else {
+                    Err(CellError::EDEADLK)
+                }
+            }
+            Some(_) => {
+                m.waiters.push_back(tid);
+                Ok(BlockOutcome::MustBlock)
+            }
+        }
+    }
+
+    fn mutex_trylock(&mut self, id: u32, tid: u32) -> Result<(), CellError> {
+        let m = self.mutex_mut(untag(id))?;
+        match m.owner {
+            None => {
+                m.owner = Some(tid);
+                m.recursion_count = 1;
+                Ok(())
+            }
+            Some(owner) if owner == tid && m.attr.recursive => {
+                m.recursion_count = m
+                    .recursion_count
+                    .checked_add(1)
+                    .ok_or(CellError::EKRESOURCE)?;
+                Ok(())
+            }
+            _ => Err(CellError::EBUSY),
+        }
+    }
+
+    fn mutex_unlock(&mut self, id: u32, tid: u32) -> Result<(), CellError> {
+        let m = self.mutex_mut(untag(id))?;
+        match m.owner {
+            Some(owner) if owner == tid => {
+                if m.recursion_count == 0 {
+                    return Err(CellError::EPERM);
+                }
+                m.recursion_count -= 1;
+                if m.recursion_count == 0 {
+                    if let Some(next) = m.waiters.pop_front() {
+                        m.owner = Some(next);
+                        m.recursion_count = 1;
+                    } else {
+                        m.owner = None;
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(CellError::EPERM),
+        }
+    }
+
+    // -- Semaphore -----------------------------------------------
+
+    fn sema_create(
+        &mut self,
+        attr: SemaAttr,
+        initial: i32,
+        max: i32,
+    ) -> Result<u32, CellError> {
+        let id = self.allocate(Lv2SyncKind::Sema);
+        {
+            let s = self.sema_mut(id.raw())?;
+            s.attr = attr;
+            s.value = initial;
+            s.max = max;
+        }
+        Ok(tag(SEMA_ID_BASE, id.raw()))
+    }
+
+    fn sema_destroy(&mut self, id: u32) -> Result<(), CellError> {
+        let raw = untag(id);
+        if !self.sema(raw)?.waiters.is_empty() {
+            return Err(CellError::EBUSY);
+        }
+        self.destroy(raw, Lv2SyncKind::Sema)
+    }
+
+    fn sema_post(&mut self, id: u32, count: i32) -> Result<(), CellError> {
+        let s = self.sema_mut(untag(id))?;
+        // Saturating ceiling check.
+        let new_value = s
+            .value
+            .checked_add(count)
+            .ok_or(CellError::EAGAIN)?;
+        if new_value > s.max {
+            return Err(CellError::EAGAIN);
+        }
+        s.value = new_value;
+        Ok(())
+    }
+
+    fn sema_wait(&mut self, id: u32) -> Result<BlockOutcome, CellError> {
+        let s = self.sema_mut(untag(id))?;
+        if s.value > 0 {
+            s.value -= 1;
+            Ok(BlockOutcome::Acquired)
+        } else {
+            Ok(BlockOutcome::MustBlock)
+        }
+    }
+
+    fn sema_trywait(&mut self, id: u32) -> Result<(), CellError> {
+        let s = self.sema_mut(untag(id))?;
+        if s.value > 0 {
+            s.value -= 1;
+            Ok(())
+        } else {
+            Err(CellError::EBUSY)
+        }
+    }
+
+    fn sema_get_value(&self, id: u32) -> Result<i32, CellError> {
+        Ok(self.sema(untag(id))?.value)
     }
 }
 
@@ -592,6 +835,162 @@ mod tests {
         let id = s.lwmutex_create(0x01).unwrap();
         s.lwmutex_destroy(id).unwrap();
         assert_eq!(s.lwmutex_destroy(id), Err(CellError::ESRCH));
+    }
+
+    // -- SyncTable mutex impl (R10.2) ------------------------------
+
+    #[test]
+    fn synctable_mutex_create_returns_tagged_id() {
+        let mut s = Lv2SyncState::new();
+        let id = SyncTable::mutex_create(&mut s, MutexAttr::default()).unwrap();
+        assert_eq!(id & 0xFF00_0000, MUTEX_ID_BASE);
+        assert_eq!(id & TAG_MASK, 1);
+    }
+
+    #[test]
+    fn synctable_mutex_lock_acquires_when_free() {
+        let mut s = Lv2SyncState::new();
+        let id = SyncTable::mutex_create(&mut s, MutexAttr::default()).unwrap();
+        assert_eq!(s.mutex_lock(id, 100), Ok(BlockOutcome::Acquired));
+        assert_eq!(s.mutex(untag(id)).unwrap().owner, Some(100));
+    }
+
+    #[test]
+    fn synctable_mutex_lock_blocks_on_contention() {
+        let mut s = Lv2SyncState::new();
+        let id = SyncTable::mutex_create(&mut s, MutexAttr::default()).unwrap();
+        s.mutex_lock(id, 100).unwrap();
+        assert_eq!(s.mutex_lock(id, 200), Ok(BlockOutcome::MustBlock));
+        assert_eq!(s.mutex(untag(id)).unwrap().waiters, vec![200u32]);
+    }
+
+    #[test]
+    fn synctable_mutex_self_lock_non_recursive_is_edeadlk() {
+        let mut s = Lv2SyncState::new();
+        let id = SyncTable::mutex_create(&mut s, MutexAttr::default()).unwrap();
+        s.mutex_lock(id, 100).unwrap();
+        assert_eq!(s.mutex_lock(id, 100), Err(CellError::EDEADLK));
+    }
+
+    #[test]
+    fn synctable_mutex_self_lock_recursive_increments() {
+        let mut s = Lv2SyncState::new();
+        let attr = MutexAttr { protocol: 1, recursive: true };
+        let id = SyncTable::mutex_create(&mut s, attr).unwrap();
+        s.mutex_lock(id, 100).unwrap();
+        s.mutex_lock(id, 100).unwrap();
+        assert_eq!(s.mutex(untag(id)).unwrap().recursion_count, 2);
+    }
+
+    #[test]
+    fn synctable_mutex_unlock_hands_off_to_next_waiter() {
+        let mut s = Lv2SyncState::new();
+        let id = SyncTable::mutex_create(&mut s, MutexAttr::default()).unwrap();
+        s.mutex_lock(id, 100).unwrap(); // tid 100 holds
+        s.mutex_lock(id, 200).unwrap(); // tid 200 parks
+        s.mutex_lock(id, 300).unwrap(); // tid 300 parks
+        s.mutex_unlock(id, 100).unwrap();
+        // 200 is now the owner; 300 still waits.
+        let m = s.mutex(untag(id)).unwrap();
+        assert_eq!(m.owner, Some(200));
+        assert_eq!(m.waiters, vec![300u32]);
+    }
+
+    #[test]
+    fn synctable_mutex_unlock_not_owner_is_eperm() {
+        let mut s = Lv2SyncState::new();
+        let id = SyncTable::mutex_create(&mut s, MutexAttr::default()).unwrap();
+        s.mutex_lock(id, 100).unwrap();
+        assert_eq!(s.mutex_unlock(id, 200), Err(CellError::EPERM));
+    }
+
+    #[test]
+    fn synctable_mutex_trylock_busy_when_held() {
+        let mut s = Lv2SyncState::new();
+        let id = SyncTable::mutex_create(&mut s, MutexAttr::default()).unwrap();
+        s.mutex_lock(id, 100).unwrap();
+        assert_eq!(s.mutex_trylock(id, 200), Err(CellError::EBUSY));
+    }
+
+    #[test]
+    fn synctable_mutex_destroy_held_is_ebusy() {
+        let mut s = Lv2SyncState::new();
+        let id = SyncTable::mutex_create(&mut s, MutexAttr::default()).unwrap();
+        s.mutex_lock(id, 100).unwrap();
+        assert_eq!(s.mutex_destroy(id), Err(CellError::EBUSY));
+    }
+
+    #[test]
+    fn synctable_mutex_destroy_when_free() {
+        let mut s = Lv2SyncState::new();
+        let id = SyncTable::mutex_create(&mut s, MutexAttr::default()).unwrap();
+        s.mutex_lock(id, 100).unwrap();
+        s.mutex_unlock(id, 100).unwrap();
+        assert_eq!(s.mutex_destroy(id), Ok(()));
+    }
+
+    // -- SyncTable sema impl (R10.4) -------------------------------
+
+    #[test]
+    fn synctable_sema_create_returns_tagged_id() {
+        let mut s = Lv2SyncState::new();
+        let id = SyncTable::sema_create(&mut s, SemaAttr::default(), 3, 10).unwrap();
+        assert_eq!(id & 0xFF00_0000, SEMA_ID_BASE);
+    }
+
+    #[test]
+    fn synctable_sema_initial_value_round_trips() {
+        let mut s = Lv2SyncState::new();
+        let id = SyncTable::sema_create(&mut s, SemaAttr::default(), 7, 10).unwrap();
+        assert_eq!(s.sema_get_value(id), Ok(7));
+    }
+
+    #[test]
+    fn synctable_sema_post_increments() {
+        let mut s = Lv2SyncState::new();
+        let id = SyncTable::sema_create(&mut s, SemaAttr::default(), 0, 10).unwrap();
+        s.sema_post(id, 3).unwrap();
+        assert_eq!(s.sema_get_value(id), Ok(3));
+    }
+
+    #[test]
+    fn synctable_sema_post_overflow_is_eagain() {
+        let mut s = Lv2SyncState::new();
+        let id = SyncTable::sema_create(&mut s, SemaAttr::default(), 5, 5).unwrap();
+        assert_eq!(s.sema_post(id, 1), Err(CellError::EAGAIN));
+    }
+
+    #[test]
+    fn synctable_sema_wait_blocks_at_zero() {
+        let mut s = Lv2SyncState::new();
+        let id = SyncTable::sema_create(&mut s, SemaAttr::default(), 0, 10).unwrap();
+        assert_eq!(s.sema_wait(id), Ok(BlockOutcome::MustBlock));
+    }
+
+    #[test]
+    fn synctable_sema_wait_decrements_when_positive() {
+        let mut s = Lv2SyncState::new();
+        let id = SyncTable::sema_create(&mut s, SemaAttr::default(), 2, 10).unwrap();
+        assert_eq!(s.sema_wait(id), Ok(BlockOutcome::Acquired));
+        assert_eq!(s.sema_get_value(id), Ok(1));
+    }
+
+    #[test]
+    fn synctable_sema_trywait_busy_at_zero() {
+        let mut s = Lv2SyncState::new();
+        let id = SyncTable::sema_create(&mut s, SemaAttr::default(), 0, 10).unwrap();
+        assert_eq!(s.sema_trywait(id), Err(CellError::EBUSY));
+    }
+
+    #[test]
+    fn synctable_mutex_and_sema_have_distinct_id_spaces() {
+        let mut s = Lv2SyncState::new();
+        let m = SyncTable::mutex_create(&mut s, MutexAttr::default()).unwrap();
+        let q = SyncTable::sema_create(&mut s, SemaAttr::default(), 0, 10).unwrap();
+        assert_ne!(m & 0xFF00_0000, q & 0xFF00_0000);
+        // And lookups via the wrong kind fail with EINVAL.
+        assert_eq!(s.sema(untag(m)), Err(CellError::EINVAL));
+        assert_eq!(s.mutex(untag(q)), Err(CellError::EINVAL));
     }
 
     // -- Reserved kinds compile and round-trip without crash ------
