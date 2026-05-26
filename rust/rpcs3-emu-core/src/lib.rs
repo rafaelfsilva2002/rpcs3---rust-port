@@ -37,6 +37,13 @@ use rpcs3_memory_backing::{Error as MemError, SparseBackend};
 use rpcs3_ppu_interpreter::{step, Error as InterpError, StepOutcome};
 use rpcs3_ppu_thread::{PpuThread, PPU_ID_BASE};
 use rpcs3_lv2_tty::SysTty;
+use rpcs3_lv2_sync::Lv2SyncState;
+use rpcs3_lv2_lwmutex::{
+    sys_lwmutex_create as lv2_lwmutex_create,
+    sys_lwmutex_lock as lv2_lwmutex_lock,
+    sys_lwmutex_unlock as lv2_lwmutex_unlock,
+    LockOutcome, LwMutexControl, LWMUTEX_RECURSIVE,
+};
 
 use rpcs3_lv2_process::{
     sys_process_get_number_of_object, sys_process_get_sdk_version, sys_process_getpid,
@@ -279,6 +286,10 @@ pub struct EmuCore {
     pub spu_exit_status: Option<u32>,
     /// Maximum steps per `run` invocation. 0 = unbounded.
     pub step_budget: usize,
+    /// R10.1.b — per-run LV2 sync primitive registry. Owns lwmutex
+    /// (+ future mutex/sema/cond/event/rwlock) handle pool. State is
+    /// per-`EmuCore`, never shared; reset on `EmuCore::new`.
+    pub lv2_sync_state: Lv2SyncState,
 }
 
 impl Default for EmuCore {
@@ -303,6 +314,7 @@ impl EmuCore {
             spu_thread_args: [0; 4],
             spu_exit_status: None,
             step_budget: 100_000,
+            lv2_sync_state: Lv2SyncState::new(),
         }
     }
 
@@ -977,26 +989,122 @@ impl EmuCore {
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
-                        // R9.1h slice 3 — PSL1GHT lwmutex family
-                        // (all no-ops + minimal initialization).
-                        // 0x2f85c0ef sys_lwmutex_create(*lock, *attr):
-                        // zero the 8-byte lwmutex struct.
+                        // R10.1.b — PSL1GHT lwmutex family wired to the
+                        // real lv2-sync handle pool. PSL1GHT calling
+                        // convention (matches PPC ABI):
+                        //   r3 = sys_lwmutex_t* (32-byte control)
+                        //   r4 = sys_lwmutex_attribute_t* (create) /
+                        //        u64 timeout (lock)
+                        // The wrappers operate on a host-side
+                        // [`LwMutexControl`] mirror; helpers below
+                        // round-trip it through guest memory.
+                        //
+                        // 0x2f85c0ef _sys_lwmutex_create(*lock, *attr).
                         0x2f85c0ef => {
                             let lock_ptr = r3_in as u32;
-                            self.mem.write(lock_ptr, &[0u8; 8]).ok();
-                            self.ppu.gpr[3] = 0;
+                            let attr_ptr = r4_in as u32;
+                            // PSL1GHT sys_lwmutex_attribute_t layout
+                            // (`<sys/lwmutex.h>`): {u32 attr_protocol;
+                            // u32 attr_recursive; char name[8];}. Both
+                            // u32s are BE.
+                            let (protocol, recursive) =
+                                self.read_lwmutex_attr(attr_ptr).unwrap_or((0x01, false));
+                            // Build a fresh control struct + a fresh
+                            // kernel sleep queue, then write the
+                            // resulting 32 bytes back to guest memory.
+                            let mut ctrl = LwMutexControl::new(0x01, recursive);
+                            match lv2_lwmutex_create(
+                                &mut self.lv2_sync_state,
+                                protocol,
+                                &mut ctrl,
+                                recursive,
+                            ) {
+                                Ok(_id) => {
+                                    self.write_lwmutex_control(lock_ptr, &ctrl).ok();
+                                    self.ppu.gpr[3] = 0;
+                                }
+                                Err(e) => {
+                                    self.ppu.gpr[3] = u64::from(u32::from(e));
+                                }
+                            }
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
-                        // 0x1573dc3f sys_lwmutex_lock(*lock, timeout):
-                        // single-threaded no-op.
+                        // 0x1573dc3f _sys_lwmutex_lock(*lock, timeout).
                         0x1573dc3f => {
-                            self.ppu.gpr[3] = 0;
+                            let lock_ptr = r3_in as u32;
+                            let timeout = r4_in;
+                            let tid = self.ppu.id as u32;
+                            let Ok(mut ctrl) = self.read_lwmutex_control(lock_ptr)
+                            else {
+                                self.ppu.gpr[3] = u64::from(u32::from(CellError::EFAULT));
+                                self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                return Ok(None);
+                            };
+                            let id = ctrl.sleep_queue();
+                            match lv2_lwmutex_lock(
+                                &mut self.lv2_sync_state,
+                                &mut ctrl,
+                                id,
+                                tid,
+                                timeout,
+                            ) {
+                                Ok(LockOutcome::Acquired) => {
+                                    self.write_lwmutex_control(lock_ptr, &ctrl).ok();
+                                    self.ppu.gpr[3] = 0;
+                                }
+                                Ok(LockOutcome::MustBlock) => {
+                                    // Single-PPU model: contention
+                                    // requires a parking scheduler we
+                                    // don't have. The PSL1GHT crt0
+                                    // path is single-threaded, so this
+                                    // arm should be unreachable for the
+                                    // current oracle set. Surface as
+                                    // CELL_EBUSY so the (rare) caller
+                                    // can decide; we also persist the
+                                    // partial state (waiter+1) which is
+                                    // what the wrapper already wrote.
+                                    self.write_lwmutex_control(lock_ptr, &ctrl).ok();
+                                    self.ppu.gpr[3] = u64::from(u32::from(CellError::EBUSY));
+                                }
+                                Ok(LockOutcome::Busy) => {
+                                    self.ppu.gpr[3] = u64::from(u32::from(CellError::EBUSY));
+                                }
+                                Err(e) => {
+                                    self.ppu.gpr[3] = u64::from(u32::from(e));
+                                }
+                            }
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
-                        // 0x1bc200f4 sys_lwmutex_unlock (already
-                        // handled above).
+                        // 0x1bc200f4 _sys_lwmutex_unlock(*lock).
+                        0x1bc200f4 => {
+                            let lock_ptr = r3_in as u32;
+                            let tid = self.ppu.id as u32;
+                            let Ok(mut ctrl) = self.read_lwmutex_control(lock_ptr)
+                            else {
+                                self.ppu.gpr[3] = u64::from(u32::from(CellError::EFAULT));
+                                self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                return Ok(None);
+                            };
+                            let id = ctrl.sleep_queue();
+                            match lv2_lwmutex_unlock(
+                                &mut self.lv2_sync_state,
+                                &mut ctrl,
+                                id,
+                                tid,
+                            ) {
+                                Ok(_handoff) => {
+                                    self.write_lwmutex_control(lock_ptr, &ctrl).ok();
+                                    self.ppu.gpr[3] = 0;
+                                }
+                                Err(e) => {
+                                    self.ppu.gpr[3] = u64::from(u32::from(e));
+                                }
+                            }
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
                         // 0xb257540b sys_mmapper_allocate_memory(
                         //   size, flags, *mem_id_out): write a
                         // unique mem_id and pretend the heap was
@@ -1842,6 +1950,82 @@ impl EmuCore {
             }
         }
     }
+
+    // -----------------------------------------------------------------
+    // R10.1.b — lwmutex memory layout helpers
+    // -----------------------------------------------------------------
+
+    /// Decode a PSL1GHT `sys_lwmutex_attribute_t` (12 bytes: protocol
+    /// u32 BE + recursive u32 BE + name[8]) at `attr_ptr` into the
+    /// `(protocol, recursive)` pair the lwmutex syscall wrappers want.
+    ///
+    /// PSL1GHT uses an upper-nibble encoding for both fields:
+    ///   protocol  0x10/0x20/0x30/0x40 → FIFO/PRIO/INHERIT/RETRY
+    ///   recursive 0x10 = not_recursive, 0x20 = recursive
+    /// We fold them down to the kernel-side `0x01..=0x04` /
+    /// `LWMUTEX_RECURSIVE` form `rpcs3-lv2-lwmutex` validates against.
+    fn read_lwmutex_attr(&self, attr_ptr: u32) -> Result<(u32, bool), Error> {
+        if attr_ptr == 0 {
+            return Ok((0x01, false));
+        }
+        let mut buf = [0u8; 8];
+        self.mem.read(attr_ptr, &mut buf)?;
+        let raw_protocol = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let raw_recursive = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let protocol = match raw_protocol {
+            0x10 | 0x01 => 0x01,
+            0x20 | 0x02 => 0x02,
+            0x30 | 0x03 => 0x03,
+            0x40 | 0x04 => 0x04,
+            other => other, // pass through; wrapper rejects with EINVAL
+        };
+        let recursive = matches!(raw_recursive, 0x20) || raw_recursive == LWMUTEX_RECURSIVE;
+        Ok((protocol, recursive))
+    }
+
+    /// Read 32 bytes from guest memory at `ctrl_ptr` and decode into a
+    /// host-side [`LwMutexControl`]. The fields are big-endian on the
+    /// guest; we round-trip them through the public setters so the
+    /// in-host representation matches what `LwMutexControl::new`
+    /// produces and the existing wrapper code can mutate it in place.
+    fn read_lwmutex_control(&self, ctrl_ptr: u32) -> Result<LwMutexControl, Error> {
+        let mut buf = [0u8; 32];
+        self.mem.read(ctrl_ptr, &mut buf)?;
+        let read_u32 = |off: usize| {
+            u32::from_be_bytes([
+                buf[off], buf[off + 1], buf[off + 2], buf[off + 3],
+            ])
+        };
+        let attribute = read_u32(0x08);
+        let protocol = attribute & 0xFF;
+        let recursive = attribute & LWMUTEX_RECURSIVE != 0;
+        let mut ctrl = LwMutexControl::new(protocol, recursive);
+        ctrl.set_owner(read_u32(0x00));
+        ctrl.set_waiter(read_u32(0x04));
+        ctrl.set_rcount(read_u32(0x0C));
+        ctrl.set_sleep_queue(read_u32(0x10));
+        Ok(ctrl)
+    }
+
+    /// Write a host-side [`LwMutexControl`] back to guest memory at
+    /// `ctrl_ptr`. Encodes each field as 4-byte BE; the `reserved`
+    /// trailing 8 bytes are written as zero so the guest sees a
+    /// canonical struct.
+    fn write_lwmutex_control(
+        &mut self,
+        ctrl_ptr: u32,
+        ctrl: &LwMutexControl,
+    ) -> Result<(), Error> {
+        let mut buf = [0u8; 32];
+        buf[0x00..0x04].copy_from_slice(&ctrl.owner().to_be_bytes());
+        buf[0x04..0x08].copy_from_slice(&ctrl.waiter().to_be_bytes());
+        buf[0x08..0x0C].copy_from_slice(&ctrl.attribute().to_be_bytes());
+        buf[0x0C..0x10].copy_from_slice(&ctrl.rcount().to_be_bytes());
+        buf[0x10..0x14].copy_from_slice(&ctrl.sleep_queue().to_be_bytes());
+        // 0x14..0x18 pad0 + 0x18..0x20 reserved stay zero.
+        self.mem.write(ctrl_ptr, &buf)?;
+        Ok(())
+    }
 }
 
 // =====================================================================
@@ -2343,5 +2527,153 @@ mod tests {
         let mut core = EmuCore::new();
         let err = core.load_elf(&bytes).unwrap_err();
         assert!(matches!(err, Error::ElfNotLoadable(_)));
+    }
+
+    // -- R10.1.b — lwmutex helper round-trip ----------------------
+
+    /// Allocate a 4 KB scratch page in `core` at `base`, suitable for
+    /// hosting a 32-byte lwmutex control struct or 8-byte attr.
+    fn alloc_lwmutex_scratch(core: &mut EmuCore, base: u32, size: u32) {
+        core.mem
+            .alloc_at(
+                base,
+                size,
+                PageFlags::READABLE | PageFlags::WRITABLE,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn r10_lwmutex_attr_decodes_psl1ght_upper_nibble_encoding() {
+        let mut core = EmuCore::new();
+        let attr_ptr: u32 = 0x4000_0000;
+        alloc_lwmutex_scratch(&mut core, attr_ptr, 0x1000);
+
+        // PSL1GHT: protocol=0x10 (FIFO), recursive=0x20 (recursive).
+        let mut buf = [0u8; 16];
+        buf[0..4].copy_from_slice(&0x10u32.to_be_bytes());
+        buf[4..8].copy_from_slice(&0x20u32.to_be_bytes());
+        core.mem.write(attr_ptr, &buf).unwrap();
+
+        let (protocol, recursive) = core.read_lwmutex_attr(attr_ptr).unwrap();
+        assert_eq!(protocol, 0x01); // folded to kernel form
+        assert!(recursive);
+    }
+
+    #[test]
+    fn r10_lwmutex_attr_accepts_kernel_form_unchanged() {
+        let mut core = EmuCore::new();
+        let attr_ptr: u32 = 0x4000_0000;
+        alloc_lwmutex_scratch(&mut core, attr_ptr, 0x1000);
+
+        // Kernel form: protocol=0x02 (priority), recursive=0x02
+        // (LWMUTEX_RECURSIVE).
+        let mut buf = [0u8; 16];
+        buf[0..4].copy_from_slice(&0x02u32.to_be_bytes());
+        buf[4..8].copy_from_slice(&LWMUTEX_RECURSIVE.to_be_bytes());
+        core.mem.write(attr_ptr, &buf).unwrap();
+
+        let (protocol, recursive) = core.read_lwmutex_attr(attr_ptr).unwrap();
+        assert_eq!(protocol, 0x02);
+        assert!(recursive);
+    }
+
+    #[test]
+    fn r10_lwmutex_create_lock_unlock_round_trip() {
+        let mut core = EmuCore::new();
+        let lock_ptr: u32 = 0x4000_1000;
+        let attr_ptr: u32 = 0x4000_2000;
+        alloc_lwmutex_scratch(&mut core, lock_ptr, 0x1000);
+        alloc_lwmutex_scratch(&mut core, attr_ptr, 0x1000);
+
+        // FIFO non-recursive attr.
+        let mut attr_buf = [0u8; 16];
+        attr_buf[0..4].copy_from_slice(&0x10u32.to_be_bytes()); // FIFO
+        attr_buf[4..8].copy_from_slice(&0x10u32.to_be_bytes()); // not_recursive
+        core.mem.write(attr_ptr, &attr_buf).unwrap();
+
+        // Simulate the create syscall by hand: build the control via the
+        // crate's `new` + allocate kernel queue, then write back. This
+        // exercises the same read/write helpers the dispatcher uses.
+        let (protocol, recursive) = core.read_lwmutex_attr(attr_ptr).unwrap();
+        let mut ctrl = LwMutexControl::new(0x01, recursive);
+        let id =
+            lv2_lwmutex_create(&mut core.lv2_sync_state, protocol, &mut ctrl, recursive)
+                .unwrap();
+        core.write_lwmutex_control(lock_ptr, &ctrl).unwrap();
+
+        // Verify the on-guest bytes look right.
+        let mut on_guest = [0u8; 32];
+        core.mem.read(lock_ptr, &mut on_guest).unwrap();
+        assert_eq!(
+            u32::from_be_bytes([on_guest[0], on_guest[1], on_guest[2], on_guest[3]]),
+            rpcs3_lv2_lwmutex::LWMUTEX_FREE,
+        );
+        assert_eq!(
+            u32::from_be_bytes([on_guest[16], on_guest[17], on_guest[18], on_guest[19]]),
+            id,
+        );
+
+        // Lock as PPU tid.
+        let mut ctrl = core.read_lwmutex_control(lock_ptr).unwrap();
+        let tid = core.ppu.id as u32;
+        let outcome = lv2_lwmutex_lock(
+            &mut core.lv2_sync_state,
+            &mut ctrl,
+            id,
+            tid,
+            0,
+        )
+        .unwrap();
+        assert_eq!(outcome, LockOutcome::Acquired);
+        assert_eq!(ctrl.owner(), tid);
+        core.write_lwmutex_control(lock_ptr, &ctrl).unwrap();
+
+        // Unlock — no waiters, mutex becomes FREE again.
+        let mut ctrl = core.read_lwmutex_control(lock_ptr).unwrap();
+        let handoff =
+            lv2_lwmutex_unlock(&mut core.lv2_sync_state, &mut ctrl, id, tid).unwrap();
+        assert!(handoff.is_none());
+        assert_eq!(ctrl.owner(), rpcs3_lv2_lwmutex::LWMUTEX_FREE);
+        core.write_lwmutex_control(lock_ptr, &ctrl).unwrap();
+
+        // Final guest-memory check.
+        let mut on_guest = [0u8; 4];
+        core.mem.read(lock_ptr, &mut on_guest).unwrap();
+        assert_eq!(
+            u32::from_be_bytes(on_guest),
+            rpcs3_lv2_lwmutex::LWMUTEX_FREE,
+        );
+    }
+
+    #[test]
+    fn r10_lwmutex_self_recursive_increments_rcount() {
+        let mut core = EmuCore::new();
+        let lock_ptr: u32 = 0x4000_3000;
+        alloc_lwmutex_scratch(&mut core, lock_ptr, 0x1000);
+
+        let mut ctrl = LwMutexControl::new(0x01, true);
+        let id =
+            lv2_lwmutex_create(&mut core.lv2_sync_state, 0x01, &mut ctrl, true).unwrap();
+        core.write_lwmutex_control(lock_ptr, &ctrl).unwrap();
+        let tid = core.ppu.id as u32;
+
+        // First lock — Acquired, rcount=1.
+        let mut c = core.read_lwmutex_control(lock_ptr).unwrap();
+        lv2_lwmutex_lock(&mut core.lv2_sync_state, &mut c, id, tid, 0).unwrap();
+        assert_eq!(c.rcount(), 1);
+        core.write_lwmutex_control(lock_ptr, &c).unwrap();
+
+        // Re-lock by same tid — recursive, rcount=2.
+        let mut c = core.read_lwmutex_control(lock_ptr).unwrap();
+        lv2_lwmutex_lock(&mut core.lv2_sync_state, &mut c, id, tid, 0).unwrap();
+        assert_eq!(c.rcount(), 2);
+        core.write_lwmutex_control(lock_ptr, &c).unwrap();
+
+        // Unlock once — still owned, rcount=1.
+        let mut c = core.read_lwmutex_control(lock_ptr).unwrap();
+        lv2_lwmutex_unlock(&mut core.lv2_sync_state, &mut c, id, tid).unwrap();
+        assert_eq!(c.rcount(), 1);
+        assert_eq!(c.owner(), tid);
     }
 }

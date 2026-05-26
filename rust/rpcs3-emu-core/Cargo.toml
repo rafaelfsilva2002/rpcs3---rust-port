@@ -25,6 +25,8 @@ rpcs3-spu-interpreter  = { path = "../rpcs3-spu-interpreter" }
 rpcs3-lv2-spu-group    = { path = "../rpcs3-lv2-spu-group" }
 rpcs3-lv2-spu-image    = { path = "../rpcs3-lv2-spu-image" }
 rpcs3-lv2-tty          = { path = "../rpcs3-lv2-tty" }
+rpcs3-lv2-sync         = { path = "../rpcs3-lv2-sync" }
+rpcs3-lv2-lwmutex      = { path = "../rpcs3-lv2-lwmutex" }
 
 [lints]
 workspace = true

@@ -39,6 +39,15 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use rpcs3_emu_types::CellError;
+use rpcs3_lv2_lwmutex::LwMutexTable;
+
+/// High-byte tag for kernel lwmutex IDs. Matches RPCS3 C++'s
+/// `lv2_lwmutex::id_base = 0x95000000`. Used by the [`LwMutexTable`]
+/// impl on [`Lv2SyncState`] to tag the registry's internal counter
+/// before exposing the handle to guest code, so capture traces match
+/// what RPCS3 C++ would have emitted.
+pub const LWMUTEX_ID_BASE: u32 = 0x9500_0000;
+const LWMUTEX_ID_MASK: u32 = 0x00FF_FFFF;
 
 // ====================================================================
 // Id newtype + kind enum
@@ -310,6 +319,71 @@ impl Lv2SyncState {
 }
 
 // ====================================================================
+// LwMutexTable bridge (R10.1.b)
+// ====================================================================
+
+impl Lv2SyncState {
+    /// Convert a raw counter into the kernel-visible lwmutex id by
+    /// applying the `0x95000000` tag. Used at the [`LwMutexTable`]
+    /// boundary so guest code sees the same id space RPCS3 C++ would
+    /// have emitted.
+    #[inline]
+    fn lwmutex_tag(raw: u32) -> u32 {
+        LWMUTEX_ID_BASE | (raw & LWMUTEX_ID_MASK)
+    }
+
+    /// Reverse of [`Self::lwmutex_tag`] — strip the kind tag back to
+    /// the registry counter.
+    #[inline]
+    fn lwmutex_untag(id: u32) -> u32 {
+        id & LWMUTEX_ID_MASK
+    }
+}
+
+impl LwMutexTable for Lv2SyncState {
+    fn lwmutex_create(&mut self, protocol: u32) -> Result<u32, CellError> {
+        let id = self.allocate(Lv2SyncKind::LwMutex);
+        // Set the create-time attr so dequeue can later honor protocol.
+        // Recursive flag is not part of the kernel side — it lives in
+        // the userspace control word — so leave it `false` here.
+        self.lw_mutex_mut(id.raw())?.attr = LwMutexAttr {
+            protocol,
+            recursive: false,
+        };
+        Ok(Self::lwmutex_tag(id.raw()))
+    }
+
+    fn lwmutex_destroy(&mut self, id: u32) -> Result<(), CellError> {
+        let raw = Self::lwmutex_untag(id);
+        // Mirror the C++ guard: refuse destroy while any waiter is
+        // parked. The trait contract says EBUSY, not ESRCH.
+        if self.lw_mutex(raw)?.waiters.is_empty() {
+            self.destroy(raw, Lv2SyncKind::LwMutex)
+        } else {
+            Err(CellError::EBUSY)
+        }
+    }
+
+    fn lwmutex_enqueue(&mut self, id: u32, tid: u32) -> Result<(), CellError> {
+        let raw = Self::lwmutex_untag(id);
+        self.lw_mutex_mut(raw)?.waiters.push_back(tid);
+        Ok(())
+    }
+
+    fn lwmutex_dequeue(&mut self, id: u32) -> Result<Option<u32>, CellError> {
+        let raw = Self::lwmutex_untag(id);
+        Ok(self.lw_mutex_mut(raw)?.waiters.pop_front())
+    }
+
+    fn lwmutex_waiter_count(&self, id: u32) -> Result<u32, CellError> {
+        let raw = Self::lwmutex_untag(id);
+        let n = self.lw_mutex(raw)?.waiters.len();
+        // u32 cast is safe: lwmutex queues are PPU-thread-bounded.
+        Ok(n as u32)
+    }
+}
+
+// ====================================================================
 // Tests — every R10.1.a acceptance criterion
 // ====================================================================
 
@@ -448,6 +522,76 @@ mod tests {
         s.destroy(id.raw(), Lv2SyncKind::LwMutex).unwrap();
         assert_eq!(s.len(), 0);
         assert!(s.is_empty());
+    }
+
+    // -- LwMutexTable impl (R10.1.b) ------------------------------
+
+    #[test]
+    fn lwmutex_table_create_returns_tagged_id() {
+        let mut s = Lv2SyncState::new();
+        let id = s.lwmutex_create(0x01).unwrap();
+        assert_eq!(id & 0xFF00_0000, LWMUTEX_ID_BASE);
+        assert_eq!(id & LWMUTEX_ID_MASK, 1); // first allocation
+    }
+
+    #[test]
+    fn lwmutex_table_create_records_protocol_in_attr() {
+        let mut s = Lv2SyncState::new();
+        let id = s.lwmutex_create(0x02).unwrap();
+        let raw = Lv2SyncState::lwmutex_untag(id);
+        assert_eq!(s.lw_mutex(raw).unwrap().attr.protocol, 0x02);
+    }
+
+    #[test]
+    fn lwmutex_table_enqueue_dequeue_is_fifo() {
+        let mut s = Lv2SyncState::new();
+        let id = s.lwmutex_create(0x01).unwrap();
+        s.lwmutex_enqueue(id, 10).unwrap();
+        s.lwmutex_enqueue(id, 11).unwrap();
+        s.lwmutex_enqueue(id, 12).unwrap();
+        assert_eq!(s.lwmutex_waiter_count(id), Ok(3));
+        assert_eq!(s.lwmutex_dequeue(id), Ok(Some(10)));
+        assert_eq!(s.lwmutex_dequeue(id), Ok(Some(11)));
+        assert_eq!(s.lwmutex_dequeue(id), Ok(Some(12)));
+        assert_eq!(s.lwmutex_dequeue(id), Ok(None));
+        assert_eq!(s.lwmutex_waiter_count(id), Ok(0));
+    }
+
+    #[test]
+    fn lwmutex_table_destroy_with_waiters_is_ebusy() {
+        let mut s = Lv2SyncState::new();
+        let id = s.lwmutex_create(0x01).unwrap();
+        s.lwmutex_enqueue(id, 42).unwrap();
+        assert_eq!(s.lwmutex_destroy(id), Err(CellError::EBUSY));
+        // Drain and retry — destroy now succeeds.
+        s.lwmutex_dequeue(id).unwrap();
+        assert_eq!(s.lwmutex_destroy(id), Ok(()));
+    }
+
+    #[test]
+    fn lwmutex_table_unknown_id_is_esrch() {
+        let mut s = Lv2SyncState::new();
+        // Tagged id whose lower bits don't correspond to any entry.
+        assert_eq!(
+            s.lwmutex_destroy(LWMUTEX_ID_BASE | 0xFF),
+            Err(CellError::ESRCH)
+        );
+        assert_eq!(
+            s.lwmutex_enqueue(LWMUTEX_ID_BASE | 0xFF, 7),
+            Err(CellError::ESRCH)
+        );
+        assert_eq!(
+            s.lwmutex_waiter_count(LWMUTEX_ID_BASE | 0xFF),
+            Err(CellError::ESRCH)
+        );
+    }
+
+    #[test]
+    fn lwmutex_table_destroy_then_reuse_id_returns_esrch() {
+        let mut s = Lv2SyncState::new();
+        let id = s.lwmutex_create(0x01).unwrap();
+        s.lwmutex_destroy(id).unwrap();
+        assert_eq!(s.lwmutex_destroy(id), Err(CellError::ESRCH));
     }
 
     // -- Reserved kinds compile and round-trip without crash ------
