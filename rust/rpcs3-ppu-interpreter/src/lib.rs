@@ -135,6 +135,13 @@ fn set_cr_field(ppu: &mut PpuThread, crfd: u32, lt: bool, gt: bool, eq: bool) {
     ppu.cr.0[base + 3] = u8::from(ppu.xer.so);
 }
 
+/// R11.4 — CR-bit operand indices (BT, BA, BB) for the CR-logical
+/// ops in primary 19. BT=bits6..10, BA=11..15, BB=16..20 — the same
+/// positions the X-form accessors call rd/ra/rb.
+fn cr_bit_indices(op: &PpuOpcode) -> (usize, usize, usize) {
+    (op.rd() as usize, op.ra() as usize, op.rb() as usize)
+}
+
 /// Decode the SPR number from the 10-bit `spr` field of mtspr/mfspr.
 /// PPC encodes the number with halves swapped:
 /// `actual_spr = ((encoded & 0x1F) << 5) | ((encoded >> 5) & 0x1F)`.
@@ -1316,6 +1323,12 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                     }
                 }
 
+                // ---- R11.4: memory barriers (no-op, in-order model) -
+                // sync (598, incl. lwsync/ptesync via the L field) and
+                // eieio (854) are storage-ordering hints; our single-
+                // thread in-order interpreter needs no action.
+                598 | 854 => {}
+
                 _ => {
                     return Err(Error::Unimplemented {
                         inst,
@@ -1538,6 +1551,63 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                         ppu.cia = target;
                         return Ok(StepOutcome::Continue);
                     }
+                }
+
+                // ---- R11.4: CR logical ops + mcrf + isync ----------
+                // CR-bit ops: BT=bits6..10 (op.rd()), BA=11..15
+                // (op.ra()), BB=16..20 (op.rb()). The CR is a [u8; 32]
+                // of 0/1 bits.
+                0 => {
+                    // mcrf crfD, crfS — copy a 4-bit CR field.
+                    let crfd = ((op.rd() >> 2) & 0x7) as usize * 4;
+                    let crfs = ((op.ra() >> 2) & 0x7) as usize * 4;
+                    for i in 0..4 {
+                        ppu.cr.0[crfd + i] = ppu.cr.0[crfs + i];
+                    }
+                }
+                257 => {
+                    // crand BT, BA, BB
+                    let (d, a, b) = cr_bit_indices(&op);
+                    ppu.cr.0[d] = ppu.cr.0[a] & ppu.cr.0[b];
+                }
+                449 => {
+                    // cror BT, BA, BB
+                    let (d, a, b) = cr_bit_indices(&op);
+                    ppu.cr.0[d] = ppu.cr.0[a] | ppu.cr.0[b];
+                }
+                193 => {
+                    // crxor BT, BA, BB
+                    let (d, a, b) = cr_bit_indices(&op);
+                    ppu.cr.0[d] = ppu.cr.0[a] ^ ppu.cr.0[b];
+                }
+                225 => {
+                    // crnand BT, BA, BB
+                    let (d, a, b) = cr_bit_indices(&op);
+                    ppu.cr.0[d] = 1 - (ppu.cr.0[a] & ppu.cr.0[b]);
+                }
+                33 => {
+                    // crnor BT, BA, BB
+                    let (d, a, b) = cr_bit_indices(&op);
+                    ppu.cr.0[d] = 1 - (ppu.cr.0[a] | ppu.cr.0[b]);
+                }
+                289 => {
+                    // creqv BT, BA, BB
+                    let (d, a, b) = cr_bit_indices(&op);
+                    ppu.cr.0[d] = 1 - (ppu.cr.0[a] ^ ppu.cr.0[b]);
+                }
+                129 => {
+                    // crandc BT, BA, BB — BA & ~BB
+                    let (d, a, b) = cr_bit_indices(&op);
+                    ppu.cr.0[d] = ppu.cr.0[a] & (1 - ppu.cr.0[b]);
+                }
+                417 => {
+                    // crorc BT, BA, BB — BA | ~BB
+                    let (d, a, b) = cr_bit_indices(&op);
+                    ppu.cr.0[d] = ppu.cr.0[a] | (1 - ppu.cr.0[b]);
+                }
+                150 => {
+                    // isync — instruction sync. No-op for our in-order
+                    // single-thread interpreter.
                 }
                 _ => {
                     return Err(Error::Unimplemented {
@@ -2690,6 +2760,56 @@ pub mod encode {
     /// `stfiwx frs, ra, rb`.
     #[must_use]
     pub const fn stfiwx(frs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(frs, ra, rb, 983) }
+
+    // -- R11.4: CR logical ops + mcrf + barriers ------------------
+
+    /// Primary-19 XL-form (CR-bit ops): bt/ba/bb at the rd/ra/rb slots.
+    const fn p19_xl(bt: u32, ba: u32, bb: u32, xo: u32) -> u32 {
+        (19 << 26)
+            | ((bt & 0x1F) << 21)
+            | ((ba & 0x1F) << 16)
+            | ((bb & 0x1F) << 11)
+            | ((xo & 0x3FF) << 1)
+    }
+
+    /// `crand BT, BA, BB`.
+    #[must_use]
+    pub const fn crand(bt: u32, ba: u32, bb: u32) -> u32 { p19_xl(bt, ba, bb, 257) }
+    /// `cror BT, BA, BB`.
+    #[must_use]
+    pub const fn cror(bt: u32, ba: u32, bb: u32) -> u32 { p19_xl(bt, ba, bb, 449) }
+    /// `crxor BT, BA, BB`.
+    #[must_use]
+    pub const fn crxor(bt: u32, ba: u32, bb: u32) -> u32 { p19_xl(bt, ba, bb, 193) }
+    /// `crnand BT, BA, BB`.
+    #[must_use]
+    pub const fn crnand(bt: u32, ba: u32, bb: u32) -> u32 { p19_xl(bt, ba, bb, 225) }
+    /// `crnor BT, BA, BB`.
+    #[must_use]
+    pub const fn crnor(bt: u32, ba: u32, bb: u32) -> u32 { p19_xl(bt, ba, bb, 33) }
+    /// `creqv BT, BA, BB`.
+    #[must_use]
+    pub const fn creqv(bt: u32, ba: u32, bb: u32) -> u32 { p19_xl(bt, ba, bb, 289) }
+    /// `crandc BT, BA, BB`.
+    #[must_use]
+    pub const fn crandc(bt: u32, ba: u32, bb: u32) -> u32 { p19_xl(bt, ba, bb, 129) }
+    /// `crorc BT, BA, BB`.
+    #[must_use]
+    pub const fn crorc(bt: u32, ba: u32, bb: u32) -> u32 { p19_xl(bt, ba, bb, 417) }
+    /// `mcrf crfD, crfS` — crfD/crfS in the top 3 bits of bt/ba.
+    #[must_use]
+    pub const fn mcrf(crfd: u32, crfs: u32) -> u32 {
+        p19_xl((crfd & 0x7) << 2, (crfs & 0x7) << 2, 0, 0)
+    }
+    /// `isync`.
+    #[must_use]
+    pub const fn isync() -> u32 { p19_xl(0, 0, 0, 150) }
+    /// `sync` (primary 31, XO 598).
+    #[must_use]
+    pub const fn sync() -> u32 { xo31_dar(0, 0, 0, 598) }
+    /// `eieio` (primary 31, XO 854).
+    #[must_use]
+    pub const fn eieio() -> u32 { xo31_dar(0, 0, 0, 854) }
 
     // -- rlwinm (primary 21) --------------------------------------
 
@@ -5198,5 +5318,89 @@ mod tests {
         step_ok(&mut ppu, &mut mem);
         step_ok(&mut ppu, &mut mem);
         assert_eq!(ppu.gpr[3], 0xCAFE_F00D);
+    }
+
+    // ---- R11.4: CR logical ops + mcrf + barriers ------------------
+
+    #[test]
+    fn crand_combines_two_bits() {
+        // CR bit 0 = 1, bit 4 = 1 → crand bit 8 = 1.
+        let prog = [encode::crand(8, 0, 4)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.cr.0[0] = 1;
+        ppu.cr.0[4] = 1;
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.cr.0[8], 1);
+    }
+
+    #[test]
+    fn crand_zero_when_one_input_clear() {
+        let prog = [encode::crand(8, 0, 4)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.cr.0[0] = 1;
+        ppu.cr.0[4] = 0;
+        ppu.cr.0[8] = 1; // preset to confirm it gets cleared
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.cr.0[8], 0);
+    }
+
+    #[test]
+    fn cror_and_crxor() {
+        let prog = [encode::cror(8, 0, 4), encode::crxor(9, 0, 4)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.cr.0[0] = 1;
+        ppu.cr.0[4] = 0;
+        step_ok(&mut ppu, &mut mem);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.cr.0[8], 1); // 1 | 0
+        assert_eq!(ppu.cr.0[9], 1); // 1 ^ 0
+    }
+
+    #[test]
+    fn crnor_and_creqv() {
+        let prog = [encode::crnor(8, 0, 4), encode::creqv(9, 0, 4)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.cr.0[0] = 0;
+        ppu.cr.0[4] = 0;
+        step_ok(&mut ppu, &mut mem);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.cr.0[8], 1); // ~(0|0)
+        assert_eq!(ppu.cr.0[9], 1); // ~(0^0)
+    }
+
+    #[test]
+    fn crandc_and_crorc() {
+        let prog = [encode::crandc(8, 0, 4), encode::crorc(9, 0, 4)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.cr.0[0] = 1;
+        ppu.cr.0[4] = 1;
+        step_ok(&mut ppu, &mut mem);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.cr.0[8], 0); // 1 & ~1
+        assert_eq!(ppu.cr.0[9], 1); // 1 | ~1
+    }
+
+    #[test]
+    fn mcrf_copies_field() {
+        // crfS=1 (bits 4..7) → crfD=2 (bits 8..11).
+        let prog = [encode::mcrf(2, 1)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.cr.0[4] = 1;
+        ppu.cr.0[5] = 0;
+        ppu.cr.0[6] = 1;
+        ppu.cr.0[7] = 0;
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(&ppu.cr.0[8..12], &[1, 0, 1, 0]);
+    }
+
+    #[test]
+    fn barriers_are_noops() {
+        let prog = [encode::sync(), encode::isync(), encode::eieio()];
+        let (mut ppu, mut mem) = make_env(&prog);
+        for _ in 0..prog.len() {
+            step_ok(&mut ppu, &mut mem);
+        }
+        // CIA advanced past all three; no fault.
+        assert_eq!(ppu.cia, PROG_BASE + 12);
     }
 }
