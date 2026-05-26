@@ -53,4 +53,11 @@ a `tests/` dir. Each wave adds handlers + inline tests.
 
 ## Validation status
 
-- R11.1: (in progress)
+- R11.1 FP arithmetic — `3f8f51215` (147 lib tests)
+- R11.2 FP convert/compare/status — `7db2403a2` (155)
+- R11.3 indexed load/store — `27a988928` (162)
+- R11.4 CR logical + mcrf + barriers — `e0c5a1b8b` (169)
+- R11.5 string/multiple — (this commit) (172) — **PPU SCALAR COMPLETE**
+- Deferred sub-slice R11.4b: OE-arithmetic (addo/subfo/mulldo)
+- Next: R11.6/7 VMX (the giant), R11.8 system/supervisor
+- All waves: workspace gate 268 result blocks, 0 fail.

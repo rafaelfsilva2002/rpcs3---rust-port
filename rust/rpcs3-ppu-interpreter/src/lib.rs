@@ -135,6 +135,66 @@ fn set_cr_field(ppu: &mut PpuThread, crfd: u32, lt: bool, gt: bool, eq: bool) {
     ppu.cr.0[base + 3] = u8::from(ppu.xer.so);
 }
 
+/// R11.5 — load `n` bytes from `ea` into GPRs starting at `rt`,
+/// packing big-endian (MSByte first) 4 bytes per register and
+/// wrapping at r31→r0. A partial final register is left-justified
+/// (high bytes filled, low bytes zero).
+fn load_string(
+    ppu: &mut PpuThread,
+    mem: &SparseBackend,
+    mut ea: u32,
+    rt: u32,
+    n: u32,
+) -> Result<(), Error> {
+    let mut reg = rt as usize;
+    let mut acc: u32 = 0;
+    let mut byte_in_reg = 0u32;
+    for _ in 0..n {
+        if byte_in_reg == 0 {
+            acc = 0;
+        }
+        let b = mem_read_u8(mem, ea)?;
+        acc |= (b as u32) << (24 - byte_in_reg * 8);
+        ea = ea.wrapping_add(1);
+        byte_in_reg += 1;
+        if byte_in_reg == 4 {
+            ppu.gpr[reg % 32] = acc as u64;
+            reg = (reg + 1) % 32;
+            byte_in_reg = 0;
+        }
+    }
+    if byte_in_reg != 0 {
+        ppu.gpr[reg % 32] = acc as u64;
+    }
+    Ok(())
+}
+
+/// R11.5 — store `n` bytes to `ea` from GPRs starting at `rs`,
+/// reading big-endian (MSByte first) 4 bytes per register, wrapping
+/// at r31→r0.
+fn store_string(
+    ppu: &mut PpuThread,
+    mem: &mut SparseBackend,
+    mut ea: u32,
+    rs: u32,
+    n: u32,
+) -> Result<(), Error> {
+    let mut reg = rs as usize;
+    let mut byte_in_reg = 0u32;
+    for _ in 0..n {
+        let word = ppu.gpr[reg % 32] as u32;
+        let b = (word >> (24 - byte_in_reg * 8)) as u8;
+        mem_write_u8(mem, ea, b)?;
+        ea = ea.wrapping_add(1);
+        byte_in_reg += 1;
+        if byte_in_reg == 4 {
+            reg = (reg + 1) % 32;
+            byte_in_reg = 0;
+        }
+    }
+    Ok(())
+}
+
 /// R11.4 — CR-bit operand indices (BT, BA, BB) for the CR-logical
 /// ops in primary 19. BT=bits6..10, BA=11..15, BB=16..20 — the same
 /// positions the X-form accessors call rd/ra/rb.
@@ -1210,6 +1270,38 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                     mem_write_u32_be(mem, ea, v)?;
                 }
 
+                // ---- R11.5: load/store string (byte) ---------------
+                // Bytes pack big-endian into 32-bit register slots,
+                // advancing rt/rs and wrapping at r31→r0. lswi/stswi
+                // take the count from the NB field (0 → 32); lswx/stswx
+                // take it from XER.cnt and use an indexed EA.
+                597 => {
+                    // lswi rt, ra, nb
+                    let n = { let nb = op.rb(); if nb == 0 { 32 } else { nb } };
+                    let ea = ra_or_zero(ppu, op.ra()) as u32;
+                    load_string(ppu, mem, ea, op.rd(), n)?;
+                }
+                533 => {
+                    // lswx rt, ra, rb — count from XER.cnt
+                    let n = ppu.xer.cnt as u32;
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    load_string(ppu, mem, ea, op.rd(), n)?;
+                }
+                725 => {
+                    // stswi rs, ra, nb
+                    let n = { let nb = op.rb(); if nb == 0 { 32 } else { nb } };
+                    let ea = ra_or_zero(ppu, op.ra()) as u32;
+                    store_string(ppu, mem, ea, op.rs(), n)?;
+                }
+                661 => {
+                    // stswx rs, ra, rb — count from XER.cnt
+                    let n = ppu.xer.cnt as u32;
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    store_string(ppu, mem, ea, op.rs(), n)?;
+                }
+
                 // R9.1g.9 — additional P31 XO additions found via
                 // iterative smoke runs.
                 60 => {
@@ -1389,6 +1481,25 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
             let v = ppu.gpr[op.rs() as usize] as u16;
             mem.write(ea, &v.to_be_bytes()).map_err(Error::from)?;
             ppu.gpr[op.ra() as usize] = ea as u64;
+        }
+
+        // ---- R11.5: load/store multiple word (D-form) --------------
+        // lmw rt, d(ra): load consecutive words into GPR[rt..=31].
+        // stmw rs, d(ra): store GPR[rs..=31]. EA increments by 4 each.
+        // Words are sign-position-irrelevant 32-bit; loads zero-extend.
+        primary::LMW => {
+            let mut ea = effective_address_d(ppu, op);
+            for r in (op.rd() as usize)..=31 {
+                ppu.gpr[r] = mem_read_u32_be(mem, ea)? as u64;
+                ea = ea.wrapping_add(4);
+            }
+        }
+        primary::STMW => {
+            let mut ea = effective_address_d(ppu, op);
+            for r in (op.rs() as usize)..=31 {
+                mem_write_u32_be(mem, ea, ppu.gpr[r] as u32)?;
+                ea = ea.wrapping_add(4);
+            }
         }
 
         // ---- D-form loads (zero-extend to 64 bit) ------------------
@@ -2810,6 +2921,42 @@ pub mod encode {
     /// `eieio` (primary 31, XO 854).
     #[must_use]
     pub const fn eieio() -> u32 { xo31_dar(0, 0, 0, 854) }
+
+    // -- R11.5: load/store multiple + string ----------------------
+
+    /// `lmw rt, d(ra)` — load multiple word (primary 46).
+    #[must_use]
+    pub const fn lmw(rt: u32, ra: u32, d: i32) -> u32 {
+        (46 << 26) | ((rt & 0x1F) << 21) | ((ra & 0x1F) << 16)
+            | ((d as u32) & 0xFFFF)
+    }
+    /// `stmw rs, d(ra)` — store multiple word (primary 47).
+    #[must_use]
+    pub const fn stmw(rs: u32, ra: u32, d: i32) -> u32 {
+        (47 << 26) | ((rs & 0x1F) << 21) | ((ra & 0x1F) << 16)
+            | ((d as u32) & 0xFFFF)
+    }
+    /// `lswi rt, ra, nb` — load string immediate (P31 XO 597). nb in
+    /// the rb slot (0 → 32 bytes).
+    #[must_use]
+    pub const fn lswi(rt: u32, ra: u32, nb: u32) -> u32 {
+        xo31_dar(rt, ra, nb, 597)
+    }
+    /// `stswi rs, ra, nb` — store string immediate (P31 XO 725).
+    #[must_use]
+    pub const fn stswi(rs: u32, ra: u32, nb: u32) -> u32 {
+        xo31_dar(rs, ra, nb, 725)
+    }
+    /// `lswx rt, ra, rb` — load string indexed (P31 XO 533).
+    #[must_use]
+    pub const fn lswx(rt: u32, ra: u32, rb: u32) -> u32 {
+        xo31_dar(rt, ra, rb, 533)
+    }
+    /// `stswx rs, ra, rb` — store string indexed (P31 XO 661).
+    #[must_use]
+    pub const fn stswx(rs: u32, ra: u32, rb: u32) -> u32 {
+        xo31_dar(rs, ra, rb, 661)
+    }
 
     // -- rlwinm (primary 21) --------------------------------------
 
@@ -5402,5 +5549,60 @@ mod tests {
         }
         // CIA advanced past all three; no fault.
         assert_eq!(ppu.cia, PROG_BASE + 12);
+    }
+
+    // ---- R11.5: load/store multiple + string ----------------------
+
+    #[test]
+    fn stmw_then_lmw_round_trip() {
+        // store r29..r31 at DATA_BASE, load back into r5..r7 via
+        // a second lmw (rt=5 loads r5..r31, but we only check 5..7).
+        let prog = [encode::stmw(29, 4, 0), encode::lmw(29, 4, 0)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        alloc_data(&mut mem, DATA_BASE);
+        ppu.gpr[4] = DATA_BASE as u64;
+        ppu.gpr[29] = 0xAAAA;
+        ppu.gpr[30] = 0xBBBB;
+        ppu.gpr[31] = 0xCCCC;
+        step_ok(&mut ppu, &mut mem); // stmw r29..r31
+        // clobber then reload
+        ppu.gpr[29] = 0;
+        ppu.gpr[30] = 0;
+        ppu.gpr[31] = 0;
+        step_ok(&mut ppu, &mut mem); // lmw r29..r31
+        assert_eq!(ppu.gpr[29], 0xAAAA);
+        assert_eq!(ppu.gpr[30], 0xBBBB);
+        assert_eq!(ppu.gpr[31], 0xCCCC);
+    }
+
+    #[test]
+    fn stswi_then_lswi_round_trip() {
+        // 6 bytes: r6 = 0x11223344 (4 bytes) + r7 high 2 bytes.
+        let prog = [encode::stswi(6, 4, 6), encode::lswi(8, 4, 6)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        alloc_data(&mut mem, DATA_BASE);
+        ppu.gpr[4] = DATA_BASE as u64;
+        ppu.gpr[6] = 0x1122_3344;
+        ppu.gpr[7] = 0x5566_0000; // only high 2 bytes used
+        step_ok(&mut ppu, &mut mem); // stswi 6 bytes from r6,r7
+        step_ok(&mut ppu, &mut mem); // lswi 6 bytes into r8,r9
+        assert_eq!(ppu.gpr[8], 0x1122_3344);
+        // r9 gets 2 bytes left-justified: 0x5566_0000.
+        assert_eq!(ppu.gpr[9], 0x5566_0000);
+    }
+
+    #[test]
+    fn lswx_uses_xer_cnt() {
+        // store 4 bytes via stswi, then lswx with XER.cnt=4.
+        let prog = [encode::stswi(6, 4, 4), encode::lswx(8, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        alloc_data(&mut mem, DATA_BASE);
+        ppu.gpr[4] = DATA_BASE as u64;
+        ppu.gpr[5] = 0; // rb offset 0
+        ppu.gpr[6] = 0xDEAD_BEEF;
+        ppu.xer.cnt = 4;
+        step_ok(&mut ppu, &mut mem);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.gpr[8], 0xDEAD_BEEF);
     }
 }
