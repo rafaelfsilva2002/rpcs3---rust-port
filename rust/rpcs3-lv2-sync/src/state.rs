@@ -48,6 +48,9 @@ use rpcs3_lv2_lwmutex::LwMutexTable;
 use rpcs3_lv2_rwlock::{
     LockOutcome as RwLockOutcome, RwlockAttr, RwlockRegistry,
 };
+use rpcs3_lv2_event::{
+    Event, EventRegistry, QueueAttr, ReceiveOutcome, QUEUE_DESTROY_FORCE,
+};
 
 use crate::{BlockOutcome, MutexAttr, SemaAttr, SyncTable};
 
@@ -220,6 +223,32 @@ pub struct EventFlag {
 }
 
 // ====================================================================
+// Kernel sys_event_queue + sys_event_port entries (R10.6)
+// ====================================================================
+
+/// Kernel-side state for one `sys_event_queue_t`. Bounded FIFO of
+/// `Event` tuples.
+#[derive(Debug, Clone, Default)]
+pub struct EventQueue {
+    pub attr: QueueAttr,
+    /// Max events the queue will hold. `port_send` to a full queue
+    /// returns `EBUSY` (matching C++ `sys_event_port_send`).
+    pub size: u32,
+    pub pending: VecDeque<Event>,
+}
+
+/// Kernel-side state for one `sys_event_port_t`. May be connected to a
+/// single event queue.
+#[derive(Debug, Clone, Default)]
+pub struct EventPort {
+    pub port_type: u32,
+    pub name: u64,
+    /// Untagged registry id of the queue this port is bound to (None
+    /// when disconnected).
+    pub connected_queue_untagged: Option<u32>,
+}
+
+// ====================================================================
 // Kernel sys_rwlock entry (R10.7)
 // ====================================================================
 
@@ -269,10 +298,10 @@ enum Entry {
     Cond(Cond),
     EventFlag(EventFlag),
     RwLock(Rwlock),
+    EventQueue(EventQueue),
+    EventPort(EventPort),
     // Variants below are placeholders the future slices flesh out.
     LwCond,
-    EventQueue,
-    EventPort,
 }
 
 impl Entry {
@@ -284,9 +313,9 @@ impl Entry {
             Entry::Cond(_) => Lv2SyncKind::Cond,
             Entry::EventFlag(_) => Lv2SyncKind::EventFlag,
             Entry::RwLock(_) => Lv2SyncKind::RwLock,
+            Entry::EventQueue(_) => Lv2SyncKind::EventQueue,
+            Entry::EventPort(_) => Lv2SyncKind::EventPort,
             Entry::LwCond => Lv2SyncKind::LwCond,
-            Entry::EventQueue => Lv2SyncKind::EventQueue,
-            Entry::EventPort => Lv2SyncKind::EventPort,
         }
     }
 
@@ -298,9 +327,9 @@ impl Entry {
             Lv2SyncKind::Cond => Entry::Cond(Cond::default()),
             Lv2SyncKind::EventFlag => Entry::EventFlag(EventFlag::default()),
             Lv2SyncKind::RwLock => Entry::RwLock(Rwlock::default()),
+            Lv2SyncKind::EventQueue => Entry::EventQueue(EventQueue::default()),
+            Lv2SyncKind::EventPort => Entry::EventPort(EventPort::default()),
             Lv2SyncKind::LwCond => Entry::LwCond,
-            Lv2SyncKind::EventQueue => Entry::EventQueue,
-            Lv2SyncKind::EventPort => Entry::EventPort,
         }
     }
 }
@@ -508,6 +537,48 @@ impl Lv2SyncState {
             Some(_) => Err(CellError::EINVAL),
         }
     }
+
+    // -- EventQueue accessors (R10.6) ------------------------------
+
+    pub fn event_queue(&self, raw: u32) -> Result<&EventQueue, CellError> {
+        match self.entries.get(&raw) {
+            None => Err(CellError::ESRCH),
+            Some(Entry::EventQueue(q)) => Ok(q),
+            Some(_) => Err(CellError::EINVAL),
+        }
+    }
+
+    pub fn event_queue_mut(
+        &mut self,
+        raw: u32,
+    ) -> Result<&mut EventQueue, CellError> {
+        match self.entries.get_mut(&raw) {
+            None => Err(CellError::ESRCH),
+            Some(Entry::EventQueue(q)) => Ok(q),
+            Some(_) => Err(CellError::EINVAL),
+        }
+    }
+
+    // -- EventPort accessors (R10.6) -------------------------------
+
+    pub fn event_port(&self, raw: u32) -> Result<&EventPort, CellError> {
+        match self.entries.get(&raw) {
+            None => Err(CellError::ESRCH),
+            Some(Entry::EventPort(p)) => Ok(p),
+            Some(_) => Err(CellError::EINVAL),
+        }
+    }
+
+    pub fn event_port_mut(
+        &mut self,
+        raw: u32,
+    ) -> Result<&mut EventPort, CellError> {
+        match self.entries.get_mut(&raw) {
+            None => Err(CellError::ESRCH),
+            Some(Entry::EventPort(p)) => Ok(p),
+            Some(_) => Err(CellError::EINVAL),
+        }
+    }
 }
 
 // ====================================================================
@@ -594,6 +665,12 @@ pub const EVENT_FLAG_ID_BASE: u32 = 0x9800_0000;
 /// High-byte tag for kernel sys_rwlock IDs (RPCS3 C++
 /// `lv2_rwlock::id_base = 0x88000000`).
 pub const RWLOCK_ID_BASE: u32 = 0x8800_0000;
+/// High-byte tag for kernel sys_event_queue IDs (RPCS3 C++
+/// `lv2_event_queue::id_base = 0x8d000000`).
+pub const EVENT_QUEUE_ID_BASE: u32 = 0x8D00_0000;
+/// High-byte tag for kernel sys_event_port IDs (RPCS3 C++
+/// `lv2_event_port::id_base = 0x0e000000`).
+pub const EVENT_PORT_ID_BASE: u32 = 0x0E00_0000;
 
 // Helpers duplicated from `rpcs3-lv2-event-flag` (private there) —
 // kept inline so we don't widen that crate's public API just for the
@@ -1117,6 +1194,119 @@ impl RwlockRegistry for Lv2SyncState {
                 r.readers.push(reader);
             }
         }
+        Ok(())
+    }
+}
+
+// ====================================================================
+// EventRegistry bridge (R10.6)
+// ====================================================================
+
+impl EventRegistry for Lv2SyncState {
+    fn queue_create(&mut self, attr: QueueAttr, size: u32) -> Result<u32, CellError> {
+        let id = self.allocate(Lv2SyncKind::EventQueue);
+        let q = self.event_queue_mut(id.raw())?;
+        q.attr = attr;
+        q.size = size;
+        Ok(tag(EVENT_QUEUE_ID_BASE, id.raw()))
+    }
+
+    fn queue_destroy(&mut self, id: u32, mode: u32) -> Result<(), CellError> {
+        let raw = untag(id);
+        {
+            let q = self.event_queue(raw)?;
+            if !q.pending.is_empty() && mode != QUEUE_DESTROY_FORCE {
+                return Err(CellError::EBUSY);
+            }
+        }
+        self.destroy(raw, Lv2SyncKind::EventQueue)
+    }
+
+    fn queue_receive(&mut self, id: u32) -> Result<ReceiveOutcome, CellError> {
+        let q = self.event_queue_mut(untag(id))?;
+        match q.pending.pop_front() {
+            Some(ev) => Ok(ReceiveOutcome::Received(ev)),
+            None => Ok(ReceiveOutcome::MustBlock),
+        }
+    }
+
+    fn queue_tryreceive(
+        &mut self,
+        id: u32,
+        max: u32,
+    ) -> Result<Vec<Event>, CellError> {
+        let q = self.event_queue_mut(untag(id))?;
+        let n = (max as usize).min(q.pending.len());
+        Ok((0..n).map(|_| q.pending.pop_front().unwrap()).collect())
+    }
+
+    fn queue_drain(&mut self, id: u32) -> Result<(), CellError> {
+        let q = self.event_queue_mut(untag(id))?;
+        q.pending.clear();
+        Ok(())
+    }
+
+    fn port_create(&mut self, port_type: u32, name: u64) -> Result<u32, CellError> {
+        let id = self.allocate(Lv2SyncKind::EventPort);
+        let p = self.event_port_mut(id.raw())?;
+        p.port_type = port_type;
+        p.name = name;
+        Ok(tag(EVENT_PORT_ID_BASE, id.raw()))
+    }
+
+    fn port_destroy(&mut self, id: u32) -> Result<(), CellError> {
+        let raw = untag(id);
+        {
+            let p = self.event_port(raw)?;
+            if p.connected_queue_untagged.is_some() {
+                return Err(CellError::EISCONN);
+            }
+        }
+        self.destroy(raw, Lv2SyncKind::EventPort)
+    }
+
+    fn port_connect_local(&mut self, port: u32, queue: u32) -> Result<(), CellError> {
+        let port_raw = untag(port);
+        let queue_raw = untag(queue);
+        // Validate queue exists + is correct kind first.
+        let _ = self.event_queue(queue_raw)?;
+        let p = self.event_port_mut(port_raw)?;
+        if p.connected_queue_untagged.is_some() {
+            return Err(CellError::EISCONN);
+        }
+        p.connected_queue_untagged = Some(queue_raw);
+        Ok(())
+    }
+
+    fn port_disconnect(&mut self, port: u32) -> Result<(), CellError> {
+        let p = self.event_port_mut(untag(port))?;
+        if p.connected_queue_untagged.is_none() {
+            return Err(CellError::ENOTCONN);
+        }
+        p.connected_queue_untagged = None;
+        Ok(())
+    }
+
+    fn port_send(
+        &mut self,
+        port: u32,
+        data1: u64,
+        data2: u64,
+        data3: u64,
+    ) -> Result<(), CellError> {
+        // Resolve the queue id off the port first, then drop the port
+        // borrow before mutating the queue.
+        let queue_raw = self
+            .event_port(untag(port))?
+            .connected_queue_untagged
+            .ok_or(CellError::ENOTCONN)?;
+        // Source = port id (tagged) — matches C++ behaviour.
+        let source = u64::from(port);
+        let q = self.event_queue_mut(queue_raw)?;
+        if q.pending.len() as u32 >= q.size {
+            return Err(CellError::EBUSY);
+        }
+        q.pending.push_back(Event { source, data1, data2, data3 });
         Ok(())
     }
 }
@@ -1884,6 +2074,123 @@ mod tests {
         let mut s = Lv2SyncState::new();
         let id = make_rwlock(&mut s);
         assert_eq!(s.rwlock_destroy(id), Ok(()));
+    }
+
+    // -- EventRegistry impl (R10.6) --------------------------------
+
+    fn setup_event() -> (Lv2SyncState, u32, u32) {
+        // Returns (state, queue_id, port_id) bound to each other.
+        let mut s = Lv2SyncState::new();
+        let q = EventRegistry::queue_create(&mut s, QueueAttr::default(), 8)
+            .unwrap();
+        let p = EventRegistry::port_create(&mut s, 1, 0).unwrap();
+        s.port_connect_local(p, q).unwrap();
+        (s, q, p)
+    }
+
+    #[test]
+    fn evreg_queue_create_returns_tagged_id() {
+        let mut s = Lv2SyncState::new();
+        let q =
+            EventRegistry::queue_create(&mut s, QueueAttr::default(), 8).unwrap();
+        assert_eq!(q & 0xFF00_0000, EVENT_QUEUE_ID_BASE);
+    }
+
+    #[test]
+    fn evreg_port_create_returns_tagged_id() {
+        let mut s = Lv2SyncState::new();
+        let p = EventRegistry::port_create(&mut s, 1, 0).unwrap();
+        assert_eq!(p & 0xFF00_0000, EVENT_PORT_ID_BASE);
+    }
+
+    #[test]
+    fn evreg_receive_empty_queue_returns_must_block() {
+        let mut s = Lv2SyncState::new();
+        let q =
+            EventRegistry::queue_create(&mut s, QueueAttr::default(), 8).unwrap();
+        assert_eq!(s.queue_receive(q), Ok(ReceiveOutcome::MustBlock));
+    }
+
+    #[test]
+    fn evreg_send_then_receive_round_trips() {
+        let (mut s, q, p) = setup_event();
+        s.port_send(p, 0xAA, 0xBB, 0xCC).unwrap();
+        let outcome = s.queue_receive(q).unwrap();
+        match outcome {
+            ReceiveOutcome::Received(ev) => {
+                assert_eq!(ev.source, u64::from(p));
+                assert_eq!(ev.data1, 0xAA);
+                assert_eq!(ev.data2, 0xBB);
+                assert_eq!(ev.data3, 0xCC);
+            }
+            _ => panic!("expected Received"),
+        }
+    }
+
+    #[test]
+    fn evreg_send_full_queue_is_ebusy() {
+        let mut s = Lv2SyncState::new();
+        let q = EventRegistry::queue_create(&mut s, QueueAttr::default(), 1)
+            .unwrap();
+        let p = EventRegistry::port_create(&mut s, 1, 0).unwrap();
+        s.port_connect_local(p, q).unwrap();
+        s.port_send(p, 0, 0, 0).unwrap();
+        assert_eq!(s.port_send(p, 0, 0, 0), Err(CellError::EBUSY));
+    }
+
+    #[test]
+    fn evreg_tryreceive_drains_up_to_max() {
+        let (mut s, q, p) = setup_event();
+        s.port_send(p, 1, 0, 0).unwrap();
+        s.port_send(p, 2, 0, 0).unwrap();
+        s.port_send(p, 3, 0, 0).unwrap();
+        let drained = s.queue_tryreceive(q, 2).unwrap();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].data1, 1);
+        assert_eq!(drained[1].data1, 2);
+    }
+
+    #[test]
+    fn evreg_drain_clears_queue() {
+        let (mut s, q, p) = setup_event();
+        s.port_send(p, 0, 0, 0).unwrap();
+        s.port_send(p, 0, 0, 0).unwrap();
+        s.queue_drain(q).unwrap();
+        assert_eq!(s.event_queue(untag(q)).unwrap().pending.len(), 0);
+    }
+
+    #[test]
+    fn evreg_port_disconnect_then_connect_again() {
+        let (mut s, q, p) = setup_event();
+        s.port_disconnect(p).unwrap();
+        // Second disconnect → ENOTCONN.
+        assert_eq!(s.port_disconnect(p), Err(CellError::ENOTCONN));
+        // Reconnect works.
+        s.port_connect_local(p, q).unwrap();
+        // Connecting twice without disconnect → EISCONN.
+        assert_eq!(s.port_connect_local(p, q), Err(CellError::EISCONN));
+    }
+
+    #[test]
+    fn evreg_port_send_disconnected_is_enotconn() {
+        let mut s = Lv2SyncState::new();
+        let p = EventRegistry::port_create(&mut s, 1, 0).unwrap();
+        assert_eq!(s.port_send(p, 0, 0, 0), Err(CellError::ENOTCONN));
+    }
+
+    #[test]
+    fn evreg_port_destroy_connected_is_eisconn() {
+        let (mut s, _q, p) = setup_event();
+        assert_eq!(s.port_destroy(p), Err(CellError::EISCONN));
+    }
+
+    #[test]
+    fn evreg_queue_destroy_with_events_default_mode_is_ebusy() {
+        let (mut s, q, p) = setup_event();
+        s.port_send(p, 0, 0, 0).unwrap();
+        assert_eq!(s.queue_destroy(q, 0), Err(CellError::EBUSY));
+        // FORCE mode succeeds.
+        assert_eq!(s.queue_destroy(q, QUEUE_DESTROY_FORCE), Ok(()));
     }
 
     // -- Reserved kinds compile and round-trip without crash ------
