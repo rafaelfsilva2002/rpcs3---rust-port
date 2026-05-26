@@ -38,6 +38,7 @@ use rpcs3_ppu_interpreter::{step, Error as InterpError, StepOutcome};
 use rpcs3_ppu_thread::{PpuThread, PPU_ID_BASE};
 use rpcs3_lv2_tty::SysTty;
 use rpcs3_lv2_sync::{BlockOutcome, Lv2SyncState, MutexAttr, SemaAttr, SyncTable};
+use rpcs3_lv2_event::{EventRegistry, QueueAttr, ReceiveOutcome};
 use rpcs3_lv2_lwmutex::{
     sys_lwmutex_create as lv2_lwmutex_create,
     sys_lwmutex_lock as lv2_lwmutex_lock,
@@ -1521,6 +1522,128 @@ impl EmuCore {
             43 => {
                 // sys_ppu_thread_yield — no-op in single-thread mode.
             }
+            // R10.1.f — sys_event_queue + sys_event_port family
+            // (#128-#130, #134-#138). PSL1GHT exposes these via
+            // <sys/event_queue.h>. Routes into the R10.6
+            // EventRegistry impl on Lv2SyncState.
+            128 => {
+                // sys_event_queue_create(*q_out, *attr, key, size)
+                let q_out = r3 as u32;
+                let attr_ptr = r4 as u32;
+                let _key = self.ppu.gpr[5];
+                let size = self.ppu.gpr[6] as u32;
+                let attr = match Self::read_sys_event_queue_attr(&self.mem, attr_ptr)
+                {
+                    Ok(a) => a,
+                    Err(e) => {
+                        self.ppu.gpr[3] = e.0 as u64;
+                        return Ok(None);
+                    }
+                };
+                match self.lv2_sync_state.queue_create(attr, size) {
+                    Ok(id) => {
+                        self.mem.write(q_out, &id.to_be_bytes())?;
+                        self.ppu.gpr[3] = 0;
+                    }
+                    Err(e) => self.ppu.gpr[3] = e.0 as u64,
+                }
+            }
+            129 => {
+                // sys_event_queue_destroy(q_id, mode)
+                let id = r3 as u32;
+                let mode = r4 as u32;
+                self.ppu.gpr[3] =
+                    match self.lv2_sync_state.queue_destroy(id, mode) {
+                        Ok(()) => 0,
+                        Err(e) => e.0 as u64,
+                    };
+            }
+            130 => {
+                // sys_event_queue_receive(q_id, *event_out, timeout).
+                // The kernel returns the event in REGISTERS r4-r7
+                // (not via the event pointer) — PSL1GHT's
+                // REG_PASS_SYS_EVENT_QUEUE_RECEIVE macro copies
+                // r4→source, r5→data_1, r6→data_2, r7→data_3 into
+                // the caller's struct. So we must NOT touch the
+                // event_out pointer; we set the registers.
+                let id = r3 as u32;
+                let _event_out = r4; // ignored by the real ABI
+                let _timeout = self.ppu.gpr[5];
+                match self.lv2_sync_state.queue_receive(id) {
+                    Ok(ReceiveOutcome::Received(ev)) => {
+                        self.ppu.gpr[3] = 0;
+                        self.ppu.gpr[4] = ev.source;
+                        self.ppu.gpr[5] = ev.data1;
+                        self.ppu.gpr[6] = ev.data2;
+                        self.ppu.gpr[7] = ev.data3;
+                    }
+                    Ok(ReceiveOutcome::MustBlock) => {
+                        // Single-PPU: empty queue + nobody to send →
+                        // would block forever. ETIMEDOUT honestly.
+                        self.ppu.gpr[3] = CellError::ETIMEDOUT.0 as u64;
+                    }
+                    Err(e) => self.ppu.gpr[3] = e.0 as u64,
+                }
+            }
+            133 => {
+                // sys_event_queue_drain(q_id)
+                let id = r3 as u32;
+                self.ppu.gpr[3] = match self.lv2_sync_state.queue_drain(id) {
+                    Ok(()) => 0,
+                    Err(e) => e.0 as u64,
+                };
+            }
+            134 => {
+                // sys_event_port_create(*port_out, port_type, name)
+                let port_out = r3 as u32;
+                let port_type = r4 as u32;
+                let name = self.ppu.gpr[5];
+                match self.lv2_sync_state.port_create(port_type, name) {
+                    Ok(id) => {
+                        self.mem.write(port_out, &id.to_be_bytes())?;
+                        self.ppu.gpr[3] = 0;
+                    }
+                    Err(e) => self.ppu.gpr[3] = e.0 as u64,
+                }
+            }
+            135 => {
+                // sys_event_port_destroy(port_id)
+                let id = r3 as u32;
+                self.ppu.gpr[3] = match self.lv2_sync_state.port_destroy(id) {
+                    Ok(()) => 0,
+                    Err(e) => e.0 as u64,
+                };
+            }
+            136 => {
+                // sys_event_port_connect_local(port_id, q_id)
+                let port = r3 as u32;
+                let queue = r4 as u32;
+                self.ppu.gpr[3] =
+                    match self.lv2_sync_state.port_connect_local(port, queue) {
+                        Ok(()) => 0,
+                        Err(e) => e.0 as u64,
+                    };
+            }
+            137 => {
+                // sys_event_port_disconnect(port_id)
+                let id = r3 as u32;
+                self.ppu.gpr[3] = match self.lv2_sync_state.port_disconnect(id) {
+                    Ok(()) => 0,
+                    Err(e) => e.0 as u64,
+                };
+            }
+            138 => {
+                // sys_event_port_send(port_id, data0, data1, data2)
+                let port = r3 as u32;
+                let data0 = r4;
+                let data1 = self.ppu.gpr[5];
+                let data2 = self.ppu.gpr[6];
+                self.ppu.gpr[3] =
+                    match self.lv2_sync_state.port_send(port, data0, data1, data2) {
+                        Ok(()) => 0,
+                        Err(e) => e.0 as u64,
+                    };
+            }
             // R10.1.e — kernel sys_semaphore family (#90-#94 + #114).
             // PSL1GHT exposes these via <sys/sem.h>. Same single-PPU
             // model as sys_mutex: MustBlock from sema_wait surfaces
@@ -2218,6 +2341,37 @@ impl EmuCore {
             _ => return Err(CellError::EINVAL),
         }
         Ok(SemaAttr { protocol })
+    }
+
+    /// R10.1.f — Decode the 16-byte BE `sys_event_queue_attr_t` at
+    /// `attr_ptr` into a host-side [`QueueAttr`].
+    ///
+    /// Layout (PSL1GHT `<sys/event_queue.h>`):
+    /// ```text
+    /// 0x00  attr_protocol  u32 BE  (1=FIFO, 2=PRIO, 3=PRIO_INHERIT)
+    /// 0x04  type           s32 BE  (1=PPU, 2=SPU)
+    /// 0x08  name[8]        char
+    /// ```
+    fn read_sys_event_queue_attr(
+        mem: &SparseBackend,
+        attr_ptr: u32,
+    ) -> Result<QueueAttr, CellError> {
+        if attr_ptr == 0 {
+            return Ok(QueueAttr::default());
+        }
+        let mut buf = [0u8; 16];
+        mem.read(attr_ptr, &mut buf).map_err(|_| CellError::EFAULT)?;
+        let protocol = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let queue_type = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        match protocol {
+            1 | 2 | 3 => {}
+            _ => return Err(CellError::EINVAL),
+        }
+        match queue_type {
+            1 | 2 => {}
+            _ => return Err(CellError::EINVAL),
+        }
+        Ok(QueueAttr { protocol, queue_type })
     }
 
     /// Read 32 bytes from guest memory at `ctrl_ptr` and decode into a
