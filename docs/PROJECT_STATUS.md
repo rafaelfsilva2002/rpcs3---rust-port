@@ -1,4 +1,4 @@
-# Project Status — R10 CLOSED library layer architecturally complete (LV2 sync primitives — Lv2SyncState owns 8 of 9 primitive families; 109 lib tests; 264 release blocks; 0 regression; 20 SPU oracles intact)
+# Project Status — R10 + fixture pipeline CLOSED (LV2 sync primitives library + 4 end-to-end PSL1GHT fixtures: mutex/sema/event_queue/cond all return 0xC0DE; 268 release blocks; 0 regression; 20 SPU oracles intact)
 
 **Authoritative current source of truth for the RPCS3 → Rust port.**
 
@@ -25,8 +25,20 @@ unit tests + 18 emu-core tests. R9 parity (264 release blocks)
 preserved across all 8 R10 library commits; 20 SPU oracles
 remain green.
 
-See `.planning/R10_LV2_SYNC_CLOSURE.md` for full deliverable
-inventory and roadmap. Previous wave status follows below.
+See `.planning/R10_LV2_SYNC_CLOSURE.md` for the library-layer
+deliverable inventory.
+
+**Fixture pipeline (post-closure, Option A):** 4 PPU-only CC0
+fixtures now drive the library impls end-to-end through real
+PSL1GHT binaries via `EmuCore::run_self`:
+`single_mutex_v1` (R10.1.d, arms #100-#104), `single_sema_v1`
+(R10.1.e, #90-#94+#114), `single_event_queue_v1` (R10.1.f,
+#128-#138), `single_cond_v1` (R10.1.g, #105-#109). Each returns
+the canonical `0xC0DE` exit sentinel. All PSL1GHT-exposed sync
+families are now covered; lwmutex/event_flag/rwlock/lwcond aren't
+exposed to homebrew and stay unit-test-only. See
+`.planning/R10_FIXTURE_PIPELINE_CLOSURE.md`. Previous wave status
+follows below.
 
 ---
 
