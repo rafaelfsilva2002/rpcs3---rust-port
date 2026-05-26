@@ -1665,6 +1665,104 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                         // fnabs frD, frB
                         ppu.fpr[op.frd() as usize] = -ppu.fpr[op.frb() as usize].abs();
                     }
+                    12 => {
+                        // frsp frD, frB — round to single precision.
+                        let r = ppu.fpr[op.frb() as usize] as f32 as f64;
+                        ppu.fpr[op.frd() as usize] = r;
+                        fpscr_update_from_result(ppu, r);
+                    }
+                    14 | 15 => {
+                        // fctiw (14, round per FPSCR.RN) / fctiwz (15,
+                        // round toward zero) — convert to 32-bit signed
+                        // int, store the raw bits in the low word of
+                        // frD (high word undefined per spec; we set
+                        // 0xFFFFFFFF to match common hardware).
+                        let v = ppu.fpr[op.frb() as usize];
+                        let i = if xo10 == 15 {
+                            v.trunc()
+                        } else {
+                            v.round_ties_even()
+                        };
+                        // Saturate to i32 range; NaN → 0 (Rust `as`
+                        // saturates and maps NaN to 0, matching the
+                        // PPC clamp behavior closely enough).
+                        let word = i as i32 as u32 as u64;
+                        ppu.fpr[op.frd() as usize] =
+                            f64::from_bits(0xFFFF_FFFF_0000_0000 | word);
+                    }
+                    814 | 815 => {
+                        // fctid (814) / fctidz (815) — convert to
+                        // 64-bit signed int, store raw bits in frD.
+                        let v = ppu.fpr[op.frb() as usize];
+                        let i = if xo10 == 815 {
+                            v.trunc()
+                        } else {
+                            v.round_ties_even()
+                        };
+                        ppu.fpr[op.frd() as usize] =
+                            f64::from_bits(i as i64 as u64);
+                    }
+                    846 => {
+                        // fcfid frD, frB — convert 64-bit signed int
+                        // (raw bits of frB) to double.
+                        let i = ppu.fpr[op.frb() as usize].to_bits() as i64;
+                        let r = i as f64;
+                        ppu.fpr[op.frd() as usize] = r;
+                        fpscr_update_from_result(ppu, r);
+                    }
+                    0 | 32 => {
+                        // fcmpu (0) / fcmpo (32) — compare frA, frB and
+                        // write CR[crfD] = {LT, GT, EQ, FU}. fcmpo also
+                        // raises VXVC on a NaN operand; we model the
+                        // observable CR result identically and skip the
+                        // VXVC-vs-VXSNAN distinction (FPSCR exception
+                        // enables are deferred project-wide).
+                        let a = ppu.fpr[op.fra() as usize];
+                        let b = ppu.fpr[op.frb() as usize];
+                        let crfd = (op.frd() >> 2) & 0x7;
+                        let base = (crfd as usize) * 4;
+                        let (lt, gt, eq, un) = if a.is_nan() || b.is_nan() {
+                            (false, false, false, true)
+                        } else {
+                            (a < b, a > b, a == b, false)
+                        };
+                        ppu.cr.0[base] = u8::from(lt);
+                        ppu.cr.0[base + 1] = u8::from(gt);
+                        ppu.cr.0[base + 2] = u8::from(eq);
+                        ppu.cr.0[base + 3] = u8::from(un);
+                        // Mirror the result into FPSCR's FPCC field
+                        // (bits 16..19): C unchanged, FL/FG/FE/FU.
+                        let fpcc = (u32::from(lt) << 15)
+                            | (u32::from(gt) << 14)
+                            | (u32::from(eq) << 13)
+                            | (u32::from(un) << 12);
+                        ppu.fpscr = (ppu.fpscr & !0x0000_F000) | fpcc;
+                    }
+                    583 => {
+                        // mffs frD — move FPSCR into the low word of
+                        // frD (high word implementation-defined → set
+                        // to 0xFFFFFFFF, matching common hardware).
+                        ppu.fpr[op.frd() as usize] = f64::from_bits(
+                            0xFFFF_FFFF_0000_0000 | u64::from(ppu.fpscr),
+                        );
+                    }
+                    711 => {
+                        // mtfsf FM, frB — copy frB's low word into FPSCR
+                        // for each nibble selected by the 8-bit FM mask
+                        // (instruction bits 7..14).
+                        let fm = (inst >> 17) & 0xFF;
+                        let src = ppu.fpr[op.frb() as usize].to_bits() as u32;
+                        let mut fpscr = ppu.fpscr;
+                        for field in 0..8u32 {
+                            if (fm >> (7 - field)) & 1 == 1 {
+                                let shift = (7 - field) * 4;
+                                let nibble_mask = 0xFu32 << shift;
+                                fpscr = (fpscr & !nibble_mask)
+                                    | (src & nibble_mask);
+                            }
+                        }
+                        ppu.fpscr = fpscr;
+                    }
                     _ => {
                         return Err(Error::Unimplemented {
                             inst,
@@ -2521,6 +2619,69 @@ pub mod encode {
         fp_a_form(frd, fra, frb, frc, 30, 0)
     }
 
+    /// `frsp frD, frB` — round double to single precision.
+    #[must_use]
+    pub const fn frsp(frd: u32, frb: u32) -> u32 {
+        fp_x_form(frd, frb, 12, 0)
+    }
+
+    /// `fctiw frD, frB` — convert to 32-bit int (FPSCR rounding).
+    #[must_use]
+    pub const fn fctiw(frd: u32, frb: u32) -> u32 {
+        fp_x_form(frd, frb, 14, 0)
+    }
+
+    /// `fctiwz frD, frB` — convert to 32-bit int (toward zero).
+    #[must_use]
+    pub const fn fctiwz(frd: u32, frb: u32) -> u32 {
+        fp_x_form(frd, frb, 15, 0)
+    }
+
+    /// `fctid frD, frB` — convert to 64-bit int (FPSCR rounding).
+    #[must_use]
+    pub const fn fctid(frd: u32, frb: u32) -> u32 {
+        fp_x_form(frd, frb, 814, 0)
+    }
+
+    /// `fctidz frD, frB` — convert to 64-bit int (toward zero).
+    #[must_use]
+    pub const fn fctidz(frd: u32, frb: u32) -> u32 {
+        fp_x_form(frd, frb, 815, 0)
+    }
+
+    /// `fcfid frD, frB` — convert 64-bit int (raw bits) to double.
+    #[must_use]
+    pub const fn fcfid(frd: u32, frb: u32) -> u32 {
+        fp_x_form(frd, frb, 846, 0)
+    }
+
+    /// `fcmpu crfD, frA, frB` — unordered compare into CR[crfD].
+    #[must_use]
+    pub const fn fcmpu(crfd: u32, fra: u32, frb: u32) -> u32 {
+        // crfD sits in the top 3 bits of the 5-bit frD field.
+        fp_x_form((crfd & 0x7) << 2, frb, 0, 0)
+            | ((fra & 0x1F) << 16)
+    }
+
+    /// `fcmpo crfD, frA, frB` — ordered compare into CR[crfD].
+    #[must_use]
+    pub const fn fcmpo(crfd: u32, fra: u32, frb: u32) -> u32 {
+        fp_x_form((crfd & 0x7) << 2, frb, 32, 0)
+            | ((fra & 0x1F) << 16)
+    }
+
+    /// `mffs frD` — move FPSCR to frD low word.
+    #[must_use]
+    pub const fn mffs(frd: u32) -> u32 {
+        fp_x_form(frd, 0, 583, 0)
+    }
+
+    /// `mtfsf FM, frB` — move frB low word to FPSCR fields per mask.
+    #[must_use]
+    pub const fn mtfsf(fm: u32, frb: u32) -> u32 {
+        (63 << 26) | ((fm & 0xFF) << 17) | ((frb & 0x1F) << 11) | (711 << 1)
+    }
+
     // ---- Single-precision arithmetic (primary 59) -------------------
 
     const fn fp_sp_a_form(frd: u32, fra: u32, frb: u32, frc: u32, xo: u32) -> u32 {
@@ -2866,8 +3027,10 @@ mod tests {
 
     #[test]
     fn unknown_primary_returns_unimplemented() {
-        // primary 63 (FPD) not supported yet.
-        let raw: u32 = 63 << 26;
+        // primary 63 with an XO that is NOT a real FP op (xo10=1).
+        // (Plain `63<<26` now decodes as fcmpu xo10=0 since R11.2, so
+        // we pick a genuinely-unimplemented sub-encoding instead.)
+        let raw: u32 = (63 << 26) | (1 << 1);
         let (mut ppu, mut mem) = make_env(&[raw]);
         let err = step(&mut ppu, &mut mem).unwrap_err();
         match err {
@@ -4536,5 +4699,105 @@ mod tests {
         ppu.fpr[4] = 16.0;
         step_ok(&mut ppu, &mut mem);
         assert_eq!(ppu.fpr[3], 0.25); // 1/sqrt(16)
+    }
+
+    // ---- R11.2: FP convert / compare / status ---------------------
+
+    #[test]
+    fn frsp_rounds_to_single() {
+        let prog = [encode::frsp(3, 4)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        // A value not exactly representable in f32.
+        ppu.fpr[4] = 1.0 + (1.0 / 3.0);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.fpr[3], (1.0_f64 + 1.0 / 3.0) as f32 as f64);
+    }
+
+    #[test]
+    fn fctiwz_truncates_to_word() {
+        let prog = [encode::fctiwz(3, 4)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.fpr[4] = 3.9;
+        step_ok(&mut ppu, &mut mem);
+        let low = ppu.fpr[3].to_bits() as u32 as i32;
+        assert_eq!(low, 3);
+    }
+
+    #[test]
+    fn fctiw_rounds_to_nearest_even() {
+        let prog = [encode::fctiw(3, 4)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.fpr[4] = 2.5; // ties-to-even → 2
+        step_ok(&mut ppu, &mut mem);
+        let low = ppu.fpr[3].to_bits() as u32 as i32;
+        assert_eq!(low, 2);
+    }
+
+    #[test]
+    fn fctidz_and_fcfid_round_trip() {
+        // fctidz r3, r4 (r4=42.0) → r3 holds raw i64 bits = 42.
+        let prog = [encode::fctidz(3, 4), encode::fcfid(5, 3)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.fpr[4] = 42.0;
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.fpr[3].to_bits() as i64, 42);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.fpr[5], 42.0);
+    }
+
+    #[test]
+    fn fcmpu_sets_lt_gt_eq() {
+        // crfD=0: compare r4 < r5.
+        let prog = [encode::fcmpu(0, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.fpr[4] = 1.0;
+        ppu.fpr[5] = 2.0;
+        step_ok(&mut ppu, &mut mem);
+        // CR0: LT=1, GT=0, EQ=0, FU=0.
+        assert_eq!(ppu.cr.0[0], 1);
+        assert_eq!(ppu.cr.0[1], 0);
+        assert_eq!(ppu.cr.0[2], 0);
+        assert_eq!(ppu.cr.0[3], 0);
+    }
+
+    #[test]
+    fn fcmpu_equal_sets_eq() {
+        let prog = [encode::fcmpu(1, 4, 5)]; // crfD=1
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.fpr[4] = 7.0;
+        ppu.fpr[5] = 7.0;
+        step_ok(&mut ppu, &mut mem);
+        // CR1 base = 4: LT=0,GT=0,EQ=1,FU=0.
+        assert_eq!(ppu.cr.0[4], 0);
+        assert_eq!(ppu.cr.0[5], 0);
+        assert_eq!(ppu.cr.0[6], 1);
+        assert_eq!(ppu.cr.0[7], 0);
+    }
+
+    #[test]
+    fn fcmpu_nan_sets_unordered() {
+        let prog = [encode::fcmpu(0, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.fpr[4] = f64::NAN;
+        ppu.fpr[5] = 1.0;
+        step_ok(&mut ppu, &mut mem);
+        // Unordered: LT=GT=EQ=0, FU=1.
+        assert_eq!(ppu.cr.0[0], 0);
+        assert_eq!(ppu.cr.0[1], 0);
+        assert_eq!(ppu.cr.0[2], 0);
+        assert_eq!(ppu.cr.0[3], 1);
+    }
+
+    #[test]
+    fn mffs_then_mtfsf_round_trips_fpscr() {
+        // Set a known FPSCR, mffs it into r3, clear FPSCR, mtfsf back.
+        let prog = [encode::mffs(3), encode::mtfsf(0xFF, 3)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.fpscr = 0x0420_0000;
+        step_ok(&mut ppu, &mut mem); // mffs → r3 low word = fpscr
+        assert_eq!(ppu.fpr[3].to_bits() as u32, 0x0420_0000);
+        ppu.fpscr = 0;
+        step_ok(&mut ppu, &mut mem); // mtfsf all fields back
+        assert_eq!(ppu.fpscr, 0x0420_0000);
     }
 }
