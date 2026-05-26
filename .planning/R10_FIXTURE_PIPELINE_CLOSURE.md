@@ -79,8 +79,24 @@ canonical `0xC0DE` sentinel.
 Added `!behavior-freeze/fixtures/**/Makefile` negation — a global
 `Makefile` rule (for CMake artifacts) had been silently ignoring
 all fixture Makefiles since the SPU fixtures landed. The fix
-brought 17 previously-untracked SPU fixture Makefiles into git +
-tracks the 4 new lv2 ones.
+brought **20** previously-untracked SPU fixture Makefiles into
+git (corrected from an earlier "17" miscount) + tracks the 4 new
+lv2 ones.
+
+**Audit (post-hoc, 2026-05-26):** all 20 SPU Makefiles were
+verified as legitimate, hand-written build recipes (55-88 lines
+each, one per fixture, each paired with its `main.c` — they
+reproduce each oracle's `.self`). Tracking them was always the
+intent: the comment at `.gitignore` line 58 explicitly states
+"CC0 sources + Makefile + capture script are tracked". They are
+NOT CMake-generated junk. The only incidental part is the
+*bundling*: all 20 rode into the R10.1.d (`aec8a92b5`) sys_mutex
+commit as a side-effect of the negation rule rather than getting
+a standalone commit, and that commit's message mislabeled them as
+"untracked-pending / a follow-up commit can bring them into git"
+when they were in fact committed in the same change. No content
+issue — the files are correct and useful; only the commit
+hygiene + the message wording were imperfect.
 
 ## What's NOT done (deferred)
 
