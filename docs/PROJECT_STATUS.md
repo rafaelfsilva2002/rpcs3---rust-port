@@ -1,8 +1,36 @@
-# Project Status — R9 CLOSED architecturally complete (LV2/PPU integration; PSL1GHT main() runs through SPU lifecycle; TTY emit deferred; 22 commits, 0 regression, 20 SPU oracles intact)
+# Project Status — R10 CLOSED library layer architecturally complete (LV2 sync primitives — Lv2SyncState owns 8 of 9 primitive families; 109 lib tests; 264 release blocks; 0 regression; 20 SPU oracles intact)
 
 **Authoritative current source of truth for the RPCS3 → Rust port.**
 
-Last updated: **2026-05-25 (R9 CLOSED architecturally complete)**.
+Last updated: **2026-05-26 (R10 CLOSED library layer architecturally complete)**.
+
+R10 wave ported the LV2 sync primitive family into a single
+per-`EmuCore` registry (`rpcs3-lv2-sync::Lv2SyncState`):
+
+- **R10.1.a-c** lwmutex (handle pool + Lv2SyncId/Kind/State + 3
+  PSL1GHT NIDs wired in EmuCore + typed LwMutexAttribute parser).
+- **R10.2+R10.4** kernel sys_mutex + sys_semaphore via SyncTable.
+- **R10.3** sys_cond via CondRegistry (mutex-tied atomic release/
+  reacquire).
+- **R10.5** sys_event_flag via EventFlagRegistry (64-bit bitmask +
+  AND/OR + CLEAR/CLEAR_ALL modes).
+- **R10.6** sys_event_queue + sys_event_port via EventRegistry.
+- **R10.7** sys_rwlock via RwlockRegistry (writer-priority).
+- **R10.8** sys_lwcond DEFERRED — no `rpcs3-lv2-lwcond` crate
+  exists in workspace.
+
+Fixture / oracle / capture work remains blocked (Docker capture
+pipeline offline); library layer validated via 109 lv2-sync
+unit tests + 18 emu-core tests. R9 parity (264 release blocks)
+preserved across all 8 R10 library commits; 20 SPU oracles
+remain green.
+
+See `.planning/R10_LV2_SYNC_CLOSURE.md` for full deliverable
+inventory and roadmap. Previous wave status follows below.
+
+---
+
+Previously: **2026-05-25 (R9 CLOSED architecturally complete)**.
 R9 wave (LV2/PPU strategic pivot) drove existing 20 CC0 SPU
 oracle binaries through the full Rust integration path:
 `EmuCore::run_self` parses a PSL1GHT `.self` through
