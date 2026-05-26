@@ -60,6 +60,94 @@ pub const PROTOCOL_RETRY: u32 = 0x04;
 /// `sys_lwmutex` attribute flag for recursion.
 pub const LWMUTEX_RECURSIVE: u32 = 0x02;
 
+/// `SYS_SYNC_NOT_RECURSIVE` — PSL1GHT's not-recursive sentinel
+/// (`<sys/lwmutex.h>`). Folded to `false` by [`LwMutexAttribute::parse`].
+pub const ATTR_NOT_RECURSIVE_PSL1GHT: u32 = 0x10;
+/// `SYS_SYNC_RECURSIVE` — PSL1GHT's recursive sentinel. Folded to
+/// `true` by [`LwMutexAttribute::parse`].
+pub const ATTR_RECURSIVE_PSL1GHT: u32 = 0x20;
+
+/// PSL1GHT user-form protocol constants (`<sys/lwmutex.h>`).
+/// Folded into the `0x01..=0x04` kernel form by [`LwMutexAttribute::parse`].
+pub const ATTR_PROTOCOL_FIFO_PSL1GHT: u32 = 0x10;
+pub const ATTR_PROTOCOL_PRIORITY_PSL1GHT: u32 = 0x20;
+pub const ATTR_PROTOCOL_PRIORITY_INHERIT_PSL1GHT: u32 = 0x30;
+pub const ATTR_PROTOCOL_RETRY_PSL1GHT: u32 = 0x40;
+
+// =====================================================================
+// User-memory attribute struct — byte-exact vs PSL1GHT `sys_lwmutex_attribute_t`
+// =====================================================================
+
+/// 16-byte BE control block the guest passes to `_sys_lwmutex_create`.
+///
+/// Layout from PSL1GHT `<sys/lwmutex.h>`:
+/// ```text
+/// 0x00  attr_protocol   u32 BE
+/// 0x04  attr_recursive  u32 BE
+/// 0x08  name            char[8]
+/// ```
+///
+/// `attr_protocol` arrives in either of two encodings:
+/// - **PSL1GHT user form**: `0x10`/`0x20`/`0x30`/`0x40` for
+///   FIFO/PRIO/INHERIT/RETRY (the constants PSL1GHT exposes through
+///   `SYS_SYNC_*_ATTR`).
+/// - **Kernel form**: `0x01`/`0x02`/`0x03`/`0x04` (what
+///   `validate_protocol` accepts directly).
+///
+/// `parse` folds both into the kernel form so downstream wrappers
+/// always see a canonical value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LwMutexAttribute {
+    /// Kernel-form protocol (0x01..=0x04). `parse` folds the PSL1GHT
+    /// user form into this.
+    pub protocol: u32,
+    /// True when the attr requested a recursive mutex.
+    pub recursive: bool,
+    /// First 8 bytes of `name` as the guest provided them. Stored as a
+    /// raw byte array because PSL1GHT doesn't require NUL termination
+    /// (the field is fixed-length).
+    pub name: [u8; 8],
+}
+
+impl LwMutexAttribute {
+    /// Fixed wire size of the BE struct.
+    pub const SIZE: usize = 16;
+
+    /// Decode the 16-byte BE struct directly. Returns `EINVAL` if the
+    /// folded protocol is unrecognised.
+    pub fn parse(buf: &[u8; Self::SIZE]) -> Result<Self, CellError> {
+        let raw_protocol = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let raw_recursive = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+
+        let protocol = match raw_protocol {
+            ATTR_PROTOCOL_FIFO_PSL1GHT | PROTOCOL_FIFO => PROTOCOL_FIFO,
+            ATTR_PROTOCOL_PRIORITY_PSL1GHT | PROTOCOL_PRIORITY => PROTOCOL_PRIORITY,
+            ATTR_PROTOCOL_PRIORITY_INHERIT_PSL1GHT | PROTOCOL_PRIORITY_INHERIT => {
+                PROTOCOL_PRIORITY_INHERIT
+            }
+            ATTR_PROTOCOL_RETRY_PSL1GHT | PROTOCOL_RETRY => PROTOCOL_RETRY,
+            _ => return Err(CellError::EINVAL),
+        };
+
+        // recursive: PSL1GHT user-form 0x20 OR kernel-form LWMUTEX_RECURSIVE,
+        // anything else (including the 0x10 NOT_RECURSIVE) → false.
+        let recursive = matches!(raw_recursive, ATTR_RECURSIVE_PSL1GHT | LWMUTEX_RECURSIVE);
+
+        let mut name = [0u8; 8];
+        name.copy_from_slice(&buf[8..16]);
+
+        Ok(Self { protocol, recursive, name })
+    }
+
+    /// Default attr — FIFO, non-recursive, empty name. Useful for the
+    /// `attr_ptr == 0` syscall case the dispatcher accepts as a
+    /// shortcut.
+    #[must_use]
+    pub fn fifo_non_recursive() -> Self {
+        Self { protocol: PROTOCOL_FIFO, recursive: false, name: [0u8; 8] }
+    }
+}
+
 // =====================================================================
 // User-memory control struct — byte-exact vs C++ `sys_lwmutex_t`
 // =====================================================================
@@ -439,6 +527,64 @@ impl LwMutexTable for TestLwMutexTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- LwMutexAttribute parser (R10.1.c) ------------------------
+
+    fn make_attr_bytes(protocol: u32, recursive: u32, name: &[u8; 8]) -> [u8; 16] {
+        let mut buf = [0u8; 16];
+        buf[0..4].copy_from_slice(&protocol.to_be_bytes());
+        buf[4..8].copy_from_slice(&recursive.to_be_bytes());
+        buf[8..16].copy_from_slice(name);
+        buf
+    }
+
+    #[test]
+    fn attr_parse_folds_psl1ght_fifo_not_recursive() {
+        let bytes = make_attr_bytes(0x10, 0x10, b"lwlock\0\0");
+        let attr = LwMutexAttribute::parse(&bytes).unwrap();
+        assert_eq!(attr.protocol, PROTOCOL_FIFO);
+        assert!(!attr.recursive);
+        assert_eq!(&attr.name, b"lwlock\0\0");
+    }
+
+    #[test]
+    fn attr_parse_folds_psl1ght_priority_recursive() {
+        let bytes = make_attr_bytes(0x20, 0x20, &[0u8; 8]);
+        let attr = LwMutexAttribute::parse(&bytes).unwrap();
+        assert_eq!(attr.protocol, PROTOCOL_PRIORITY);
+        assert!(attr.recursive);
+    }
+
+    #[test]
+    fn attr_parse_accepts_kernel_form_directly() {
+        let bytes = make_attr_bytes(0x03, LWMUTEX_RECURSIVE, &[b'k'; 8]);
+        let attr = LwMutexAttribute::parse(&bytes).unwrap();
+        assert_eq!(attr.protocol, PROTOCOL_PRIORITY_INHERIT);
+        assert!(attr.recursive);
+    }
+
+    #[test]
+    fn attr_parse_rejects_unknown_protocol() {
+        let bytes = make_attr_bytes(0xDEAD, 0x10, &[0u8; 8]);
+        assert_eq!(LwMutexAttribute::parse(&bytes), Err(CellError::EINVAL));
+    }
+
+    #[test]
+    fn attr_default_is_fifo_non_recursive() {
+        let a = LwMutexAttribute::fifo_non_recursive();
+        assert_eq!(a.protocol, PROTOCOL_FIFO);
+        assert!(!a.recursive);
+        assert_eq!(a.name, [0u8; 8]);
+    }
+
+    #[test]
+    fn attr_parse_retry_protocol() {
+        let bytes = make_attr_bytes(0x40, 0x10, &[0u8; 8]);
+        let attr = LwMutexAttribute::parse(&bytes).unwrap();
+        assert_eq!(attr.protocol, PROTOCOL_RETRY);
+    }
+
+    // -- existing helpers -----------------------------------------
 
     fn setup() -> (TestLwMutexTable, LwMutexControl, u32) {
         let mut t = TestLwMutexTable::default();

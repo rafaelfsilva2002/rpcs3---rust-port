@@ -42,7 +42,7 @@ use rpcs3_lv2_lwmutex::{
     sys_lwmutex_create as lv2_lwmutex_create,
     sys_lwmutex_lock as lv2_lwmutex_lock,
     sys_lwmutex_unlock as lv2_lwmutex_unlock,
-    LockOutcome, LwMutexControl, LWMUTEX_RECURSIVE,
+    LockOutcome, LwMutexAttribute, LwMutexControl, LWMUTEX_RECURSIVE,
 };
 
 use rpcs3_lv2_process::{
@@ -98,6 +98,11 @@ pub enum Error {
     Spu(SpuError),
     /// A SPU thread group syscall failed.
     SpuGroup(CellError),
+    /// R10.1.c — a syscall received an argument the wrapper rejected
+    /// with `CellError::EINVAL` (e.g. a malformed attribute struct).
+    /// Carries the original error so the NID handler can route it back
+    /// to the guest's `r3` register.
+    SyscallEinval(CellError),
 }
 
 impl From<SpuError> for Error {
@@ -133,6 +138,7 @@ impl core::fmt::Display for Error {
             Error::ElfNotLoadable(r) => write!(f, "ELF not loadable: {r}"),
             Error::Spu(e) => write!(f, "SPU: {e:?}"),
             Error::SpuGroup(e) => write!(f, "SPU group: cell error 0x{:08x}", e.0),
+            Error::SyscallEinval(e) => write!(f, "syscall EINVAL: cell error 0x{:08x}", e.0),
         }
     }
 }
@@ -1003,21 +1009,32 @@ impl EmuCore {
                         0x2f85c0ef => {
                             let lock_ptr = r3_in as u32;
                             let attr_ptr = r4_in as u32;
-                            // PSL1GHT sys_lwmutex_attribute_t layout
-                            // (`<sys/lwmutex.h>`): {u32 attr_protocol;
-                            // u32 attr_recursive; char name[8];}. Both
-                            // u32s are BE.
-                            let (protocol, recursive) =
-                                self.read_lwmutex_attr(attr_ptr).unwrap_or((0x01, false));
-                            // Build a fresh control struct + a fresh
-                            // kernel sleep queue, then write the
-                            // resulting 32 bytes back to guest memory.
-                            let mut ctrl = LwMutexControl::new(0x01, recursive);
+                            // R10.1.c — typed attr parser via
+                            // `LwMutexAttribute::parse` (handles both
+                            // PSL1GHT user form 0x10/0x20/0x30/0x40 and
+                            // kernel form 0x01/0x02/0x03/0x04, plus
+                            // recursive folding).
+                            let attr = match self.read_lwmutex_attr(attr_ptr) {
+                                Ok(a) => a,
+                                Err(Error::SyscallEinval(e)) => {
+                                    self.ppu.gpr[3] = u64::from(u32::from(e));
+                                    self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                    return Ok(None);
+                                }
+                                Err(_) => {
+                                    self.ppu.gpr[3] =
+                                        u64::from(u32::from(CellError::EFAULT));
+                                    self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                    return Ok(None);
+                                }
+                            };
+                            let mut ctrl =
+                                LwMutexControl::new(attr.protocol, attr.recursive);
                             match lv2_lwmutex_create(
                                 &mut self.lv2_sync_state,
-                                protocol,
+                                attr.protocol,
                                 &mut ctrl,
-                                recursive,
+                                attr.recursive,
                             ) {
                                 Ok(_id) => {
                                     self.write_lwmutex_control(lock_ptr, &ctrl).ok();
@@ -1955,32 +1972,21 @@ impl EmuCore {
     // R10.1.b — lwmutex memory layout helpers
     // -----------------------------------------------------------------
 
-    /// Decode a PSL1GHT `sys_lwmutex_attribute_t` (12 bytes: protocol
-    /// u32 BE + recursive u32 BE + name[8]) at `attr_ptr` into the
-    /// `(protocol, recursive)` pair the lwmutex syscall wrappers want.
+    /// Decode a PSL1GHT `sys_lwmutex_attribute_t` at `attr_ptr` using
+    /// [`LwMutexAttribute::parse`].
     ///
-    /// PSL1GHT uses an upper-nibble encoding for both fields:
-    ///   protocol  0x10/0x20/0x30/0x40 → FIFO/PRIO/INHERIT/RETRY
-    ///   recursive 0x10 = not_recursive, 0x20 = recursive
-    /// We fold them down to the kernel-side `0x01..=0x04` /
-    /// `LWMUTEX_RECURSIVE` form `rpcs3-lv2-lwmutex` validates against.
-    fn read_lwmutex_attr(&self, attr_ptr: u32) -> Result<(u32, bool), Error> {
+    /// `attr_ptr == 0` returns the default attr (FIFO, non-recursive).
+    /// Read errors from guest memory propagate as `Error::Memory`.
+    /// Unknown protocol bytes propagate as `CellError::EINVAL` packaged
+    /// as `Error::SyscallEinval` so the calling NID handler can route
+    /// it to `r3` directly.
+    fn read_lwmutex_attr(&self, attr_ptr: u32) -> Result<LwMutexAttribute, Error> {
         if attr_ptr == 0 {
-            return Ok((0x01, false));
+            return Ok(LwMutexAttribute::fifo_non_recursive());
         }
-        let mut buf = [0u8; 8];
+        let mut buf = [0u8; LwMutexAttribute::SIZE];
         self.mem.read(attr_ptr, &mut buf)?;
-        let raw_protocol = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        let raw_recursive = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-        let protocol = match raw_protocol {
-            0x10 | 0x01 => 0x01,
-            0x20 | 0x02 => 0x02,
-            0x30 | 0x03 => 0x03,
-            0x40 | 0x04 => 0x04,
-            other => other, // pass through; wrapper rejects with EINVAL
-        };
-        let recursive = matches!(raw_recursive, 0x20) || raw_recursive == LWMUTEX_RECURSIVE;
-        Ok((protocol, recursive))
+        LwMutexAttribute::parse(&buf).map_err(Error::SyscallEinval)
     }
 
     /// Read 32 bytes from guest memory at `ctrl_ptr` and decode into a
@@ -2555,9 +2561,9 @@ mod tests {
         buf[4..8].copy_from_slice(&0x20u32.to_be_bytes());
         core.mem.write(attr_ptr, &buf).unwrap();
 
-        let (protocol, recursive) = core.read_lwmutex_attr(attr_ptr).unwrap();
-        assert_eq!(protocol, 0x01); // folded to kernel form
-        assert!(recursive);
+        let attr = core.read_lwmutex_attr(attr_ptr).unwrap();
+        assert_eq!(attr.protocol, 0x01); // folded to kernel form
+        assert!(attr.recursive);
     }
 
     #[test]
@@ -2573,9 +2579,33 @@ mod tests {
         buf[4..8].copy_from_slice(&LWMUTEX_RECURSIVE.to_be_bytes());
         core.mem.write(attr_ptr, &buf).unwrap();
 
-        let (protocol, recursive) = core.read_lwmutex_attr(attr_ptr).unwrap();
-        assert_eq!(protocol, 0x02);
-        assert!(recursive);
+        let attr = core.read_lwmutex_attr(attr_ptr).unwrap();
+        assert_eq!(attr.protocol, 0x02);
+        assert!(attr.recursive);
+    }
+
+    #[test]
+    fn r10_lwmutex_attr_null_ptr_returns_default() {
+        let core = EmuCore::new();
+        let attr = core.read_lwmutex_attr(0).unwrap();
+        assert_eq!(attr.protocol, 0x01);
+        assert!(!attr.recursive);
+    }
+
+    #[test]
+    fn r10_lwmutex_attr_rejects_unknown_protocol() {
+        let mut core = EmuCore::new();
+        let attr_ptr: u32 = 0x4000_0000;
+        alloc_lwmutex_scratch(&mut core, attr_ptr, 0x1000);
+
+        let mut buf = [0u8; 16];
+        buf[0..4].copy_from_slice(&0xDEADu32.to_be_bytes());
+        core.mem.write(attr_ptr, &buf).unwrap();
+
+        assert!(matches!(
+            core.read_lwmutex_attr(attr_ptr),
+            Err(Error::SyscallEinval(_))
+        ));
     }
 
     #[test]
@@ -2595,11 +2625,15 @@ mod tests {
         // Simulate the create syscall by hand: build the control via the
         // crate's `new` + allocate kernel queue, then write back. This
         // exercises the same read/write helpers the dispatcher uses.
-        let (protocol, recursive) = core.read_lwmutex_attr(attr_ptr).unwrap();
-        let mut ctrl = LwMutexControl::new(0x01, recursive);
-        let id =
-            lv2_lwmutex_create(&mut core.lv2_sync_state, protocol, &mut ctrl, recursive)
-                .unwrap();
+        let attr = core.read_lwmutex_attr(attr_ptr).unwrap();
+        let mut ctrl = LwMutexControl::new(attr.protocol, attr.recursive);
+        let id = lv2_lwmutex_create(
+            &mut core.lv2_sync_state,
+            attr.protocol,
+            &mut ctrl,
+            attr.recursive,
+        )
+        .unwrap();
         core.write_lwmutex_control(lock_ptr, &ctrl).unwrap();
 
         // Verify the on-guest bytes look right.
