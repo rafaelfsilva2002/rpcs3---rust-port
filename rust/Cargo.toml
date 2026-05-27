@@ -228,6 +228,7 @@ members = [
     "rpcs3-rsx-gsframe",
     "rpcs3-system-config-random",
     "rpcs3-perf-monitor",
+    "rpcs3-rsx-fifo",
     "rpcs3-rsx-vertex-data",
     "rpcs3-rsx-texture-cache-types",
     "rpcs3-rsx-gl-decompiler",

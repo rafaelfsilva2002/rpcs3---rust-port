@@ -1,0 +1,17 @@
+[package]
+name = "rpcs3-rsx-fifo"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpcs3/Emu/RSX/FIFO — RSX/GCM command-buffer (FIFO) decoder: walks the command ring and emits (method, arg) writes, handling increment/non-increment methods and JUMP/CALL/RET/NOP."
+
+[lib]
+name = "rpcs3_rsx_fifo"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true
