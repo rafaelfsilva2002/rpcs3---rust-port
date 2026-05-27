@@ -2291,6 +2291,21 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                     ppu.cia = cia.wrapping_add(4);
                     return Ok(StepOutcome::Continue);
                 }
+                47 => {
+                    // vnmsubfp vd, va, vb, vc — vd = -((va*vc) - vb)
+                    let va = split_lanes(ppu.vr[op.va() as usize]);
+                    let vb = split_lanes(ppu.vr[op.vb() as usize]);
+                    let vc = split_lanes(ppu.vr[op.vc() as usize]);
+                    let mut r = [0u32; 4];
+                    for i in 0..4 {
+                        let v = -(f32::from_bits(va[i]) * f32::from_bits(vc[i])
+                            - f32::from_bits(vb[i]));
+                        r[i] = v.to_bits();
+                    }
+                    ppu.vr[op.vd() as usize] = join_lanes(r);
+                    ppu.cia = cia.wrapping_add(4);
+                    return Ok(StepOutcome::Continue);
+                }
                 _ => {}
             }
 
@@ -2614,6 +2629,90 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                         _ => unreachable!(),
                     };
                     ppu.vr[op.vd() as usize] = r;
+                    ppu.cia = cia.wrapping_add(4);
+                    return Ok(StepOutcome::Continue);
+                }
+                // ---- R11.7a: VMX float (min/max/est/convert) -------
+                1034 | 1098 | 266 | 330 | 394 | 458 => {
+                    let a = split_lanes(ppu.vr[op.va() as usize]);
+                    let b = split_lanes(ppu.vr[op.vb() as usize]);
+                    let mut r = [0u32; 4];
+                    for i in 0..4 {
+                        let fa = f32::from_bits(a[i]);
+                        let fb = f32::from_bits(b[i]);
+                        let v = match xo11 {
+                            1034 => fa.max(fb),          // vmaxfp
+                            1098 => fa.min(fb),          // vminfp
+                            266 => 1.0 / fb,             // vrefp
+                            330 => 1.0 / fb.sqrt(),      // vrsqrtefp
+                            394 => fb.exp2(),            // vexptefp (2^x)
+                            458 => fb.log2(),            // vlogefp
+                            _ => unreachable!(),
+                        };
+                        r[i] = v.to_bits();
+                    }
+                    ppu.vr[op.vd() as usize] = join_lanes(r);
+                    ppu.cia = cia.wrapping_add(4);
+                    return Ok(StepOutcome::Continue);
+                }
+                // float<->fixed conversions; UIMM scale in the va field.
+                778 | 842 | 906 | 970 => {
+                    let b = split_lanes(ppu.vr[op.vb() as usize]);
+                    let uimm = op.va();
+                    let scale = (1u64 << uimm) as f32;
+                    let mut r = [0u32; 4];
+                    for i in 0..4 {
+                        r[i] = match xo11 {
+                            778 => ((b[i] as f32) / scale).to_bits(), // vcfux
+                            842 => ((b[i] as i32 as f32) / scale).to_bits(), // vcfsx
+                            906 => {
+                                // vctuxs: float→u32, saturate.
+                                let v = f32::from_bits(b[i]) * scale;
+                                if v.is_nan() || v <= 0.0 { 0 }
+                                else if v >= u32::MAX as f32 { u32::MAX }
+                                else { v as u32 }
+                            }
+                            970 => {
+                                // vctsxs: float→i32, saturate.
+                                let v = f32::from_bits(b[i]) * scale;
+                                if v.is_nan() { 0 }
+                                else if v >= i32::MAX as f32 { i32::MAX as u32 }
+                                else if v <= i32::MIN as f32 { i32::MIN as u32 }
+                                else { v as i32 as u32 }
+                            }
+                            _ => unreachable!(),
+                        };
+                    }
+                    ppu.vr[op.vd() as usize] = join_lanes(r);
+                    ppu.cia = cia.wrapping_add(4);
+                    return Ok(StepOutcome::Continue);
+                }
+                // float compares (VXR-form, Rc bit 0x400 → CR6).
+                // vcmpeqfp(198), vcmpgefp(454), vcmpgtfp(710) + records.
+                198 | 454 | 710 | 1222 | 1478 | 1734 => {
+                    let a = ppu.vr[op.va() as usize];
+                    let b = ppu.vr[op.vb() as usize];
+                    let base = xo11 & !0x400;
+                    let rc = xo11 & 0x400 != 0;
+                    let (r, allt, allf) = match base {
+                        198 => vcmp_u32(a, b, |x, y| {
+                            f32::from_bits(x) == f32::from_bits(y)
+                        }),
+                        454 => vcmp_u32(a, b, |x, y| {
+                            f32::from_bits(x) >= f32::from_bits(y)
+                        }),
+                        710 => vcmp_u32(a, b, |x, y| {
+                            f32::from_bits(x) > f32::from_bits(y)
+                        }),
+                        _ => unreachable!(),
+                    };
+                    ppu.vr[op.vd() as usize] = r;
+                    if rc {
+                        ppu.cr.0[24] = u8::from(allt);
+                        ppu.cr.0[25] = 0;
+                        ppu.cr.0[26] = u8::from(allf);
+                        ppu.cr.0[27] = 0;
+                    }
                     ppu.cia = cia.wrapping_add(4);
                     return Ok(StepOutcome::Continue);
                 }
@@ -3890,6 +3989,46 @@ pub mod encode {
     pub const fn vspltish(vd: u32, simm: u32) -> u32 { vx_form(844, vd, simm & 0x1F, 0) }
     /// `vspltisw vD, SIMM`. #[must_use]
     pub const fn vspltisw(vd: u32, simm: u32) -> u32 { vx_form(908, vd, simm & 0x1F, 0) }
+
+    // -- R11.7a: VMX float -----------------------------------------
+    /// `vnmsubfp vD, vA, vB, vC` (VA-form 6-bit XO=47).
+    #[must_use]
+    pub const fn vnmsubfp(vd: u32, va: u32, vb: u32, vc: u32) -> u32 {
+        (4 << 26) | ((vd & 0x1F) << 21) | ((va & 0x1F) << 16)
+            | ((vb & 0x1F) << 11) | ((vc & 0x1F) << 6) | 47
+    }
+    /// `vmaxfp`. #[must_use]
+    pub const fn vmaxfp(vd: u32, va: u32, vb: u32) -> u32 { vx_form(1034, vd, va, vb) }
+    /// `vminfp`. #[must_use]
+    pub const fn vminfp(vd: u32, va: u32, vb: u32) -> u32 { vx_form(1098, vd, va, vb) }
+    /// `vrefp` (operand in vb). #[must_use]
+    pub const fn vrefp(vd: u32, vb: u32) -> u32 { vx_form(266, vd, 0, vb) }
+    /// `vrsqrtefp`. #[must_use]
+    pub const fn vrsqrtefp(vd: u32, vb: u32) -> u32 { vx_form(330, vd, 0, vb) }
+    /// `vexptefp`. #[must_use]
+    pub const fn vexptefp(vd: u32, vb: u32) -> u32 { vx_form(394, vd, 0, vb) }
+    /// `vlogefp`. #[must_use]
+    pub const fn vlogefp(vd: u32, vb: u32) -> u32 { vx_form(458, vd, 0, vb) }
+    /// `vcfux vD, vB, UIMM` (scale in va slot). #[must_use]
+    pub const fn vcfux(vd: u32, vb: u32, uimm: u32) -> u32 { vx_form(778, vd, uimm, vb) }
+    /// `vcfsx vD, vB, UIMM`. #[must_use]
+    pub const fn vcfsx(vd: u32, vb: u32, uimm: u32) -> u32 { vx_form(842, vd, uimm, vb) }
+    /// `vctuxs vD, vB, UIMM`. #[must_use]
+    pub const fn vctuxs(vd: u32, vb: u32, uimm: u32) -> u32 { vx_form(906, vd, uimm, vb) }
+    /// `vctsxs vD, vB, UIMM`. #[must_use]
+    pub const fn vctsxs(vd: u32, vb: u32, uimm: u32) -> u32 { vx_form(970, vd, uimm, vb) }
+    /// `vcmpeqfp[.]`. #[must_use]
+    pub const fn vcmpeqfp(vd: u32, va: u32, vb: u32, record: bool) -> u32 {
+        vcr_form(198, vd, va, vb, record)
+    }
+    /// `vcmpgefp[.]`. #[must_use]
+    pub const fn vcmpgefp(vd: u32, va: u32, vb: u32, record: bool) -> u32 {
+        vcr_form(454, vd, va, vb, record)
+    }
+    /// `vcmpgtfp[.]`. #[must_use]
+    pub const fn vcmpgtfp(vd: u32, va: u32, vb: u32, record: bool) -> u32 {
+        vcr_form(710, vd, va, vb, record)
+    }
 
     /// `vperm vD, vA, vB, vC` — byte permutation (VA-form 6-bit XO = 43).
     #[must_use]
@@ -6390,5 +6529,87 @@ mod tests {
         let (mut ppu, mut mem) = make_env(&prog);
         step_ok(&mut ppu, &mut mem);
         assert_eq!(ppu.vr[3], u128::from_be_bytes([7; 16]));
+    }
+
+    // ---- R11.7a: VMX float ----------------------------------------
+
+    fn vr_f32x4(ppu: &mut PpuThread, idx: usize, v: [f32; 4]) {
+        ppu.vr[idx] = join_lanes([
+            v[0].to_bits(), v[1].to_bits(), v[2].to_bits(), v[3].to_bits(),
+        ]);
+    }
+    fn lanes_f32(v: u128) -> [f32; 4] {
+        let l = split_lanes(v);
+        [f32::from_bits(l[0]), f32::from_bits(l[1]),
+         f32::from_bits(l[2]), f32::from_bits(l[3])]
+    }
+
+    #[test]
+    fn vmaxfp_vminfp() {
+        let prog = [encode::vmaxfp(3, 4, 5), encode::vminfp(6, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        vr_f32x4(&mut ppu, 4, [1.0, 5.0, -2.0, 8.0]);
+        vr_f32x4(&mut ppu, 5, [3.0, 2.0, -9.0, 4.0]);
+        step_ok(&mut ppu, &mut mem);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(lanes_f32(ppu.vr[3]), [3.0, 5.0, -2.0, 8.0]);
+        assert_eq!(lanes_f32(ppu.vr[6]), [1.0, 2.0, -9.0, 4.0]);
+    }
+
+    #[test]
+    fn vrefp_reciprocal() {
+        let prog = [encode::vrefp(3, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        vr_f32x4(&mut ppu, 5, [2.0, 4.0, 8.0, 0.5]);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(lanes_f32(ppu.vr[3]), [0.5, 0.25, 0.125, 2.0]);
+    }
+
+    #[test]
+    fn vcfsx_converts_with_scale() {
+        // UIMM=1 → divide by 2. int 10 → 5.0.
+        let prog = [encode::vcfsx(3, 5, 1)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[5] = join_lanes([10, 20, 0xFFFF_FFFF, 4]); // [10,20,-1,4]
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(lanes_f32(ppu.vr[3]), [5.0, 10.0, -0.5, 2.0]);
+    }
+
+    #[test]
+    fn vctsxs_saturates() {
+        // UIMM=0 → no scale. float→i32 with saturation.
+        let prog = [encode::vctsxs(3, 5, 0)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        vr_f32x4(&mut ppu, 5, [3.9, -3.9, 1e30, -1e30]);
+        step_ok(&mut ppu, &mut mem);
+        let l = split_lanes(ppu.vr[3]);
+        assert_eq!(l[0] as i32, 3);
+        assert_eq!(l[1] as i32, -3);
+        assert_eq!(l[2], i32::MAX as u32);
+        assert_eq!(l[3], i32::MIN as u32);
+    }
+
+    #[test]
+    fn vcmpgtfp_with_record_sets_cr6() {
+        let prog = [encode::vcmpgtfp(3, 4, 5, true)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        vr_f32x4(&mut ppu, 4, [5.0, 5.0, 5.0, 5.0]);
+        vr_f32x4(&mut ppu, 5, [1.0, 1.0, 1.0, 1.0]);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.vr[3], join_lanes([0xFFFF_FFFF; 4]));
+        assert_eq!(ppu.cr.0[24], 1); // all true
+    }
+
+    #[test]
+    fn vnmsubfp_negated_multiply_sub() {
+        // vd = -((va*vc) - vb) = vb - va*vc
+        let prog = [encode::vnmsubfp(3, 4, 5, 6)]; // va=4, vb=5, vc=6
+        let (mut ppu, mut mem) = make_env(&prog);
+        vr_f32x4(&mut ppu, 4, [2.0, 2.0, 2.0, 2.0]); // va
+        vr_f32x4(&mut ppu, 5, [10.0, 10.0, 10.0, 10.0]); // vb
+        vr_f32x4(&mut ppu, 6, [3.0, 3.0, 3.0, 3.0]); // vc
+        step_ok(&mut ppu, &mut mem);
+        // -((2*3)-10) = -(6-10) = 4
+        assert_eq!(lanes_f32(ppu.vr[3]), [4.0, 4.0, 4.0, 4.0]);
     }
 }
