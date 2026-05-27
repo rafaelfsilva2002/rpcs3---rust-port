@@ -2378,6 +2378,34 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                     ppu.cia = cia.wrapping_add(4);
                     return Ok(StepOutcome::Continue);
                 }
+                // ---- R11.6b: VMX min/max (unsigned + signed) -------
+                2 | 66 | 130 | 258 | 322 | 386
+                | 514 | 578 | 642 | 770 | 834 | 898 => {
+                    let a = ppu.vr[op.va() as usize];
+                    let b = ppu.vr[op.vb() as usize];
+                    let r = match xo11 {
+                        // unsigned max
+                        2 => vec_u8(a, b, u8::max),
+                        66 => vec_u16(a, b, u16::max),
+                        130 => vec_u32(a, b, u32::max),
+                        // signed max
+                        258 => vec_u8(a, b, |x, y| (x as i8).max(y as i8) as u8),
+                        322 => vec_u16(a, b, |x, y| (x as i16).max(y as i16) as u16),
+                        386 => vec_u32(a, b, |x, y| (x as i32).max(y as i32) as u32),
+                        // unsigned min
+                        514 => vec_u8(a, b, u8::min),
+                        578 => vec_u16(a, b, u16::min),
+                        642 => vec_u32(a, b, u32::min),
+                        // signed min
+                        770 => vec_u8(a, b, |x, y| (x as i8).min(y as i8) as u8),
+                        834 => vec_u16(a, b, |x, y| (x as i16).min(y as i16) as u16),
+                        898 => vec_u32(a, b, |x, y| (x as i32).min(y as i32) as u32),
+                        _ => unreachable!(),
+                    };
+                    ppu.vr[op.vd() as usize] = r;
+                    ppu.cia = cia.wrapping_add(4);
+                    return Ok(StepOutcome::Continue);
+                }
                 _ => {
                     return Err(Error::Unimplemented {
                         inst,
@@ -3509,6 +3537,44 @@ pub mod encode {
     /// `vsubsws` — word sub, signed saturate.
     #[must_use]
     pub const fn vsubsws(vd: u32, va: u32, vb: u32) -> u32 { vx_form(1920, vd, va, vb) }
+
+    // -- R11.6b: VMX min/max --------------------------------------
+    /// `vmaxub`.
+    #[must_use]
+    pub const fn vmaxub(vd: u32, va: u32, vb: u32) -> u32 { vx_form(2, vd, va, vb) }
+    /// `vmaxuh`.
+    #[must_use]
+    pub const fn vmaxuh(vd: u32, va: u32, vb: u32) -> u32 { vx_form(66, vd, va, vb) }
+    /// `vmaxuw`.
+    #[must_use]
+    pub const fn vmaxuw(vd: u32, va: u32, vb: u32) -> u32 { vx_form(130, vd, va, vb) }
+    /// `vmaxsb`.
+    #[must_use]
+    pub const fn vmaxsb(vd: u32, va: u32, vb: u32) -> u32 { vx_form(258, vd, va, vb) }
+    /// `vmaxsh`.
+    #[must_use]
+    pub const fn vmaxsh(vd: u32, va: u32, vb: u32) -> u32 { vx_form(322, vd, va, vb) }
+    /// `vmaxsw`.
+    #[must_use]
+    pub const fn vmaxsw(vd: u32, va: u32, vb: u32) -> u32 { vx_form(386, vd, va, vb) }
+    /// `vminub`.
+    #[must_use]
+    pub const fn vminub(vd: u32, va: u32, vb: u32) -> u32 { vx_form(514, vd, va, vb) }
+    /// `vminuh`.
+    #[must_use]
+    pub const fn vminuh(vd: u32, va: u32, vb: u32) -> u32 { vx_form(578, vd, va, vb) }
+    /// `vminuw`.
+    #[must_use]
+    pub const fn vminuw(vd: u32, va: u32, vb: u32) -> u32 { vx_form(642, vd, va, vb) }
+    /// `vminsb`.
+    #[must_use]
+    pub const fn vminsb(vd: u32, va: u32, vb: u32) -> u32 { vx_form(770, vd, va, vb) }
+    /// `vminsh`.
+    #[must_use]
+    pub const fn vminsh(vd: u32, va: u32, vb: u32) -> u32 { vx_form(834, vd, va, vb) }
+    /// `vminsw`.
+    #[must_use]
+    pub const fn vminsw(vd: u32, va: u32, vb: u32) -> u32 { vx_form(898, vd, va, vb) }
 
     /// `vperm vD, vA, vB, vC` — byte permutation (VA-form 6-bit XO = 43).
     #[must_use]
@@ -5807,5 +5873,62 @@ mod tests {
         ppu.vr[5] = join_lanes([1, 1, 1, 1]);
         step_ok(&mut ppu, &mut mem);
         assert_eq!(ppu.vr[3], join_lanes([0xFFFF_FFFF; 4]));
+    }
+
+    // ---- R11.6b: VMX min/max --------------------------------------
+
+    #[test]
+    fn vmaxub_unsigned_max() {
+        let prog = [encode::vmaxub(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = u128::from_be_bytes([0x10; 16]);
+        ppu.vr[5] = u128::from_be_bytes([0x80; 16]);
+        step_ok(&mut ppu, &mut mem);
+        // unsigned: 0x80 > 0x10.
+        assert_eq!(ppu.vr[3], u128::from_be_bytes([0x80; 16]));
+    }
+
+    #[test]
+    fn vmaxsb_signed_max() {
+        let prog = [encode::vmaxsb(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = u128::from_be_bytes([0x10; 16]); // +16
+        ppu.vr[5] = u128::from_be_bytes([0x80; 16]); // -128
+        step_ok(&mut ppu, &mut mem);
+        // signed: +16 > -128.
+        assert_eq!(ppu.vr[3], u128::from_be_bytes([0x10; 16]));
+    }
+
+    #[test]
+    fn vminub_unsigned_min() {
+        let prog = [encode::vminub(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = u128::from_be_bytes([0x10; 16]);
+        ppu.vr[5] = u128::from_be_bytes([0x80; 16]);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.vr[3], u128::from_be_bytes([0x10; 16]));
+    }
+
+    #[test]
+    fn vminsw_signed_min_words() {
+        let prog = [encode::vminsw(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = join_lanes([5, 0xFFFF_FFFF, 100, 0]); // [5, -1, 100, 0]
+        ppu.vr[5] = join_lanes([3, 1, 0xFFFF_FF9C, 7]);   // [3, 1, -100, 7]
+        step_ok(&mut ppu, &mut mem);
+        // signed mins: min(5,3)=3, min(-1,1)=-1, min(100,-100)=-100, min(0,7)=0
+        assert_eq!(ppu.vr[3], join_lanes([3, 0xFFFF_FFFF, 0xFFFF_FF9C, 0]));
+    }
+
+    #[test]
+    fn vmaxuh_halfword_max() {
+        let prog = [encode::vmaxuh(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = u128::from_be_bytes([0x00, 0x10, 0x00, 0x10, 0x00, 0x10,
+            0x00, 0x10, 0x00, 0x10, 0x00, 0x10, 0x00, 0x10, 0x00, 0x10]);
+        ppu.vr[5] = u128::from_be_bytes([0x00, 0x80, 0x00, 0x80, 0x00, 0x80,
+            0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80]);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.vr[3], ppu.vr[5]);
     }
 }
