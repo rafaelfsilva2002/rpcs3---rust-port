@@ -13,6 +13,7 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 rpcs3-rsx-fifo = { path = "../rpcs3-rsx-fifo" }
+rpcs3-rsx-vertex-data = { path = "../rpcs3-rsx-vertex-data" }
 
 [lints]
 workspace = true

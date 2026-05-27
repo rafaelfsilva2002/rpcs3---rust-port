@@ -19,6 +19,7 @@
 //! divided by 4).
 
 use rpcs3_rsx_fifo::{FifoEngine, FifoError};
+use rpcs3_rsx_vertex_data::VertexBaseType;
 
 /// Number of u32 method registers (`0x10000` bytes / 4).
 pub const METHOD_COUNT: usize = 0x4000;
@@ -43,6 +44,13 @@ pub const BEGIN_END: u32 = 0x1808 >> 2;
 pub const DRAW_ARRAYS: u32 = 0x1814 >> 2;
 /// `NV4097_DRAW_INDEX_ARRAY` (0x1824).
 pub const DRAW_INDEX_ARRAY: u32 = 0x1824 >> 2;
+/// `NV4097_SET_VERTEX_DATA_ARRAY_FORMAT(0)` (0x1740). 16 attributes,
+/// one register each.
+pub const VERTEX_DATA_ARRAY_FORMAT: u32 = 0x1740 >> 2;
+/// `NV4097_SET_VERTEX_DATA_ARRAY_OFFSET(0)` (0x1680). 16 attributes.
+pub const VERTEX_DATA_ARRAY_OFFSET: u32 = 0x1680 >> 2;
+/// Number of vertex attribute inputs.
+pub const VERTEX_ATTRIB_COUNT: u32 = 16;
 /// `NV4097_SET_VIEWPORT_HORIZONTAL` (0x0A00).
 pub const VIEWPORT_HORIZONTAL: u32 = 0x0A00 >> 2;
 /// `NV4097_SET_VIEWPORT_VERTICAL` (0x0A04).
@@ -357,6 +365,104 @@ impl DrawTracker {
     }
 }
 
+// =====================================================================
+// R12.6 — vertex attribute format parsing (Camada B)
+// =====================================================================
+
+/// A decoded vertex attribute array descriptor, from the
+/// `SET_VERTEX_DATA_ARRAY_FORMAT` + `..._OFFSET` register pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VertexAttribute {
+    /// Element base type (float / unorm8 / snorm16 / ...).
+    pub base_type: VertexBaseType,
+    /// Component count (1..=4).
+    pub count: u8,
+    /// Byte stride between consecutive vertices (0 = tightly packed
+    /// / constant).
+    pub stride: u8,
+    /// Instancing frequency divider (0 = per-vertex).
+    pub frequency: u16,
+    /// Raw offset register value (low 31 bits = byte offset into the
+    /// bound DMA buffer; bit 31 selects main vs local memory).
+    pub offset: u32,
+}
+
+impl VertexAttribute {
+    /// True when this attribute reads from main (system) memory
+    /// rather than local (video) memory — bit 31 of the offset reg.
+    #[must_use]
+    pub fn in_main_memory(&self) -> bool {
+        self.offset & 0x8000_0000 != 0
+    }
+
+    /// Byte offset into the bound buffer (offset reg with the
+    /// memory-select bit masked off).
+    #[must_use]
+    pub fn byte_offset(&self) -> u32 {
+        self.offset & 0x7FFF_FFFF
+    }
+}
+
+/// Map the 4-bit type field of a `SET_VERTEX_DATA_ARRAY_FORMAT` word
+/// to a [`VertexBaseType`]. Returns `None` for the undefined code 0
+/// or any reserved value.
+#[must_use]
+pub fn vertex_base_type_from_code(code: u32) -> Option<VertexBaseType> {
+    match code & 0xF {
+        1 => Some(VertexBaseType::S1),
+        2 => Some(VertexBaseType::F),
+        3 => Some(VertexBaseType::Sf),
+        4 => Some(VertexBaseType::Ub),
+        5 => Some(VertexBaseType::S32k),
+        6 => Some(VertexBaseType::Cmp),
+        7 => Some(VertexBaseType::Ub256),
+        _ => None,
+    }
+}
+
+/// Decode a `SET_VERTEX_DATA_ARRAY_FORMAT` register word into its
+/// `(base_type, count, stride, frequency)` fields.
+///
+/// Bit layout (RPCS3 `rsx::registers`): type = bits 0..3,
+/// count = bits 4..7, stride = bits 8..15, frequency = bits 16..31.
+/// Returns `None` when count is 0 (the attribute is disabled) or the
+/// type code is undefined.
+#[must_use]
+pub fn decode_vertex_format(word: u32) -> Option<(VertexBaseType, u8, u8, u16)> {
+    let count = ((word >> 4) & 0xF) as u8;
+    if count == 0 {
+        return None;
+    }
+    let base_type = vertex_base_type_from_code(word)?;
+    let stride = ((word >> 8) & 0xFF) as u8;
+    let frequency = ((word >> 16) & 0xFFFF) as u16;
+    Some((base_type, count, stride, frequency))
+}
+
+impl RsxState {
+    /// Read and decode vertex attribute `index` (0..16). Returns
+    /// `None` when the attribute is disabled (count 0) or its type
+    /// code is undefined.
+    #[must_use]
+    pub fn vertex_attribute(&self, index: u32) -> Option<VertexAttribute> {
+        if index >= VERTEX_ATTRIB_COUNT {
+            return None;
+        }
+        let fmt = self.read(VERTEX_DATA_ARRAY_FORMAT + index);
+        let (base_type, count, stride, frequency) = decode_vertex_format(fmt)?;
+        let offset = self.read(VERTEX_DATA_ARRAY_OFFSET + index);
+        Some(VertexAttribute { base_type, count, stride, frequency, offset })
+    }
+
+    /// Collect every enabled vertex attribute as `(index, attr)`.
+    #[must_use]
+    pub fn enabled_vertex_attributes(&self) -> Vec<(u32, VertexAttribute)> {
+        (0..VERTEX_ATTRIB_COUNT)
+            .filter_map(|i| self.vertex_attribute(i).map(|a| (i, a)))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,6 +665,81 @@ mod tests {
         // DRAW_ARRAYS with no open primitive → ignored.
         assert_eq!(t.process(DRAW_ARRAYS, 0x0300_0000), None);
         assert!(!t.in_primitive());
+    }
+
+    // ---- R12.6: vertex attribute format parsing ------------------
+
+    /// Build a SET_VERTEX_DATA_ARRAY_FORMAT word.
+    fn fmt(type_code: u32, count: u32, stride: u32, freq: u32) -> u32 {
+        (type_code & 0xF) | ((count & 0xF) << 4) | ((stride & 0xFF) << 8)
+            | ((freq & 0xFFFF) << 16)
+    }
+
+    #[test]
+    fn decode_vertex_format_fields() {
+        // type=2 (F), count=3, stride=12, freq=0.
+        let w = fmt(2, 3, 12, 0);
+        assert_eq!(
+            decode_vertex_format(w),
+            Some((VertexBaseType::F, 3, 12, 0))
+        );
+    }
+
+    #[test]
+    fn decode_vertex_format_disabled_when_count_zero() {
+        let w = fmt(2, 0, 12, 0);
+        assert_eq!(decode_vertex_format(w), None);
+    }
+
+    #[test]
+    fn decode_vertex_format_undefined_type_rejected() {
+        // type code 0 = undefined, but count != 0.
+        let w = fmt(0, 3, 12, 0);
+        assert_eq!(decode_vertex_format(w), None);
+    }
+
+    #[test]
+    fn vertex_base_type_code_table() {
+        assert_eq!(vertex_base_type_from_code(1), Some(VertexBaseType::S1));
+        assert_eq!(vertex_base_type_from_code(2), Some(VertexBaseType::F));
+        assert_eq!(vertex_base_type_from_code(4), Some(VertexBaseType::Ub));
+        assert_eq!(vertex_base_type_from_code(7), Some(VertexBaseType::Ub256));
+        assert_eq!(vertex_base_type_from_code(0), None);
+        assert_eq!(vertex_base_type_from_code(8), None);
+    }
+
+    #[test]
+    fn rsx_state_reads_vertex_attribute() {
+        let mut s = RsxState::new();
+        // attribute 2: F, count 4, stride 16; offset in main memory.
+        s.write(VERTEX_DATA_ARRAY_FORMAT + 2, fmt(2, 4, 16, 0));
+        s.write(VERTEX_DATA_ARRAY_OFFSET + 2, 0x8000_1000);
+        let a = s.vertex_attribute(2).unwrap();
+        assert_eq!(a.base_type, VertexBaseType::F);
+        assert_eq!(a.count, 4);
+        assert_eq!(a.stride, 16);
+        assert!(a.in_main_memory());
+        assert_eq!(a.byte_offset(), 0x1000);
+    }
+
+    #[test]
+    fn disabled_attribute_reads_none() {
+        let s = RsxState::new();
+        // nothing written → format word 0 → count 0 → disabled.
+        assert_eq!(s.vertex_attribute(0), None);
+        assert_eq!(s.vertex_attribute(16), None); // out of range
+    }
+
+    #[test]
+    fn enabled_vertex_attributes_filters() {
+        let mut s = RsxState::new();
+        s.write(VERTEX_DATA_ARRAY_FORMAT + 0, fmt(2, 3, 12, 0));
+        s.write(VERTEX_DATA_ARRAY_FORMAT + 5, fmt(4, 4, 4, 0));
+        let enabled = s.enabled_vertex_attributes();
+        assert_eq!(enabled.len(), 2);
+        assert_eq!(enabled[0].0, 0);
+        assert_eq!(enabled[1].0, 5);
+        assert_eq!(enabled[1].1.base_type, VertexBaseType::Ub);
     }
 
     #[test]
