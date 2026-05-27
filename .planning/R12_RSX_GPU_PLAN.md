@@ -80,6 +80,27 @@ writes → `RsxState` register file + `MethodEffect` control events +
 crates; workspace gate 270 result blocks, 0 fail. Fully testable
 without a GPU — the natural shape of a GCM-stream replay oracle.
 
+## Validation status — Camada B (resource descriptors) CLOSED 2026-05-27
+
+| Slice | Commit | Scope |
+|---|---|---|
+| R12.6 | `a026382a6` | vertex attribute format parsing — `decode_vertex_format`, `VertexAttribute`, `RsxState::vertex_attribute` |
+| R12.7 | `93b6eb725` | index buffer descriptor — `IndexType`, `IndexArray`, `RsxState::index_array` |
+| R12.8 | `abbc94ffa` | texture descriptor (parse only) — `TextureDescriptor`, `RsxState::texture`/`texture_enabled` |
+| R12.9 | `c66df45b6` | surface / render-target descriptor — `SurfaceTargets`, `SurfaceDescriptor`, `RsxState::surface` |
+
+**Result:** the `RsxState` register file now decodes into every
+structured resource a draw references — vertex attributes, index
+buffer, textures (16 units), surfaces (MRT + zeta). All pure
+register-word transforms, `None`/empty for disabled state, each
+with FIFO-pipeline integration tests. 39 `rpcs3-rsx-state` lib
+tests; workspace gate 270, 0 fail. The descriptors are the input
+a future GPU backend (Camada E) would consume, and are themselves
+behavior-freezable from a captured GCM stream.
+
+Texture *format classification* and *pixel decode* (vs the
+structural parse here) remain in Camada D.
+
 ## Deferred — the GPU-backend giant tail (out of near-term scope)
 
 These need an actual GPU backend and are months of work; they do
