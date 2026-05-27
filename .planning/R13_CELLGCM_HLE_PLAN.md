@@ -48,6 +48,36 @@ broad RSX/PRX setup:
    sets up, so the homebrew's inline command writes land somewhere
    EmuCore can read via R12.11a's `capture_command_buffer`.
 
+## R13.1 — first concrete target (located 2026-05-27)
+
+Disassembly of the fault: at CIA `0x12784` rsxInit executes
+`std r8, 0(r9)` with **r9 = 0** — a null store. r9 should hold a
+pointer that an earlier `cellGcmSys` import was supposed to produce.
+
+The probe's import-stub map shows rsxInit called two cellGcmSys PRX
+imports, both returning 0 via R9's unimplemented-import fast path
+(this path ignores `permissive_unknown_syscalls`):
+
+| NID | trampoline | args at call | likely fn |
+|---|---|---|---|
+| `0x15bae46b` | 0xd0010000 | r3=0x10300000, r4=0x10000 | **cellGcmInitBody** (context, cmdSize, …) |
+| `0xe315a0b2` | 0xd0010030 | r3=0x10300014, r4=0x10000 | second init call (config/default-cmd-buffer) |
+
+So R13.1 = implement these two NID handlers in `EmuCore`:
+`cellGcmInitBody` must set up the `gcmContextData` (begin/end/
+current/callback — layout known from R12.11b), allocate the command
+buffer + IO region in guest memory, and populate the config +
+control-register structs so rsxInit's subsequent stores land on a
+valid pointer (r9 != 0). Then re-run → next gap.
+
+Note: the cellGcmSys functions ARE PRX NID imports (resolved via R9's
+import-stub mechanism), not static — the `rsx*` wrappers are static
+but they call through to these `cellGcm*` PRX exports.
+
+Risk: faithfully reproducing the exact struct layouts + memory
+addresses PSL1GHT expects is iterative — a wrong field offset →
+another downstream fault. Each re-run pins the next.
+
 ## Proposed slice decomposition (R9.1g-style iterative)
 
 - **R13.1** — make the cellGcmSys PRX call resolve (fix the null
