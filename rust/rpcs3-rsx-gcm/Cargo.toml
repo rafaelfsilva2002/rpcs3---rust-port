@@ -1,0 +1,21 @@
+[package]
+name = "rpcs3-rsx-gcm"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RSX/GCM command-buffer builder — Rust port of the libgcm command-emission layer (gcmSetSurface / rsxClearSurface / rsxDrawArrays / ...). Emits NV4097/NV406E method words into a command buffer; the producer half that pairs with rpcs3-rsx-fifo's decoder."
+
+[lib]
+name = "rpcs3_rsx_gcm"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[dev-dependencies]
+# round-trip oracle: emit via GcmContext → decode via replay_gcm.
+rpcs3-rsx-state = { path = "../rpcs3-rsx-state" }
+
+[lints]
+workspace = true

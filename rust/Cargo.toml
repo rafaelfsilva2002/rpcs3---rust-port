@@ -230,6 +230,7 @@ members = [
     "rpcs3-perf-monitor",
     "rpcs3-rsx-fifo",
     "rpcs3-rsx-state",
+    "rpcs3-rsx-gcm",
     "rpcs3-rsx-vertex-data",
     "rpcs3-rsx-texture-cache-types",
     "rpcs3-rsx-gl-decompiler",
