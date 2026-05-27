@@ -78,6 +78,40 @@ Risk: faithfully reproducing the exact struct layouts + memory
 addresses PSL1GHT expects is iterative — a wrong field offset →
 another downstream fault. Each re-run pins the next.
 
+## R13.1 status — BLOCKED on tooling + source (2026-05-27)
+
+Attempted the implementation grind. Hit a real wall on two fronts:
+
+1. **cellGcmInitBody is firmware-PRX behavior with no source in our
+   tree.** It's not in the homebrew ELF (it's a PRX import resolved
+   from PS3 firmware), and the RPCS3 C++ reimplementation
+   (`cellGcmSys.cpp`) is NOT in `rpcs3-upstream-clean/`. So its exact
+   guest-memory/struct setup (where the command buffer lands, the
+   gcmConfiguration layout, the control-register placement, what
+   `*context` points at) must be reverse-engineered from rsxInit's
+   expectations or obtained from the RPCS3 source. Guessing the
+   struct offsets would just move the fault downstream silently —
+   worse than an honest stop.
+2. **The Docker→output capture is unreliable in this session.** The
+   `.self` *builds* land on the host fine, but `objdump` disassembly
+   (redirected to the mount OR piped to stdout) comes back empty
+   through the harness — only one small early window ever captured.
+   The disassembly-driven RE this grind needs can't iterate reliably
+   here.
+
+**To unblock R13 (either path):**
+- Provide / locate the RPCS3 `cellGcmSys.cpp` (or the PSL1GHT
+  `libgcm_sys` source) so cellGcmInitBody's behavior is known
+  exactly, OR
+- A working disassembly path (e.g. run `objdump -d` outside the
+  harness and paste the rsxInit window, or a host-side ppu objdump)
+  to RE rsxInit's expectations of the cellGcm returns.
+
+What IS known + committed: the blocker is precisely
+`cellGcmInitBody` (NID 0x15bae46b) + the second init call
+(0xe315a0b2) returning 0 → null store at CIA 0x12784 (`std r8,
+0(r9)`, r9=0). The probe + fixture are committed and reproduce it.
+
 ## Proposed slice decomposition (R9.1g-style iterative)
 
 - **R13.1** — make the cellGcmSys PRX call resolve (fix the null
