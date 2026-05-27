@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-rsx-state"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of the RSX method register file (rpcs3/Emu/RSX/rsx_methods) — the ~0x4000-entry method address space written by the FIFO command stream, with typed accessors for common NV4097 register groups."
+
+[lib]
+name = "rpcs3_rsx_state"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-rsx-fifo = { path = "../rpcs3-rsx-fifo" }
+
+[lints]
+workspace = true
