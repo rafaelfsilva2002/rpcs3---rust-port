@@ -1726,6 +1726,72 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                 // thread in-order interpreter needs no action.
                 598 | 854 => {}
 
+                // ---- R11.8: atomic (single-thread reservation) -----
+                // Single PPU: a reservation can never be broken by
+                // another thread, so the store-conditional always
+                // succeeds. lwarx/ldarx just load; stwcx./stdcx. store
+                // and set CR0 = {0, 0, EQ=1, SO}.
+                20 => {
+                    // lwarx rt, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    ppu.gpr[op.rd() as usize] = mem_read_u32_be(mem, ea)? as u64;
+                }
+                84 => {
+                    // ldarx rt, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    ppu.gpr[op.rd() as usize] = mem_read_u64_be(mem, ea)?;
+                }
+                150 => {
+                    // stwcx. rs, ra, rb — always succeeds single-thread.
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    mem_write_u32_be(mem, ea, ppu.gpr[op.rs() as usize] as u32)?;
+                    ppu.cr.0[0] = 0;
+                    ppu.cr.0[1] = 0;
+                    ppu.cr.0[2] = 1; // EQ → success
+                    ppu.cr.0[3] = u8::from(ppu.xer.so);
+                }
+                214 => {
+                    // stdcx. rs, ra, rb — always succeeds single-thread.
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    mem_write_u64_be(mem, ea, ppu.gpr[op.rs() as usize])?;
+                    ppu.cr.0[0] = 0;
+                    ppu.cr.0[1] = 0;
+                    ppu.cr.0[2] = 1;
+                    ppu.cr.0[3] = u8::from(ppu.xer.so);
+                }
+
+                // ---- R11.8: time base + MSR (stubs) ----------------
+                371 => {
+                    // mftb rt, TBR — time base read. We have no real
+                    // clock; return 0 (documented stub). TBR field
+                    // (268=TBL, 269=TBU) is ignored.
+                    ppu.gpr[op.rd() as usize] = 0;
+                }
+                83 => {
+                    // mfmsr rt — supervisor; return 0 (user-mode stub).
+                    ppu.gpr[op.rd() as usize] = 0;
+                }
+                146 | 178 => {
+                    // mtmsr / mtmsrd — supervisor; no-op in user mode.
+                }
+
+                // ---- R11.8: cache hints (no-ops) + dcbz ------------
+                // dcbt/dcbtst/dcbst/dcbf/icbi/dcbi/dcba are hints with
+                // no architecturally-visible effect for our model.
+                54 | 86 | 246 | 278 | 470 | 758 | 982 => {}
+                1014 => {
+                    // dcbz ra, rb — zero a 128-byte cache block (Cell
+                    // BE line size) at the block-aligned EA.
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32 & !127;
+                    let zeros = [0u8; 128];
+                    mem.write(ea, &zeros).map_err(Error::from)?;
+                }
+
                 _ => {
                     return Err(Error::Unimplemented {
                         inst,
@@ -3615,6 +3681,22 @@ pub mod encode {
     /// `eieio` (primary 31, XO 854).
     #[must_use]
     pub const fn eieio() -> u32 { xo31_dar(0, 0, 0, 854) }
+
+    // -- R11.8: atomic / time-base / cache ------------------------
+    /// `lwarx rt, ra, rb`. #[must_use]
+    pub const fn lwarx(rt: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rt, ra, rb, 20) }
+    /// `ldarx rt, ra, rb`. #[must_use]
+    pub const fn ldarx(rt: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rt, ra, rb, 84) }
+    /// `stwcx. rs, ra, rb`. #[must_use]
+    pub const fn stwcx(rs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rs, ra, rb, 150) | 1 }
+    /// `stdcx. rs, ra, rb`. #[must_use]
+    pub const fn stdcx(rs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(rs, ra, rb, 214) | 1 }
+    /// `mftb rt` (TBR ignored). #[must_use]
+    pub const fn mftb(rt: u32) -> u32 { xo31_dar(rt, 0, 0, 371) }
+    /// `dcbz ra, rb`. #[must_use]
+    pub const fn dcbz(ra: u32, rb: u32) -> u32 { xo31_dar(0, ra, rb, 1014) }
+    /// `dcbt ra, rb`. #[must_use]
+    pub const fn dcbt(ra: u32, rb: u32) -> u32 { xo31_dar(0, ra, rb, 278) }
 
     // -- R11.5: load/store multiple + string ----------------------
 
@@ -7121,5 +7203,57 @@ mod tests {
         step_ok(&mut ppu, &mut mem);
         // result word 0 = -6.
         assert_eq!(split_lanes(ppu.vr[3])[0] as i32, -6);
+    }
+
+    // ---- R11.8: atomic / time-base / cache ------------------------
+
+    #[test]
+    fn lwarx_stwcx_succeeds_single_thread() {
+        let prog = [encode::lwarx(3, 0, 4), encode::stwcx(5, 0, 4)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        alloc_data(&mut mem, DATA_BASE);
+        ppu.gpr[4] = DATA_BASE as u64;
+        mem_write_u32_be(&mut mem, DATA_BASE, 0x0000_0042).unwrap();
+        ppu.gpr[5] = 0x99;
+        step_ok(&mut ppu, &mut mem); // lwarx → r3 = 0x42
+        assert_eq!(ppu.gpr[3], 0x42);
+        step_ok(&mut ppu, &mut mem); // stwcx. → success
+        // CR0.EQ (bit 2) set.
+        assert_eq!(ppu.cr.0[2], 1);
+        assert_eq!(mem_read_u32_be(&mem, DATA_BASE).unwrap(), 0x99);
+    }
+
+    #[test]
+    fn mftb_returns_stub_zero() {
+        let prog = [encode::mftb(3)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.gpr[3] = 0xDEAD;
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.gpr[3], 0);
+    }
+
+    #[test]
+    fn dcbz_zeroes_block() {
+        let prog = [encode::dcbz(0, 4)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        alloc_data(&mut mem, DATA_BASE);
+        // fill with non-zero, then dcbz the 128-byte block.
+        for i in 0..128u32 {
+            mem_write_u8(&mut mem, DATA_BASE + i, 0xFF).unwrap();
+        }
+        ppu.gpr[4] = DATA_BASE as u64;
+        step_ok(&mut ppu, &mut mem);
+        for i in 0..128u32 {
+            assert_eq!(mem_read_u8(&mem, DATA_BASE + i).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn dcbt_is_noop() {
+        let prog = [encode::dcbt(0, 4)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.gpr[4] = DATA_BASE as u64;
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.cia, PROG_BASE + 4); // advanced, no fault
     }
 }
