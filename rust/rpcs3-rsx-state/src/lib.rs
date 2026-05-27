@@ -81,6 +81,41 @@ pub const VIEWPORT_HORIZONTAL: u32 = 0x0A00 >> 2;
 /// `NV4097_SET_VIEWPORT_VERTICAL` (0x0A04).
 pub const VIEWPORT_VERTICAL: u32 = 0x0A04 >> 2;
 
+// Surface / render-target registers (byte offsets from RPCS3
+// rsx_methods.h, cross-checked):
+//   NV4097_SET_SURFACE_FORMAT        0x0208
+//   NV4097_SET_SURFACE_COLOR_AOFFSET 0x0210
+//   NV4097_SET_SURFACE_PITCH_A       0x0218 (interleaved with offsets)
+//   NV4097_SET_SURFACE_COLOR_TARGET  0x0220
+//   NV4097_SET_SURFACE_ZETA_OFFSET   0x0214
+//   NV4097_SET_SURFACE_PITCH_Z       0x022C
+//   NV4097_SET_SURFACE_COLOR_BOFFSET 0x0230
+//   NV4097_SET_SURFACE_COLOR_C/DOFFSET 0x0280 / 0x0284
+/// `SET_SURFACE_FORMAT` (0x0208) — color/depth format + AA + type.
+pub const SURFACE_FORMAT: u32 = 0x0208 >> 2;
+/// `SET_SURFACE_COLOR_TARGET` (0x0220) — active MRT slot mask.
+pub const SURFACE_COLOR_TARGET: u32 = 0x0220 >> 2;
+/// `SET_SURFACE_COLOR_AOFFSET` (0x0210).
+pub const SURFACE_COLOR_A_OFFSET: u32 = 0x0210 >> 2;
+/// `SET_SURFACE_PITCH_A` (0x0218).
+pub const SURFACE_PITCH_A: u32 = 0x0218 >> 2;
+/// `SET_SURFACE_COLOR_BOFFSET` (0x0230).
+pub const SURFACE_COLOR_B_OFFSET: u32 = 0x0230 >> 2;
+/// `SET_SURFACE_PITCH_B` (0x0234).
+pub const SURFACE_PITCH_B: u32 = 0x0234 >> 2;
+/// `SET_SURFACE_COLOR_COFFSET` (0x0280).
+pub const SURFACE_COLOR_C_OFFSET: u32 = 0x0280 >> 2;
+/// `SET_SURFACE_PITCH_C` (0x0288).
+pub const SURFACE_PITCH_C: u32 = 0x0288 >> 2;
+/// `SET_SURFACE_COLOR_DOFFSET` (0x0284).
+pub const SURFACE_COLOR_D_OFFSET: u32 = 0x0284 >> 2;
+/// `SET_SURFACE_PITCH_D` (0x028C).
+pub const SURFACE_PITCH_D: u32 = 0x028C >> 2;
+/// `SET_SURFACE_ZETA_OFFSET` (0x0214).
+pub const SURFACE_ZETA_OFFSET: u32 = 0x0214 >> 2;
+/// `SET_SURFACE_PITCH_Z` (0x022C).
+pub const SURFACE_PITCH_Z: u32 = 0x022C >> 2;
+
 // -- NV406E (DMA channel) control methods (R12.4) --------------------
 /// `NV406E_SET_REFERENCE` (0x0050).
 pub const SET_REFERENCE: u32 = 0x0050 >> 2;
@@ -638,6 +673,95 @@ impl RsxState {
     }
 }
 
+// =====================================================================
+// R12.9 — surface / render-target descriptor (Camada B)
+// =====================================================================
+
+/// Which MRT color slots a draw renders to (`SET_SURFACE_COLOR_TARGET`).
+/// The hardware encodes a small enum, not a free bitmask: 0=none,
+/// 1=A, 2=B, 3=A+B, 4=A+B+C, 5=A+B+C+D.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceTargets(pub u32);
+
+impl SurfaceTargets {
+    /// Number of active color targets (0..=4).
+    #[must_use]
+    pub fn active_count(self) -> u32 {
+        match self.0 {
+            0 => 0,
+            1 | 2 => 1,
+            3 => 2,
+            4 => 3,
+            5 => 4,
+            // Unknown codes: treat conservatively as none.
+            _ => 0,
+        }
+    }
+
+    /// Whether color slot `i` (0=A..3=D) is active.
+    #[must_use]
+    pub fn is_active(self, i: u32) -> bool {
+        i < self.active_count()
+    }
+}
+
+/// A parsed surface / render-target binding. Format fields are kept
+/// as their raw register sub-fields; full format → API enum mapping
+/// belongs to the deferred backend layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceDescriptor {
+    /// Color format code (`SET_SURFACE_FORMAT` bits 0..4).
+    pub color_format: u8,
+    /// Depth/stencil format code (bits 5..7).
+    pub depth_format: u8,
+    /// Antialias mode (bits 12..15).
+    pub antialias: u8,
+    /// Which MRT slots are active.
+    pub targets: SurfaceTargets,
+    /// Per-slot color buffer byte offsets [A, B, C, D].
+    pub color_offset: [u32; 4],
+    /// Per-slot color buffer pitches [A, B, C, D].
+    pub color_pitch: [u32; 4],
+    /// Depth/stencil (zeta) buffer byte offset.
+    pub zeta_offset: u32,
+    /// Depth/stencil pitch.
+    pub zeta_pitch: u32,
+    /// Render-target clip `(width, height)` from the surface-clip
+    /// registers.
+    pub clip: (u16, u16),
+}
+
+impl RsxState {
+    /// Parse the current surface / render-target binding.
+    #[must_use]
+    pub fn surface(&self) -> SurfaceDescriptor {
+        let fmt = self.read(SURFACE_FORMAT);
+        let (_, w) = self.surface_clip_horizontal();
+        let (_, h) = self.surface_clip_vertical();
+        SurfaceDescriptor {
+            color_format: (fmt & 0x1F) as u8,
+            depth_format: ((fmt >> 5) & 0x7) as u8,
+            antialias: ((fmt >> 12) & 0xF) as u8,
+            targets: SurfaceTargets(self.read(SURFACE_COLOR_TARGET)),
+            color_offset: [
+                self.read(SURFACE_COLOR_A_OFFSET),
+                self.read(SURFACE_COLOR_B_OFFSET),
+                self.read(SURFACE_COLOR_C_OFFSET),
+                self.read(SURFACE_COLOR_D_OFFSET),
+            ],
+            color_pitch: [
+                self.read(SURFACE_PITCH_A),
+                self.read(SURFACE_PITCH_B),
+                self.read(SURFACE_PITCH_C),
+                self.read(SURFACE_PITCH_D),
+            ],
+            zeta_offset: self.read(SURFACE_ZETA_OFFSET),
+            zeta_pitch: self.read(SURFACE_PITCH_Z),
+            clip: (w, h),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1021,6 +1145,72 @@ mod tests {
         assert_eq!(t.mipmap_levels, 5);
         // unit 0 untouched → disabled.
         assert_eq!(s.texture(0), None);
+    }
+
+    // ---- R12.9: surface / render-target descriptor ---------------
+
+    #[test]
+    fn surface_targets_active_count() {
+        assert_eq!(SurfaceTargets(0).active_count(), 0);
+        assert_eq!(SurfaceTargets(1).active_count(), 1); // A
+        assert_eq!(SurfaceTargets(3).active_count(), 2); // A+B
+        assert_eq!(SurfaceTargets(5).active_count(), 4); // A+B+C+D
+        assert!(SurfaceTargets(5).is_active(3));
+        assert!(!SurfaceTargets(3).is_active(2));
+    }
+
+    #[test]
+    fn surface_format_subfields() {
+        let mut s = RsxState::new();
+        // color format 0x08, depth format 0x2 (bits 5..7), AA 0x3.
+        let fmt = 0x08 | (0x2 << 5) | (0x3 << 12);
+        s.write(SURFACE_FORMAT, fmt);
+        let d = s.surface();
+        assert_eq!(d.color_format, 0x08);
+        assert_eq!(d.depth_format, 0x2);
+        assert_eq!(d.antialias, 0x3);
+    }
+
+    #[test]
+    fn surface_offsets_and_pitches_per_slot() {
+        let mut s = RsxState::new();
+        s.write(SURFACE_COLOR_A_OFFSET, 0x1000);
+        s.write(SURFACE_COLOR_B_OFFSET, 0x2000);
+        s.write(SURFACE_PITCH_A, 0x500);
+        s.write(SURFACE_PITCH_B, 0x500);
+        s.write(SURFACE_ZETA_OFFSET, 0x9000);
+        s.write(SURFACE_PITCH_Z, 0x500);
+        s.write(SURFACE_COLOR_TARGET, 3); // A+B
+        let d = s.surface();
+        assert_eq!(d.color_offset[0], 0x1000);
+        assert_eq!(d.color_offset[1], 0x2000);
+        assert_eq!(d.color_pitch[0], 0x500);
+        assert_eq!(d.zeta_offset, 0x9000);
+        assert_eq!(d.targets.active_count(), 2);
+    }
+
+    #[test]
+    fn surface_clip_feeds_descriptor() {
+        let mut s = RsxState::new();
+        s.write(SURFACE_CLIP_HORIZONTAL, 1280u32 << 16);
+        s.write(SURFACE_CLIP_VERTICAL, 720u32 << 16);
+        let d = s.surface();
+        assert_eq!(d.clip, (1280, 720));
+    }
+
+    #[test]
+    fn surface_from_fifo_pipeline() {
+        // increment run setting FORMAT then COLOR_TARGET (adjacent?
+        // no — use two single writes via non-adjacent regs).
+        let h_fmt = (1 << 18) | (SURFACE_FORMAT << 2);
+        let h_tgt = (1 << 18) | (SURFACE_COLOR_TARGET << 2);
+        let buf = words(&[h_fmt, 0x05, h_tgt, 5]);
+        let mut eng = FifoEngine::new(0, 16);
+        let mut s = RsxState::new();
+        s.run_and_apply(&mut eng, &buf).unwrap();
+        let d = s.surface();
+        assert_eq!(d.color_format, 0x05);
+        assert_eq!(d.targets.active_count(), 4);
     }
 
     #[test]
