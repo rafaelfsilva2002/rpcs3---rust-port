@@ -71,6 +71,10 @@ behavior-freeze/fixtures/spu/sources/*/*.bin
 behavior-freeze/fixtures/lv2/sources/*/*.elf
 behavior-freeze/fixtures/lv2/sources/*/*.self
 
+# R12.11b — RSX (PPU-only) command-capture fixtures, same convention.
+behavior-freeze/fixtures/rsx/sources/*/*.elf
+behavior-freeze/fixtures/rsx/sources/*/*.self
+
 # =============================================================================
 # Original upstream .gitignore patterns below
 # =============================================================================
@@ -145,6 +149,7 @@ Makefile
 # `Makefile` rule for them. (Comment at line 58 documents the intent.)
 !behavior-freeze/fixtures/spu/sources/*/Makefile
 !behavior-freeze/fixtures/lv2/sources/*/Makefile
+!behavior-freeze/fixtures/rsx/sources/*/Makefile
 *CMakeFiles*
 CMakeCache.txt
 *cmake_install.cmake*

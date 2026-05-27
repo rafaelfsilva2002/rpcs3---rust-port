@@ -30,5 +30,10 @@ rpcs3-lv2-lwmutex      = { path = "../rpcs3-lv2-lwmutex" }
 rpcs3-lv2-event        = { path = "../rpcs3-lv2-event" }
 rpcs3-lv2-cond         = { path = "../rpcs3-lv2-cond" }
 
+[dev-dependencies]
+# R12.11b — decode the captured RSX command stream from the gcm
+# fixture's TTY dump.
+rpcs3-rsx-state = { path = "../rpcs3-rsx-state" }
+
 [lints]
 workspace = true
