@@ -405,6 +405,55 @@ fn vec_u32<F: Fn(u32, u32) -> u32>(a: u128, b: u128, f: F) -> u128 {
     ])
 }
 
+// VMX compare lane mappers (R11.6c): each lane becomes all-ones when
+// the predicate holds, else all-zeros. Returns (result, all_true,
+// all_false) so the record (`.`) form can update CR6.
+#[inline]
+fn vcmp_u8<F: Fn(u8, u8) -> bool>(a: u128, b: u128, f: F) -> (u128, bool, bool) {
+    let a = a.to_be_bytes();
+    let b = b.to_be_bytes();
+    let (mut o, mut allt, mut allf) = ([0u8; 16], true, true);
+    for i in 0..16 {
+        if f(a[i], b[i]) {
+            o[i] = 0xFF;
+            allf = false;
+        } else {
+            allt = false;
+        }
+    }
+    (u128::from_be_bytes(o), allt, allf)
+}
+
+#[inline]
+fn vcmp_u16<F: Fn(u16, u16) -> bool>(a: u128, b: u128, f: F) -> (u128, bool, bool) {
+    let a = a.to_be_bytes();
+    let b = b.to_be_bytes();
+    let (mut o, mut allt, mut allf) = ([0u8; 16], true, true);
+    for i in 0..8 {
+        let av = u16::from_be_bytes([a[i * 2], a[i * 2 + 1]]);
+        let bv = u16::from_be_bytes([b[i * 2], b[i * 2 + 1]]);
+        let m = if f(av, bv) { allf = false; 0xFFFF } else { allt = false; 0 };
+        o[i * 2..i * 2 + 2].copy_from_slice(&(m as u16).to_be_bytes());
+    }
+    (u128::from_be_bytes(o), allt, allf)
+}
+
+#[inline]
+fn vcmp_u32<F: Fn(u32, u32) -> bool>(a: u128, b: u128, f: F) -> (u128, bool, bool) {
+    let la = split_lanes(a);
+    let lb = split_lanes(b);
+    let (mut o, mut allt, mut allf) = ([0u32; 4], true, true);
+    for i in 0..4 {
+        if f(la[i], lb[i]) {
+            o[i] = 0xFFFF_FFFF;
+            allf = false;
+        } else {
+            allt = false;
+        }
+    }
+    (join_lanes(o), allt, allf)
+}
+
 // =====================================================================
 // Effective-address computation for D-form and DS-form loads/stores
 // =====================================================================
@@ -2378,6 +2427,44 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                     ppu.cia = cia.wrapping_add(4);
                     return Ok(StepOutcome::Continue);
                 }
+                // ---- R11.6c: VMX compares (eq + gt, u/s) -----------
+                // VXR-form: Rc is bit 21 (LSB 10, mask 0x400). The
+                // record form (`.`) also writes CR6 = {all_true, 0,
+                // all_false, 0}. Strip the Rc bit to get the base XO.
+                6 | 70 | 134 | 518 | 582 | 646 | 774 | 838 | 902
+                | 1030 | 1094 | 1158 | 1542 | 1606 | 1670 | 1798
+                | 1862 | 1926 => {
+                    let a = ppu.vr[op.va() as usize];
+                    let b = ppu.vr[op.vb() as usize];
+                    let base = xo11 & !0x400;
+                    let rc = xo11 & 0x400 != 0;
+                    let (r, allt, allf) = match base {
+                        // equal
+                        6 => vcmp_u8(a, b, |x, y| x == y),
+                        70 => vcmp_u16(a, b, |x, y| x == y),
+                        134 => vcmp_u32(a, b, |x, y| x == y),
+                        // unsigned greater-than
+                        518 => vcmp_u8(a, b, |x, y| x > y),
+                        582 => vcmp_u16(a, b, |x, y| x > y),
+                        646 => vcmp_u32(a, b, |x, y| x > y),
+                        // signed greater-than
+                        774 => vcmp_u8(a, b, |x, y| (x as i8) > (y as i8)),
+                        838 => vcmp_u16(a, b, |x, y| (x as i16) > (y as i16)),
+                        902 => vcmp_u32(a, b, |x, y| (x as i32) > (y as i32)),
+                        _ => unreachable!(),
+                    };
+                    ppu.vr[op.vd() as usize] = r;
+                    if rc {
+                        // CR6 = CR field 6 → cr.0[24..28].
+                        ppu.cr.0[24] = u8::from(allt);
+                        ppu.cr.0[25] = 0;
+                        ppu.cr.0[26] = u8::from(allf);
+                        ppu.cr.0[27] = 0;
+                    }
+                    ppu.cia = cia.wrapping_add(4);
+                    return Ok(StepOutcome::Continue);
+                }
+
                 // ---- R11.6b: VMX min/max (unsigned + signed) -------
                 2 | 66 | 130 | 258 | 322 | 386
                 | 514 | 578 | 642 | 770 | 834 | 898 => {
@@ -3575,6 +3662,56 @@ pub mod encode {
     /// `vminsw`.
     #[must_use]
     pub const fn vminsw(vd: u32, va: u32, vb: u32) -> u32 { vx_form(898, vd, va, vb) }
+
+    // -- R11.6c: VMX compares (VXR-form; `record` sets Rc/CR6) -----
+    const fn vcr_form(xo: u32, vd: u32, va: u32, vb: u32, record: bool) -> u32 {
+        vx_form(xo, vd, va, vb) | if record { 0x400 } else { 0 }
+    }
+    /// `vcmpequb[.]`.
+    #[must_use]
+    pub const fn vcmpequb(vd: u32, va: u32, vb: u32, record: bool) -> u32 {
+        vcr_form(6, vd, va, vb, record)
+    }
+    /// `vcmpequh[.]`.
+    #[must_use]
+    pub const fn vcmpequh(vd: u32, va: u32, vb: u32, record: bool) -> u32 {
+        vcr_form(70, vd, va, vb, record)
+    }
+    /// `vcmpequw[.]`.
+    #[must_use]
+    pub const fn vcmpequw(vd: u32, va: u32, vb: u32, record: bool) -> u32 {
+        vcr_form(134, vd, va, vb, record)
+    }
+    /// `vcmpgtub[.]`.
+    #[must_use]
+    pub const fn vcmpgtub(vd: u32, va: u32, vb: u32, record: bool) -> u32 {
+        vcr_form(518, vd, va, vb, record)
+    }
+    /// `vcmpgtuh[.]`.
+    #[must_use]
+    pub const fn vcmpgtuh(vd: u32, va: u32, vb: u32, record: bool) -> u32 {
+        vcr_form(582, vd, va, vb, record)
+    }
+    /// `vcmpgtuw[.]`.
+    #[must_use]
+    pub const fn vcmpgtuw(vd: u32, va: u32, vb: u32, record: bool) -> u32 {
+        vcr_form(646, vd, va, vb, record)
+    }
+    /// `vcmpgtsb[.]`.
+    #[must_use]
+    pub const fn vcmpgtsb(vd: u32, va: u32, vb: u32, record: bool) -> u32 {
+        vcr_form(774, vd, va, vb, record)
+    }
+    /// `vcmpgtsh[.]`.
+    #[must_use]
+    pub const fn vcmpgtsh(vd: u32, va: u32, vb: u32, record: bool) -> u32 {
+        vcr_form(838, vd, va, vb, record)
+    }
+    /// `vcmpgtsw[.]`.
+    #[must_use]
+    pub const fn vcmpgtsw(vd: u32, va: u32, vb: u32, record: bool) -> u32 {
+        vcr_form(902, vd, va, vb, record)
+    }
 
     /// `vperm vD, vA, vB, vC` — byte permutation (VA-form 6-bit XO = 43).
     #[must_use]
@@ -5930,5 +6067,75 @@ mod tests {
             0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80]);
         step_ok(&mut ppu, &mut mem);
         assert_eq!(ppu.vr[3], ppu.vr[5]);
+    }
+
+    // ---- R11.6c: VMX compares -------------------------------------
+
+    #[test]
+    fn vcmpequb_sets_per_byte_mask() {
+        let prog = [encode::vcmpequb(3, 4, 5, false)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        let mut a = [0u8; 16];
+        let mut b = [0u8; 16];
+        a[0] = 0xAA; b[0] = 0xAA; // equal → 0xFF
+        a[1] = 0x11; b[1] = 0x22; // differ → 0x00
+        ppu.vr[4] = u128::from_be_bytes(a);
+        ppu.vr[5] = u128::from_be_bytes(b);
+        step_ok(&mut ppu, &mut mem);
+        let out = ppu.vr[3].to_be_bytes();
+        assert_eq!(out[0], 0xFF);
+        assert_eq!(out[1], 0x00);
+    }
+
+    #[test]
+    fn vcmpequw_all_equal_sets_cr6_when_record() {
+        let prog = [encode::vcmpequw(3, 4, 5, true)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = join_lanes([7, 7, 7, 7]);
+        ppu.vr[5] = join_lanes([7, 7, 7, 7]);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.vr[3], join_lanes([0xFFFF_FFFF; 4]));
+        // CR6: all_true=1, all_false=0.
+        assert_eq!(ppu.cr.0[24], 1);
+        assert_eq!(ppu.cr.0[26], 0);
+    }
+
+    #[test]
+    fn vcmpequw_none_equal_sets_cr6_all_false() {
+        let prog = [encode::vcmpequw(3, 4, 5, true)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = join_lanes([1, 2, 3, 4]);
+        ppu.vr[5] = join_lanes([9, 9, 9, 9]);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.vr[3], 0);
+        assert_eq!(ppu.cr.0[24], 0); // not all true
+        assert_eq!(ppu.cr.0[26], 1); // all false
+    }
+
+    #[test]
+    fn vcmpgtsw_signed_greater() {
+        let prog = [encode::vcmpgtsw(3, 4, 5, false)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = join_lanes([5, 0, 0xFFFF_FFFF, 100]); // [5,0,-1,100]
+        ppu.vr[5] = join_lanes([3, 0, 0xFFFF_FFFE, 200]); // [3,0,-2,200]
+        step_ok(&mut ppu, &mut mem);
+        // 5>3 T, 0>0 F, -1>-2 T, 100>200 F
+        assert_eq!(ppu.vr[3], join_lanes([0xFFFF_FFFF, 0, 0xFFFF_FFFF, 0]));
+    }
+
+    #[test]
+    fn vcmpgtub_unsigned_greater() {
+        let prog = [encode::vcmpgtub(3, 4, 5, false)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        let mut a = [0u8; 16];
+        let mut b = [0u8; 16];
+        a[0] = 0x80; b[0] = 0x10; // unsigned 128 > 16 → T
+        a[1] = 0x10; b[1] = 0x80; // 16 > 128 → F
+        ppu.vr[4] = u128::from_be_bytes(a);
+        ppu.vr[5] = u128::from_be_bytes(b);
+        step_ok(&mut ppu, &mut mem);
+        let out = ppu.vr[3].to_be_bytes();
+        assert_eq!(out[0], 0xFF);
+        assert_eq!(out[1], 0x00);
     }
 }
