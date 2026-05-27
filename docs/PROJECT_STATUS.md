@@ -1,4 +1,19 @@
-# Project Status — R12 RSX command/state layer landed (FIFO decode → engine → method register file → dispatch/effects → draw-call recognition; 2 new crates; 270 release blocks; 0 regression)
+# Project Status — R12 RSX pure-pipeline CLOSED (command/state + resource descriptors + GCM replay oracles across all 3 provenance tiers incl. real PSL1GHT-libgcm capture; 3 RSX crates; 274 release blocks; 0 regression)
+
+> **R12 RSX wave (pure pipeline) closed 2026-05-27.** Deterministic
+> triangle: `rpcs3-rsx-gcm` (emit) → bytes → `rpcs3-rsx-fifo` (decode)
+> → `rpcs3-rsx-state` (`replay_gcm` → `RsxSnapshot` w/ descriptors,
+> effects, draw calls). Validated across three provenance tiers:
+> R12.10a authored golden (`7e8b4cd9d`), R12.10b emitted/producer-side
+> via `GcmContext` (`b57839b75`), R12.11b **real PSL1GHT-libgcm**
+> capture (`5035127f1`) — a CC0 fixture's real `rsxClearSurface` runs
+> in `EmuCore::run_self`, dumps via `sysTtyWrite`, and `replay_gcm`
+> decodes `ClearSurface(0xF3)`. Earlier slices: R12.1-5 command/state
+> core, R12.6-9 resource descriptors (vertex/index/texture/surface).
+> **Next advance (separate sub-wave):** gcmInitDefault + draw + flip
+> needs a cellGcm HLE / RSX memory setup. **Deferred giant tail
+> (need GPU, not behavior-freezable):** shader decompile, texture
+> pixel-decode, Vulkan/GL backend. See `.planning/R12_RSX_GPU_PLAN.md`.
 
 **Authoritative current source of truth for the RPCS3 → Rust port.**
 

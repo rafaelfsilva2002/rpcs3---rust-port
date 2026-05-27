@@ -1,6 +1,23 @@
 # R12 — RSX / GPU subsystem
 
-**Status:** PLAN + in-progress (2026-05-27).
+**Status:** PURE PIPELINE CLOSED 2026-05-27. Command/state +
+resource descriptors + GCM replay oracles (all 3 provenance tiers,
+incl. real PSL1GHT-libgcm capture) landed. 3 RSX crates; 274
+workspace blocks, 0 fail. Final nomenclature (locked):
+- **R12.10a** — Tier 1 authored golden stream (`7e8b4cd9d`)
+- **R12.10b** — Tier 2 emitted / producer-side stream (`b57839b75`)
+- **R12.11b** — Tier 3 real PSL1GHT-emitted stream (`5035127f1`)
+
+Next advance is a separate sub-wave (gcmInitDefault + draw + flip →
+needs cellGcm HLE / wider RSX memory setup). The GPU backend
+(shader decompile, texture pixel-decode, Vulkan/GL — Camadas C/D/E)
+stays out of scope (needs GPU, not behavior-freezable).
+
+---
+
+(original plan below)
+
+**Status (historical):** PLAN + in-progress (2026-05-27).
 **Predecessor:** R11 (PPU interpreter) closed.
 **Honest scope note:** RSX is the single largest RPCS3 subsystem.
 A full byte-exact port (command processor + ~hundreds of NV4097
@@ -128,25 +145,32 @@ Success criterion: PSL1GHT fixture calls cellGcm-like API →
 EmuCore cellGcm HLE produces/exposes the command buffer → emitted
 stream → `replay_gcm` → expected `RsxSnapshot`.
 
-Sub-slices:
-- **R12.11a** (in-Rust, no Docker): the capture *mechanism* — a
-  `GcmControl` command-buffer model (base / PUT / GET / IO offset)
-  + a `capture_command_buffer(mem_image, control)` path that reads
-  `[base+GET .. base+PUT)` out of a memory image. Validated by
-  driving `GcmContext` writes into a mock memory region, setting
-  PUT, capturing, and replaying → the exact same snapshot. This is
-  the byte-snapshot logic the real fixture capture reuses.
-- **R12.11b** (needs Docker + EmuCore run): a CC0 PSL1GHT fixture
-  using libgcm (cellGcmInit + clear + flush); EmuCore wires
-  cellGcmInit (command-buffer region) + reads the buffer the
-  homebrew's inline libgcm wrote, via R12.11a's capture path; feed
-  `replay_gcm` → assert.
+Sub-slices (BOTH LANDED 2026-05-27):
+- **R12.11a** (`1cce1e742`, in-Rust): the capture *mechanism* —
+  `GcmControl` + `capture_command_buffer(mem, control)` reading
+  `[base+GET .. base+PUT)` + `GcmContext::write_into`. Validated by
+  the `capture_through_memory_round_trip` oracle.
+- **R12.11b** (`5035127f1`, real fixture): CC0 PSL1GHT homebrew
+  `single_gcm_clear_v1` sets up a gcmContextData by hand over a
+  static buffer (NO gcmInitDefault → no cellGcm HLE needed), calls
+  PSL1GHT's REAL emission (rsxSetClearColor / rsxClearSurface /
+  rsxSetWriteCommandLabel), and dumps the words as hex via
+  sysTtyWrite. EmuCore `run_self` runs it (exit 0xC0DE), the oracle
+  parses the TTY hex → GCM bytes → `replay_gcm` → asserts
+  ClearSurface(0xF3) from the REAL captured stream (10 words, 2
+  effects).
 
-Note: PSL1GHT libgcm command emission is mostly *inline* (writes
-words directly into the context's command buffer in guest memory),
-so capture = read `[GET..PUT)` from memory after flush — NOT
-per-command HLE interception. The few real PRX calls (cellGcmInit,
-flip, control register) are the HLE surface.
+Key realization that unblocked it: PSL1GHT librsx command emission
+is *inline* (pure memory writes to the context buffer), so a manual
+context + sysTtyWrite dump captures real bytes WITHOUT mapping the
+RSX or porting cellGcmInit. A fuller capture (gcmInitDefault +
+draws + flip) would need the cellGcm HLE, but this minimal path
+proves the Tier-3 pipeline end to end.
+
+**All three provenance tiers now land:** authored golden (R12.10a),
+emitted/producer-side (R12.10b), real captured (R12.11b). The
+decoder is frozen by the golden oracles and validated against real
+PSL1GHT libgcm output.
 
 ## Deferred — the GPU-backend giant tail (out of near-term scope)
 
