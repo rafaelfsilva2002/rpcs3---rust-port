@@ -41,6 +41,8 @@ pub const CLEAR_SURFACE: u32 = 0x1D94 >> 2;
 pub const BEGIN_END: u32 = 0x1808 >> 2;
 /// `NV4097_DRAW_ARRAYS` (0x1814).
 pub const DRAW_ARRAYS: u32 = 0x1814 >> 2;
+/// `NV4097_DRAW_INDEX_ARRAY` (0x1824).
+pub const DRAW_INDEX_ARRAY: u32 = 0x1824 >> 2;
 /// `NV4097_SET_VIEWPORT_HORIZONTAL` (0x0A00).
 pub const VIEWPORT_HORIZONTAL: u32 = 0x0A00 >> 2;
 /// `NV4097_SET_VIEWPORT_VERTICAL` (0x0A04).
@@ -245,6 +247,116 @@ impl RsxState {
     }
 }
 
+// =====================================================================
+// R12.5 — draw-call recognition
+// =====================================================================
+
+/// Whether a draw sources vertices directly (DRAW_ARRAYS) or through
+/// an index buffer (DRAW_INDEX_ARRAY).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawKind {
+    /// `NV4097_DRAW_ARRAYS` — sequential vertices.
+    Arrays,
+    /// `NV4097_DRAW_INDEX_ARRAY` — indexed vertices.
+    Indexed,
+}
+
+/// A completed draw: the primitive type set by `SET_BEGIN_END` plus
+/// every `(first, count)` vertex range issued between begin and end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrawCall {
+    /// Primitive mode from `SET_BEGIN_END` (1=points, 2=lines,
+    /// 3=line-loop, 4=line-strip, 5=triangles, 8=quads, ... per NV).
+    pub primitive: u32,
+    /// Arrays vs indexed.
+    pub kind: DrawKind,
+    /// `(first_vertex, count)` ranges accumulated for this draw.
+    pub ranges: Vec<(u32, u32)>,
+}
+
+/// Decode a `DRAW_ARRAYS` / `DRAW_INDEX_ARRAY` arg word into a
+/// `(first, count)` range: `first = arg & 0xFFFFFF`,
+/// `count = ((arg >> 24) & 0xFF) + 1`.
+#[must_use]
+pub fn decode_draw_range(arg: u32) -> (u32, u32) {
+    let first = arg & 0x00FF_FFFF;
+    let count = ((arg >> 24) & 0xFF) + 1;
+    (first, count)
+}
+
+/// Accumulates draw state across a write stream, emitting a
+/// [`DrawCall`] when `SET_BEGIN_END` closes a primitive block.
+///
+/// Usage: feed every `(register, arg)` write via [`Self::process`];
+/// it returns `Some(DrawCall)` on the END that finalizes a draw.
+#[derive(Debug, Clone, Default)]
+pub struct DrawTracker {
+    primitive: Option<u32>,
+    kind: DrawKind,
+    ranges: Vec<(u32, u32)>,
+}
+
+impl Default for DrawKind {
+    fn default() -> Self {
+        DrawKind::Arrays
+    }
+}
+
+impl DrawTracker {
+    /// A fresh tracker (no primitive in progress).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Process one method write. Returns `Some(DrawCall)` when an
+    /// END (`SET_BEGIN_END` with arg 0) finalizes a draw that issued
+    /// at least one range; otherwise `None`.
+    pub fn process(&mut self, reg: u32, arg: u32) -> Option<DrawCall> {
+        match reg {
+            BEGIN_END if arg != 0 => {
+                // Begin: start a fresh primitive block.
+                self.primitive = Some(arg);
+                self.ranges.clear();
+                None
+            }
+            BEGIN_END => {
+                // End: emit the accumulated draw, if any ranges.
+                let prim = self.primitive.take()?;
+                if self.ranges.is_empty() {
+                    return None;
+                }
+                Some(DrawCall {
+                    primitive: prim,
+                    kind: self.kind,
+                    ranges: core::mem::take(&mut self.ranges),
+                })
+            }
+            DRAW_ARRAYS => {
+                if self.primitive.is_some() {
+                    self.kind = DrawKind::Arrays;
+                    self.ranges.push(decode_draw_range(arg));
+                }
+                None
+            }
+            DRAW_INDEX_ARRAY => {
+                if self.primitive.is_some() {
+                    self.kind = DrawKind::Indexed;
+                    self.ranges.push(decode_draw_range(arg));
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// True when a primitive block is open (between begin and end).
+    #[must_use]
+    pub fn in_primitive(&self) -> bool {
+        self.primitive.is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,5 +498,88 @@ mod tests {
         // plain writes still landed.
         assert_eq!(s.read(VIEWPORT_HORIZONTAL), 0x10);
         assert_eq!(s.color_clear_value(), 0xABCD);
+    }
+
+    // ---- R12.5: draw-call recognition -----------------------------
+
+    #[test]
+    fn decode_draw_range_unpacks_first_count() {
+        // first=0x100, count=0x40 → arg = ((0x40-1)<<24)|0x100.
+        let arg = ((0x40u32 - 1) << 24) | 0x100;
+        assert_eq!(decode_draw_range(arg), (0x100, 0x40));
+    }
+
+    #[test]
+    fn draw_tracker_emits_call_on_end() {
+        let mut t = DrawTracker::new();
+        assert_eq!(t.process(BEGIN_END, 5), None); // begin triangles
+        assert!(t.in_primitive());
+        // one DRAW_ARRAYS: first 0, count 3.
+        let arg = ((3u32 - 1) << 24) | 0;
+        assert_eq!(t.process(DRAW_ARRAYS, arg), None);
+        // end → emits.
+        let call = t.process(BEGIN_END, 0).unwrap();
+        assert_eq!(call.primitive, 5);
+        assert_eq!(call.kind, DrawKind::Arrays);
+        assert_eq!(call.ranges, vec![(0, 3)]);
+        assert!(!t.in_primitive());
+    }
+
+    #[test]
+    fn draw_tracker_accumulates_multiple_ranges() {
+        let mut t = DrawTracker::new();
+        t.process(BEGIN_END, 8); // quads
+        t.process(DRAW_ARRAYS, ((4u32 - 1) << 24) | 0);
+        t.process(DRAW_ARRAYS, ((4u32 - 1) << 24) | 4);
+        let call = t.process(BEGIN_END, 0).unwrap();
+        assert_eq!(call.ranges, vec![(0, 4), (4, 4)]);
+    }
+
+    #[test]
+    fn draw_tracker_indexed_kind() {
+        let mut t = DrawTracker::new();
+        t.process(BEGIN_END, 5);
+        t.process(DRAW_INDEX_ARRAY, ((6u32 - 1) << 24) | 0);
+        let call = t.process(BEGIN_END, 0).unwrap();
+        assert_eq!(call.kind, DrawKind::Indexed);
+        assert_eq!(call.ranges, vec![(0, 6)]);
+    }
+
+    #[test]
+    fn draw_tracker_empty_block_emits_nothing() {
+        let mut t = DrawTracker::new();
+        t.process(BEGIN_END, 5);
+        // no DRAW_ARRAYS issued.
+        assert_eq!(t.process(BEGIN_END, 0), None);
+    }
+
+    #[test]
+    fn draw_arrays_outside_begin_ignored() {
+        let mut t = DrawTracker::new();
+        // DRAW_ARRAYS with no open primitive → ignored.
+        assert_eq!(t.process(DRAW_ARRAYS, 0x0300_0000), None);
+        assert!(!t.in_primitive());
+    }
+
+    #[test]
+    fn draw_tracker_full_pipeline_from_fifo() {
+        // GCM stream: begin(triangles), draw_arrays(0,3), end.
+        let h_begin = (1 << 18) | (BEGIN_END << 2);
+        let h_draw = (1 << 18) | (DRAW_ARRAYS << 2);
+        let h_end = (1 << 18) | (BEGIN_END << 2);
+        let draw_arg = ((3u32 - 1) << 24) | 0;
+        let buf = words(&[h_begin, 5, h_draw, draw_arg, h_end, 0]);
+        let mut eng = FifoEngine::new(0, 24);
+        let writes = eng.run(&buf).unwrap();
+        let mut t = DrawTracker::new();
+        let mut calls = Vec::new();
+        for &(reg, arg) in &writes {
+            if let Some(c) = t.process(reg, arg) {
+                calls.push(c);
+            }
+        }
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].primitive, 5);
+        assert_eq!(calls[0].ranges, vec![(0, 3)]);
     }
 }
