@@ -51,13 +51,34 @@ a `tests/` dir. Each wave adds handlers + inline tests.
 3. Supervisor ops (MSR/TLB) — stub as no-op vs Unimplemented.
    Lean no-op for user-mode binaries.
 
-## Validation status
+## Validation status — R11 CLOSED 2026-05-26
 
-- R11.1 FP arithmetic — `3f8f51215` (147 lib tests)
-- R11.2 FP convert/compare/status — `7db2403a2` (155)
-- R11.3 indexed load/store — `27a988928` (162)
-- R11.4 CR logical + mcrf + barriers — `e0c5a1b8b` (169)
-- R11.5 string/multiple — (this commit) (172) — **PPU SCALAR COMPLETE**
-- Deferred sub-slice R11.4b: OE-arithmetic (addo/subfo/mulldo)
-- Next: R11.6/7 VMX (the giant), R11.8 system/supervisor
-- All waves: workspace gate 268 result blocks, 0 fail.
+| Slice | Commit | lib tests | Scope |
+|---|---|---|---|
+| R11.1 | `3f8f51215` | 147 | FP arithmetic (fmadd family, fsel, fsqrt/fre/frsqrte) |
+| R11.2 | `7db2403a2` | 155 | FP convert/compare/status (fctiw/fcfid/fcmpu/mffs/mtfsf) |
+| R11.3 | `27a988928` | 162 | indexed load/store (P31 X-form, ~34 ops) |
+| R11.4 | `e0c5a1b8b` | 169 | CR-logical + mcrf + barriers |
+| R11.5 | `3bb18b154` | 172 | string/multiple — **PPU SCALAR COMPLETE** |
+| R11.6a | `2eb33b2b1` | 178 | VMX integer add/sub (modulo + saturating) |
+| R11.6b | `72df1913f` | 183 | VMX min/max |
+| R11.6c | `e62747dc4` | 188 | VMX compares (eq+gt, +CR6) |
+| R11.6d | `4966801e0` | 195 | VMX shift/rotate + merge + splat |
+| R11.7a | `2820c0dac` | 201 | VMX float (minmax/est/convert/compares) |
+| R11.7b | `ad58100da` | 205 | VMX load/store (lvx/stvx/element/lvsl) |
+| R11.6e | `32b6d6355` | 212 | VMX pack/unpack/multiply + vsel/vsldoi |
+| R11.8 | `f938877a2` | 216 | system: atomic/mftb/msr/cache |
+
+**Result:** PPU interpreter functionally complete — full scalar
+ISA (integer/FP/branch/CR/load-store all forms) + VMX/AltiVec
+(~120 vector ops) + system ops. 216 lib tests (from 136
+baseline); workspace gate held at 268 result blocks, 0 fail
+across all 13 commits.
+
+**Deferred (none block user-mode PPC execution):**
+- R11.4b: OE-enabled arithmetic overflow tracking (addo/subfo/
+  mulldo etc.) — low frequency.
+- mftb real monotonic clock (currently stub → 0).
+- supervisor TLB/SLB ops, rfid.
+- VMX: vmsum* multiply-sum family, vcmpbfp, crypto (vcipher),
+  exotic packs (vpkpx) — rare in practice.

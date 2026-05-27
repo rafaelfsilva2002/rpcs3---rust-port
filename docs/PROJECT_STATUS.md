@@ -1,6 +1,25 @@
-# Project Status — R10 + fixture pipeline CLOSED (LV2 sync primitives library + 4 end-to-end PSL1GHT fixtures: mutex/sema/event_queue/cond all return 0xC0DE; 268 release blocks; 0 regression; 20 SPU oracles intact)
+# Project Status — R11 CLOSED (PPU interpreter functionally complete: full scalar ISA + VMX/AltiVec ~120 vector ops + system ops; 216 ppu-interpreter lib tests; 268 release blocks; 0 regression)
 
 **Authoritative current source of truth for the RPCS3 → Rust port.**
+
+R11 (PPU interpreter completion) closed 2026-05-26 across 13
+commits (R11.1 → R11.8). The `rpcs3-ppu-interpreter` now covers
+the full scalar PowerPC ISA (integer/FP/branch/CR/load-store in
+all forms — D, indexed, with-update, byte-reversed, multiple,
+string), the VMX/AltiVec vector category (~120 ops: add/sub,
+min/max, compares, shift/rotate, merge, splat, pack/unpack,
+multiply, select, float arith/convert, load/store), and
+system-level ops (atomic lwarx/stwcx., mftb/msr stubs, cache
+dcbz/dcbt). 216 inline lib tests (from a 136 baseline); the
+workspace gate held at 268 result blocks, 0 fail, across all 13
+commits. Deferred (none block user-mode PPC execution):
+OE-arithmetic overflow tracking, mftb real clock, supervisor
+TLB/SLB, VMX multiply-sum/crypto. See
+`.planning/R11_PPU_INTERPRETER_COMPLETION.md`.
+
+Previous wave status follows below.
+
+---
 
 Last updated: **2026-05-26 (R10 CLOSED library layer architecturally complete)**.
 
