@@ -1726,6 +1726,142 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                 // thread in-order interpreter needs no action.
                 598 | 854 => {}
 
+                // ---- R11.4b: OE-enabled arithmetic (XER.OV/SO) -----
+                // OE variants share the base result but also set
+                // XER.OV (overflow) + sticky XER.SO. 10-bit XO =
+                // base | 0x200 (OE is the MSB of the 10-bit field).
+                778 | 552 | 616 | 522 | 520 | 650 | 648 | 746 | 744
+                | 714 | 712 | 747 | 745 | 1003 | 971 | 1001 | 969 => {
+                    let a = ppu.gpr[op.ra() as usize];
+                    let b = ppu.gpr[op.rb() as usize];
+                    let ca: u64 = u64::from(ppu.xer.ca);
+                    let cai = i128::from(ppu.xer.ca);
+                    // (result, overflow, optional carry-out)
+                    let (r, ov, new_ca): (u64, bool, Option<bool>) = match xo {
+                        778 => {
+                            // addo
+                            (a.wrapping_add(b),
+                             (a as i64).checked_add(b as i64).is_none(), None)
+                        }
+                        552 => {
+                            // subfo: rb - ra
+                            (b.wrapping_sub(a),
+                             (b as i64).checked_sub(a as i64).is_none(), None)
+                        }
+                        616 => {
+                            // nego
+                            (a.wrapping_neg(), a == 0x8000_0000_0000_0000, None)
+                        }
+                        522 => {
+                            // addco
+                            let (s, c) = a.overflowing_add(b);
+                            (s, (a as i64).checked_add(b as i64).is_none(),
+                             Some(c))
+                        }
+                        520 => {
+                            // subfco: ~a + b + 1
+                            let (s, c1) = (!a).overflowing_add(b);
+                            let (r, c2) = s.overflowing_add(1);
+                            (r, (b as i64).checked_sub(a as i64).is_none(),
+                             Some(c1 || c2))
+                        }
+                        650 => {
+                            // addeo: a + b + CA
+                            let (s, c1) = a.overflowing_add(b);
+                            let (r, c2) = s.overflowing_add(ca);
+                            let sum = a as i64 as i128 + b as i64 as i128 + cai;
+                            (r, sum < i64::MIN as i128 || sum > i64::MAX as i128,
+                             Some(c1 || c2))
+                        }
+                        648 => {
+                            // subfeo: ~a + b + CA
+                            let (s, c1) = (!a).overflowing_add(b);
+                            let (r, c2) = s.overflowing_add(ca);
+                            let sum = !a as i64 as i128 + b as i64 as i128 + cai;
+                            (r, sum < i64::MIN as i128 || sum > i64::MAX as i128,
+                             Some(c1 || c2))
+                        }
+                        746 => {
+                            // addmeo: a + (-1) + CA
+                            let (s, c1) = a.overflowing_add(u64::MAX);
+                            let (r, c2) = s.overflowing_add(ca);
+                            let sum = a as i64 as i128 - 1 + cai;
+                            (r, sum < i64::MIN as i128 || sum > i64::MAX as i128,
+                             Some(c1 || c2))
+                        }
+                        744 => {
+                            // subfmeo: ~a + (-1) + CA
+                            let (s, c1) = (!a).overflowing_add(u64::MAX);
+                            let (r, c2) = s.overflowing_add(ca);
+                            let sum = !a as i64 as i128 - 1 + cai;
+                            (r, sum < i64::MIN as i128 || sum > i64::MAX as i128,
+                             Some(c1 || c2))
+                        }
+                        714 => {
+                            // addzeo: a + CA
+                            let (r, c) = a.overflowing_add(ca);
+                            let sum = a as i64 as i128 + cai;
+                            (r, sum < i64::MIN as i128 || sum > i64::MAX as i128,
+                             Some(c))
+                        }
+                        712 => {
+                            // subfzeo: ~a + CA
+                            let (r, c) = (!a).overflowing_add(ca);
+                            let sum = !a as i64 as i128 + cai;
+                            (r, sum < i64::MIN as i128 || sum > i64::MAX as i128,
+                             Some(c))
+                        }
+                        747 => {
+                            // mullwo: 32×32 signed; OV if product ⊄ i32.
+                            let p = (a as i32 as i64).wrapping_mul(b as i32 as i64);
+                            (p as u64,
+                             p < i32::MIN as i64 || p > i32::MAX as i64, None)
+                        }
+                        745 => {
+                            // mulldo: 64×64 signed low.
+                            (a.wrapping_mul(b),
+                             (a as i64).checked_mul(b as i64).is_none(), None)
+                        }
+                        1003 => {
+                            // divwo: signed 32/32.
+                            let (x, y) = (a as i32, b as i32);
+                            let ov = y == 0 || (x == i32::MIN && y == -1);
+                            let r = if ov { 0 } else { x.wrapping_div(y) };
+                            (r as u32 as u64, ov, None)
+                        }
+                        971 => {
+                            // divwuo: unsigned 32/32.
+                            let (x, y) = (a as u32, b as u32);
+                            let ov = y == 0;
+                            let r = if ov { 0 } else { x / y };
+                            (r as u64, ov, None)
+                        }
+                        1001 => {
+                            // divdo: signed 64/64.
+                            let (x, y) = (a as i64, b as i64);
+                            let ov = y == 0 || (x == i64::MIN && y == -1);
+                            let r = if ov { 0 } else { x.wrapping_div(y) };
+                            (r as u64, ov, None)
+                        }
+                        969 => {
+                            // divduo: unsigned 64/64.
+                            let ov = b == 0;
+                            let r = if ov { 0 } else { a / b };
+                            (r, ov, None)
+                        }
+                        _ => unreachable!(),
+                    };
+                    ppu.gpr[op.rd() as usize] = r;
+                    if let Some(c) = new_ca {
+                        ppu.xer.ca = c;
+                    }
+                    ppu.xer.ov = ov;
+                    ppu.xer.so |= ov;
+                    if rc_bit {
+                        update_cr0(ppu, r);
+                    }
+                }
+
                 // ---- R11.8: atomic (single-thread reservation) -----
                 // Single PPU: a reservation can never be broken by
                 // another thread, so the store-conditional always
@@ -3820,6 +3956,42 @@ pub mod encode {
             | ((xo & 0x1FF) << 1)
             | (rc & 1)
     }
+
+    // -- R11.4b: OE-enabled arithmetic (OE=1, sets XER.OV/SO) -----
+    /// `addo rd, ra, rb`. #[must_use]
+    pub const fn addo(rd: u32, ra: u32, rb: u32) -> u32 { xo_form(31, rd, ra, rb, 266, 1, 0) }
+    /// `subfo rd, ra, rb`. #[must_use]
+    pub const fn subfo(rd: u32, ra: u32, rb: u32) -> u32 { xo_form(31, rd, ra, rb, 40, 1, 0) }
+    /// `nego rd, ra`. #[must_use]
+    pub const fn nego(rd: u32, ra: u32) -> u32 { xo_form(31, rd, ra, 0, 104, 1, 0) }
+    /// `addco rd, ra, rb`. #[must_use]
+    pub const fn addco(rd: u32, ra: u32, rb: u32) -> u32 { xo_form(31, rd, ra, rb, 10, 1, 0) }
+    /// `subfco rd, ra, rb`. #[must_use]
+    pub const fn subfco(rd: u32, ra: u32, rb: u32) -> u32 { xo_form(31, rd, ra, rb, 8, 1, 0) }
+    /// `addeo rd, ra, rb`. #[must_use]
+    pub const fn addeo(rd: u32, ra: u32, rb: u32) -> u32 { xo_form(31, rd, ra, rb, 138, 1, 0) }
+    /// `subfeo rd, ra, rb`. #[must_use]
+    pub const fn subfeo(rd: u32, ra: u32, rb: u32) -> u32 { xo_form(31, rd, ra, rb, 136, 1, 0) }
+    /// `addmeo rd, ra`. #[must_use]
+    pub const fn addmeo(rd: u32, ra: u32) -> u32 { xo_form(31, rd, ra, 0, 234, 1, 0) }
+    /// `subfmeo rd, ra`. #[must_use]
+    pub const fn subfmeo(rd: u32, ra: u32) -> u32 { xo_form(31, rd, ra, 0, 232, 1, 0) }
+    /// `addzeo rd, ra`. #[must_use]
+    pub const fn addzeo(rd: u32, ra: u32) -> u32 { xo_form(31, rd, ra, 0, 202, 1, 0) }
+    /// `subfzeo rd, ra`. #[must_use]
+    pub const fn subfzeo(rd: u32, ra: u32) -> u32 { xo_form(31, rd, ra, 0, 200, 1, 0) }
+    /// `mullwo rd, ra, rb`. #[must_use]
+    pub const fn mullwo(rd: u32, ra: u32, rb: u32) -> u32 { xo_form(31, rd, ra, rb, 235, 1, 0) }
+    /// `mulldo rd, ra, rb`. #[must_use]
+    pub const fn mulldo(rd: u32, ra: u32, rb: u32) -> u32 { xo_form(31, rd, ra, rb, 233, 1, 0) }
+    /// `divwo rd, ra, rb`. #[must_use]
+    pub const fn divwo(rd: u32, ra: u32, rb: u32) -> u32 { xo_form(31, rd, ra, rb, 491, 1, 0) }
+    /// `divwuo rd, ra, rb`. #[must_use]
+    pub const fn divwuo(rd: u32, ra: u32, rb: u32) -> u32 { xo_form(31, rd, ra, rb, 459, 1, 0) }
+    /// `divdo rd, ra, rb`. #[must_use]
+    pub const fn divdo(rd: u32, ra: u32, rb: u32) -> u32 { xo_form(31, rd, ra, rb, 489, 1, 0) }
+    /// `divduo rd, ra, rb`. #[must_use]
+    pub const fn divduo(rd: u32, ra: u32, rb: u32) -> u32 { xo_form(31, rd, ra, rb, 457, 1, 0) }
 
     // ---- Floating-point D-form loads/stores -------------------------
 
@@ -7255,5 +7427,82 @@ mod tests {
         ppu.gpr[4] = DATA_BASE as u64;
         step_ok(&mut ppu, &mut mem);
         assert_eq!(ppu.cia, PROG_BASE + 4); // advanced, no fault
+    }
+
+    // ---- R11.4b: OE-enabled arithmetic (XER.OV/SO) ----------------
+
+    #[test]
+    fn addo_no_overflow_clears_ov() {
+        let prog = [encode::addo(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.gpr[4] = 2;
+        ppu.gpr[5] = 3;
+        ppu.xer.ov = true; // preset; should clear
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.gpr[3], 5);
+        assert!(!ppu.xer.ov);
+    }
+
+    #[test]
+    fn addo_overflow_sets_ov_and_so() {
+        let prog = [encode::addo(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.gpr[4] = i64::MAX as u64;
+        ppu.gpr[5] = 1;
+        step_ok(&mut ppu, &mut mem);
+        assert!(ppu.xer.ov);
+        assert!(ppu.xer.so); // sticky
+    }
+
+    #[test]
+    fn subfo_overflow() {
+        let prog = [encode::subfo(3, 4, 5)]; // rb - ra
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.gpr[5] = i64::MAX as u64; // rb
+        ppu.gpr[4] = (-1i64) as u64;  // ra → MAX - (-1) overflows
+        step_ok(&mut ppu, &mut mem);
+        assert!(ppu.xer.ov);
+    }
+
+    #[test]
+    fn nego_min_overflows() {
+        let prog = [encode::nego(3, 4)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.gpr[4] = 0x8000_0000_0000_0000; // i64::MIN
+        step_ok(&mut ppu, &mut mem);
+        assert!(ppu.xer.ov);
+    }
+
+    #[test]
+    fn mullwo_overflow_when_product_exceeds_i32() {
+        let prog = [encode::mullwo(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.gpr[4] = 0x0001_0000; // 65536
+        ppu.gpr[5] = 0x0001_0000; // 65536 → 2^32 > i32::MAX
+        step_ok(&mut ppu, &mut mem);
+        assert!(ppu.xer.ov);
+        assert_eq!(ppu.gpr[3], 0x0000_0001_0000_0000); // full product
+    }
+
+    #[test]
+    fn divwo_by_zero_sets_ov() {
+        let prog = [encode::divwo(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.gpr[4] = 100;
+        ppu.gpr[5] = 0;
+        step_ok(&mut ppu, &mut mem);
+        assert!(ppu.xer.ov);
+        assert_eq!(ppu.gpr[3], 0); // undefined → 0
+    }
+
+    #[test]
+    fn divduo_normal_no_overflow() {
+        let prog = [encode::divduo(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.gpr[4] = 100;
+        ppu.gpr[5] = 7;
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.gpr[3], 14);
+        assert!(!ppu.xer.ov);
     }
 }
