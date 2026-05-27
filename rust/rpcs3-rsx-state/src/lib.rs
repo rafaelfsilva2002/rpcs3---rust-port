@@ -51,6 +51,12 @@ pub const VERTEX_DATA_ARRAY_FORMAT: u32 = 0x1740 >> 2;
 pub const VERTEX_DATA_ARRAY_OFFSET: u32 = 0x1680 >> 2;
 /// Number of vertex attribute inputs.
 pub const VERTEX_ATTRIB_COUNT: u32 = 16;
+/// `NV4097_SET_INDEX_ARRAY_ADDRESS` (0x181C) — byte offset of the
+/// index buffer in the bound DMA context.
+pub const INDEX_ARRAY_ADDRESS: u32 = 0x181C >> 2;
+/// `NV4097_SET_INDEX_ARRAY_DMA` (0x1820) — packs the index element
+/// type (bit 4) and the DMA context location (low 4 bits).
+pub const INDEX_ARRAY_DMA: u32 = 0x1820 >> 2;
 /// `NV4097_SET_VIEWPORT_HORIZONTAL` (0x0A00).
 pub const VIEWPORT_HORIZONTAL: u32 = 0x0A00 >> 2;
 /// `NV4097_SET_VIEWPORT_VERTICAL` (0x0A04).
@@ -463,6 +469,59 @@ impl RsxState {
     }
 }
 
+// =====================================================================
+// R12.7 — index buffer descriptor (Camada B)
+// =====================================================================
+
+/// Index element width for indexed draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexType {
+    /// 32-bit indices (`NV4097` type code 0).
+    U32,
+    /// 16-bit indices (type code 1).
+    U16,
+}
+
+/// The bound index array, from `SET_INDEX_ARRAY_ADDRESS` +
+/// `SET_INDEX_ARRAY_DMA`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexArray {
+    /// Byte offset of the index buffer in the bound DMA context.
+    pub address: u32,
+    /// Index element width.
+    pub index_type: IndexType,
+    /// DMA context location selector (low 4 bits of the DMA reg).
+    pub location: u8,
+}
+
+impl IndexType {
+    /// Size of one index in bytes.
+    #[must_use]
+    pub fn size_bytes(self) -> u32 {
+        match self {
+            IndexType::U32 => 4,
+            IndexType::U16 => 2,
+        }
+    }
+}
+
+impl RsxState {
+    /// The currently-bound index array. The DMA register's bit 4
+    /// selects the index width (0 = u32, 1 = u16); its low 4 bits
+    /// select the DMA context.
+    #[must_use]
+    pub fn index_array(&self) -> IndexArray {
+        let address = self.read(INDEX_ARRAY_ADDRESS);
+        let dma = self.read(INDEX_ARRAY_DMA);
+        let index_type = if dma & 0x10 != 0 {
+            IndexType::U16
+        } else {
+            IndexType::U32
+        };
+        IndexArray { address, index_type, location: (dma & 0xF) as u8 }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,6 +799,44 @@ mod tests {
         assert_eq!(enabled[0].0, 0);
         assert_eq!(enabled[1].0, 5);
         assert_eq!(enabled[1].1.base_type, VertexBaseType::Ub);
+    }
+
+    // ---- R12.7: index buffer descriptor --------------------------
+
+    #[test]
+    fn index_array_u32_default() {
+        let mut s = RsxState::new();
+        s.write(INDEX_ARRAY_ADDRESS, 0x0010_0000);
+        s.write(INDEX_ARRAY_DMA, 0x0000_0000); // bit4 clear → u32
+        let ia = s.index_array();
+        assert_eq!(ia.address, 0x0010_0000);
+        assert_eq!(ia.index_type, IndexType::U32);
+        assert_eq!(ia.index_type.size_bytes(), 4);
+    }
+
+    #[test]
+    fn index_array_u16_and_location() {
+        let mut s = RsxState::new();
+        s.write(INDEX_ARRAY_ADDRESS, 0x2000);
+        s.write(INDEX_ARRAY_DMA, 0x10 | 0x0B); // bit4 set → u16, loc 0xB
+        let ia = s.index_array();
+        assert_eq!(ia.index_type, IndexType::U16);
+        assert_eq!(ia.index_type.size_bytes(), 2);
+        assert_eq!(ia.location, 0x0B);
+        assert_eq!(ia.address, 0x2000);
+    }
+
+    #[test]
+    fn index_array_from_fifo() {
+        let h_addr = (1 << 18) | (INDEX_ARRAY_ADDRESS << 2);
+        let h_dma = (1 << 18) | (INDEX_ARRAY_DMA << 2);
+        let buf = words(&[h_addr, 0x4000, h_dma, 0x10]);
+        let mut eng = FifoEngine::new(0, 16);
+        let mut s = RsxState::new();
+        s.run_and_apply(&mut eng, &buf).unwrap();
+        let ia = s.index_array();
+        assert_eq!(ia.address, 0x4000);
+        assert_eq!(ia.index_type, IndexType::U16);
     }
 
     #[test]
