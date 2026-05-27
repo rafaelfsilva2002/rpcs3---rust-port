@@ -366,6 +366,46 @@ fn join_lanes(lanes: [u32; 4]) -> u128 {
 }
 
 // =====================================================================
+// R11.6 — generic VMX lane mappers (16×u8 / 8×u16 / 4×u32 lanes)
+// =====================================================================
+
+#[inline]
+fn vec_u8<F: Fn(u8, u8) -> u8>(a: u128, b: u128, f: F) -> u128 {
+    let a = a.to_be_bytes();
+    let b = b.to_be_bytes();
+    let mut o = [0u8; 16];
+    for i in 0..16 {
+        o[i] = f(a[i], b[i]);
+    }
+    u128::from_be_bytes(o)
+}
+
+#[inline]
+fn vec_u16<F: Fn(u16, u16) -> u16>(a: u128, b: u128, f: F) -> u128 {
+    let a = a.to_be_bytes();
+    let b = b.to_be_bytes();
+    let mut o = [0u8; 16];
+    for i in 0..8 {
+        let av = u16::from_be_bytes([a[i * 2], a[i * 2 + 1]]);
+        let bv = u16::from_be_bytes([b[i * 2], b[i * 2 + 1]]);
+        o[i * 2..i * 2 + 2].copy_from_slice(&f(av, bv).to_be_bytes());
+    }
+    u128::from_be_bytes(o)
+}
+
+#[inline]
+fn vec_u32<F: Fn(u32, u32) -> u32>(a: u128, b: u128, f: F) -> u128 {
+    let la = split_lanes(a);
+    let lb = split_lanes(b);
+    join_lanes([
+        f(la[0], lb[0]),
+        f(la[1], lb[1]),
+        f(la[2], lb[2]),
+        f(la[3], lb[3]),
+    ])
+}
+
+// =====================================================================
 // Effective-address computation for D-form and DS-form loads/stores
 // =====================================================================
 
@@ -2290,6 +2330,54 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                     ppu.cia = cia.wrapping_add(4);
                     return Ok(StepOutcome::Continue);
                 }
+
+                // ---- R11.6a: VMX integer add/sub (modulo + sat) ----
+                // Modulo (wrap) add: byte/half (word=128 exists above).
+                0 | 64 | 512 | 576 | 640 | 768 | 832 | 896
+                | 1024 | 1088 | 1536 | 1600 | 1664 | 1792 | 1856 | 1920 => {
+                    let a = ppu.vr[op.va() as usize];
+                    let b = ppu.vr[op.vb() as usize];
+                    let r = match xo11 {
+                        // --- add, modulo ---
+                        0 => vec_u8(a, b, |x, y| x.wrapping_add(y)),
+                        64 => vec_u16(a, b, |x, y| x.wrapping_add(y)),
+                        // --- add, unsigned saturate ---
+                        512 => vec_u8(a, b, u8::saturating_add),
+                        576 => vec_u16(a, b, u16::saturating_add),
+                        640 => vec_u32(a, b, u32::saturating_add),
+                        // --- add, signed saturate ---
+                        768 => vec_u8(a, b, |x, y| {
+                            (x as i8).saturating_add(y as i8) as u8
+                        }),
+                        832 => vec_u16(a, b, |x, y| {
+                            (x as i16).saturating_add(y as i16) as u16
+                        }),
+                        896 => vec_u32(a, b, |x, y| {
+                            (x as i32).saturating_add(y as i32) as u32
+                        }),
+                        // --- sub, modulo ---
+                        1024 => vec_u8(a, b, |x, y| x.wrapping_sub(y)),
+                        1088 => vec_u16(a, b, |x, y| x.wrapping_sub(y)),
+                        // --- sub, unsigned saturate ---
+                        1536 => vec_u8(a, b, u8::saturating_sub),
+                        1600 => vec_u16(a, b, u16::saturating_sub),
+                        1664 => vec_u32(a, b, u32::saturating_sub),
+                        // --- sub, signed saturate ---
+                        1792 => vec_u8(a, b, |x, y| {
+                            (x as i8).saturating_sub(y as i8) as u8
+                        }),
+                        1856 => vec_u16(a, b, |x, y| {
+                            (x as i16).saturating_sub(y as i16) as u16
+                        }),
+                        1920 => vec_u32(a, b, |x, y| {
+                            (x as i32).saturating_sub(y as i32) as u32
+                        }),
+                        _ => unreachable!(),
+                    };
+                    ppu.vr[op.vd() as usize] = r;
+                    ppu.cia = cia.wrapping_add(4);
+                    return Ok(StepOutcome::Continue);
+                }
                 _ => {
                     return Err(Error::Unimplemented {
                         inst,
@@ -3371,6 +3459,56 @@ pub mod encode {
     /// `vnor vD, vA, vB` — bitwise NOR.
     #[must_use]
     pub const fn vnor(vd: u32, va: u32, vb: u32) -> u32 { vx_form(1284, vd, va, vb) }
+
+    // -- R11.6a: VMX integer add/sub (modulo + saturating) --------
+    /// `vaddubm` — byte add modulo.
+    #[must_use]
+    pub const fn vaddubm(vd: u32, va: u32, vb: u32) -> u32 { vx_form(0, vd, va, vb) }
+    /// `vadduhm` — halfword add modulo.
+    #[must_use]
+    pub const fn vadduhm(vd: u32, va: u32, vb: u32) -> u32 { vx_form(64, vd, va, vb) }
+    /// `vaddubs` — byte add, unsigned saturate.
+    #[must_use]
+    pub const fn vaddubs(vd: u32, va: u32, vb: u32) -> u32 { vx_form(512, vd, va, vb) }
+    /// `vadduhs` — halfword add, unsigned saturate.
+    #[must_use]
+    pub const fn vadduhs(vd: u32, va: u32, vb: u32) -> u32 { vx_form(576, vd, va, vb) }
+    /// `vadduws` — word add, unsigned saturate.
+    #[must_use]
+    pub const fn vadduws(vd: u32, va: u32, vb: u32) -> u32 { vx_form(640, vd, va, vb) }
+    /// `vaddsbs` — byte add, signed saturate.
+    #[must_use]
+    pub const fn vaddsbs(vd: u32, va: u32, vb: u32) -> u32 { vx_form(768, vd, va, vb) }
+    /// `vaddshs` — halfword add, signed saturate.
+    #[must_use]
+    pub const fn vaddshs(vd: u32, va: u32, vb: u32) -> u32 { vx_form(832, vd, va, vb) }
+    /// `vaddsws` — word add, signed saturate.
+    #[must_use]
+    pub const fn vaddsws(vd: u32, va: u32, vb: u32) -> u32 { vx_form(896, vd, va, vb) }
+    /// `vsububm` — byte sub modulo.
+    #[must_use]
+    pub const fn vsububm(vd: u32, va: u32, vb: u32) -> u32 { vx_form(1024, vd, va, vb) }
+    /// `vsubuhm` — halfword sub modulo.
+    #[must_use]
+    pub const fn vsubuhm(vd: u32, va: u32, vb: u32) -> u32 { vx_form(1088, vd, va, vb) }
+    /// `vsububs` — byte sub, unsigned saturate.
+    #[must_use]
+    pub const fn vsububs(vd: u32, va: u32, vb: u32) -> u32 { vx_form(1536, vd, va, vb) }
+    /// `vsubuhs` — halfword sub, unsigned saturate.
+    #[must_use]
+    pub const fn vsubuhs(vd: u32, va: u32, vb: u32) -> u32 { vx_form(1600, vd, va, vb) }
+    /// `vsubuws` — word sub, unsigned saturate.
+    #[must_use]
+    pub const fn vsubuws(vd: u32, va: u32, vb: u32) -> u32 { vx_form(1664, vd, va, vb) }
+    /// `vsubsbs` — byte sub, signed saturate.
+    #[must_use]
+    pub const fn vsubsbs(vd: u32, va: u32, vb: u32) -> u32 { vx_form(1792, vd, va, vb) }
+    /// `vsubshs` — halfword sub, signed saturate.
+    #[must_use]
+    pub const fn vsubshs(vd: u32, va: u32, vb: u32) -> u32 { vx_form(1856, vd, va, vb) }
+    /// `vsubsws` — word sub, signed saturate.
+    #[must_use]
+    pub const fn vsubsws(vd: u32, va: u32, vb: u32) -> u32 { vx_form(1920, vd, va, vb) }
 
     /// `vperm vD, vA, vB, vC` — byte permutation (VA-form 6-bit XO = 43).
     #[must_use]
@@ -4960,12 +5098,12 @@ mod tests {
 
     #[test]
     fn primary_4_unknown_xo_returns_unimplemented() {
-        // Primary 4 with XO that doesn't match any implemented op.
-        // XO 99 = 0x63, not used (but note 0x63 is also a potential
-        // 6-bit VA-form XO — so we pick something that fits neither).
-        // 11-bit 0x100 = 256 isn't mapped; 6-bit low = 0x00 isn't
-        // either. Use inst with 6-bit low == 0 and 11-bit == 256.
-        let inst = (4u32 << 26) | (256 << 6);
+        // Primary 4 with an XO that matches neither a VA-form 6-bit
+        // op nor a VX-form 11-bit op. xo11 = 0x7FF (2047) is unused,
+        // and its low 6 bits (0x3F = 63) is not a VA-form op either.
+        // (Earlier this used 256<<6 → xo11=0, but R11.6a mapped
+        // xo11=0 to vaddubm, so we repoint to a free slot.)
+        let inst = (4u32 << 26) | 0x7FF;
         let prog = [inst];
         let (mut ppu, mut mem) = make_env(&prog);
         let err = step(&mut ppu, &mut mem).unwrap_err();
@@ -5604,5 +5742,70 @@ mod tests {
         step_ok(&mut ppu, &mut mem);
         step_ok(&mut ppu, &mut mem);
         assert_eq!(ppu.gpr[8], 0xDEAD_BEEF);
+    }
+
+    // ---- R11.6a: VMX integer add/sub (modulo + saturating) --------
+
+    #[test]
+    fn vaddubm_wraps_per_byte() {
+        let prog = [encode::vaddubm(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = u128::from_be_bytes([0xFF; 16]);
+        ppu.vr[5] = u128::from_be_bytes([0x02; 16]);
+        step_ok(&mut ppu, &mut mem);
+        // 0xFF + 0x02 wraps to 0x01 per byte.
+        assert_eq!(ppu.vr[3], u128::from_be_bytes([0x01; 16]));
+    }
+
+    #[test]
+    fn vaddubs_saturates_unsigned() {
+        let prog = [encode::vaddubs(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = u128::from_be_bytes([0xFF; 16]);
+        ppu.vr[5] = u128::from_be_bytes([0x02; 16]);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.vr[3], u128::from_be_bytes([0xFF; 16]));
+    }
+
+    #[test]
+    fn vaddsbs_saturates_signed() {
+        let prog = [encode::vaddsbs(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = u128::from_be_bytes([0x7F; 16]); // +127
+        ppu.vr[5] = u128::from_be_bytes([0x01; 16]);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.vr[3], u128::from_be_bytes([0x7F; 16])); // clamp +127
+    }
+
+    #[test]
+    fn vadduhm_halfword_wrap() {
+        let prog = [encode::vadduhm(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = u128::from_be_bytes([0xFF; 16]); // each half = 0xFFFF
+        ppu.vr[5] = u128::from_be_bytes([0x00, 0x01, 0x00, 0x01, 0x00, 0x01,
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01]);
+        step_ok(&mut ppu, &mut mem);
+        // 0xFFFF + 1 = 0x0000 per halfword.
+        assert_eq!(ppu.vr[3], 0);
+    }
+
+    #[test]
+    fn vsububs_saturates_to_zero() {
+        let prog = [encode::vsububs(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = u128::from_be_bytes([0x01; 16]);
+        ppu.vr[5] = u128::from_be_bytes([0x05; 16]);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.vr[3], 0); // 1-5 saturates to 0 unsigned
+    }
+
+    #[test]
+    fn vsubuwm_word_wrap_matches_existing() {
+        let prog = [encode::vsubuwm(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = 0;
+        ppu.vr[5] = join_lanes([1, 1, 1, 1]);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.vr[3], join_lanes([0xFFFF_FFFF; 4]));
     }
 }
