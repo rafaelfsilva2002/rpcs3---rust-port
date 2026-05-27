@@ -98,6 +98,11 @@ pub enum FifoError {
     OutOfBounds,
     /// `get` is not 4-byte aligned.
     Misaligned,
+    /// A RETURN was decoded with an empty call stack.
+    EmptyCallStack,
+    /// The engine processed more than [`MAX_FIFO_ITERS`] entries
+    /// without reaching PUT (suspected jump loop).
+    RunawayFifo,
 }
 
 // =====================================================================
@@ -171,6 +176,78 @@ pub fn decode(buf: &[u8], get: u32) -> Result<Decoded, FifoError> {
     }
     let next_get = get.wrapping_add(4).wrapping_add(count * 4);
     Ok(Decoded { entry: FifoEntry::Methods(writes), next_get })
+}
+
+// =====================================================================
+// R12.2 — FIFO engine (DMA control: PUT/GET + call stack)
+// =====================================================================
+
+/// Maximum FIFO entries processed in one [`FifoEngine::run`] before
+/// bailing with [`FifoError::RunawayFifo`]. Guards against malformed
+/// jump loops in untrusted command streams.
+pub const MAX_FIFO_ITERS: usize = 1_000_000;
+
+/// The RSX command-processor DMA control state: a GET pointer that
+/// chases the PUT pointer through the command ring, plus a
+/// subroutine call stack for CALL/RETURN.
+#[derive(Debug, Clone, Default)]
+pub struct FifoEngine {
+    /// Current read offset (byte offset into the command buffer).
+    pub get: u32,
+    /// Write offset the GET pointer chases toward.
+    pub put: u32,
+    /// CALL/RETURN return-offset stack.
+    call_stack: Vec<u32>,
+}
+
+impl FifoEngine {
+    /// Create an engine positioned at `get`, chasing `put`.
+    #[must_use]
+    pub fn new(get: u32, put: u32) -> Self {
+        Self { get, put, call_stack: Vec::new() }
+    }
+
+    /// Current call-stack depth (test/diagnostic helper).
+    #[must_use]
+    pub fn call_depth(&self) -> usize {
+        self.call_stack.len()
+    }
+
+    /// Process commands from GET until it reaches PUT, following
+    /// jump/call/return, and return every `(register, arg)` method
+    /// write in order. Stops cleanly when `get == put`.
+    pub fn run(&mut self, buf: &[u8]) -> Result<Vec<(u32, u32)>, FifoError> {
+        let mut writes = Vec::new();
+        let mut iters = 0usize;
+        while self.get != self.put {
+            iters += 1;
+            if iters > MAX_FIFO_ITERS {
+                return Err(FifoError::RunawayFifo);
+            }
+            let d = decode(buf, self.get)?;
+            match d.entry {
+                FifoEntry::Methods(mut w) => {
+                    writes.append(&mut w);
+                    self.get = d.next_get;
+                }
+                FifoEntry::Nop => {
+                    self.get = d.next_get;
+                }
+                FifoEntry::Jump(addr) => {
+                    self.get = addr;
+                }
+                FifoEntry::Call(addr) => {
+                    // Return to the header after this CALL.
+                    self.call_stack.push(d.next_get);
+                    self.get = addr;
+                }
+                FifoEntry::Return => {
+                    self.get = self.call_stack.pop().ok_or(FifoError::EmptyCallStack)?;
+                }
+            }
+        }
+        Ok(writes)
+    }
 }
 
 #[cfg(test)]
@@ -280,5 +357,80 @@ mod tests {
         assert_eq!(d0.next_get, 8);
         let d1 = decode(&buf, d0.next_get).unwrap();
         assert_eq!(d1.entry, FifoEntry::Methods(vec![(0x80, 0xAD)]));
+    }
+
+    // ---- R12.2: FifoEngine ----------------------------------------
+
+    #[test]
+    fn engine_runs_linear_until_put() {
+        let h0 = (1 << 18) | 0x100;
+        let h1 = (2 << 18) | 0x200;
+        let buf = words(&[h0, 0xDE, h1, 0x11, 0x22]);
+        let mut eng = FifoEngine::new(0, 20); // put at end (5 words)
+        let writes = eng.run(&buf).unwrap();
+        assert_eq!(
+            writes,
+            vec![(0x40, 0xDE), (0x80, 0x11), (0x81, 0x22)]
+        );
+        assert_eq!(eng.get, eng.put);
+    }
+
+    #[test]
+    fn engine_follows_jump() {
+        // word0: jump to byte 8; word2: method.
+        let jump = OLD_JUMP_CMD | 8;
+        let h = (1 << 18) | 0x100;
+        let buf = words(&[jump, 0xDEAD, h, 0xBE]);
+        let mut eng = FifoEngine::new(0, 16);
+        let writes = eng.run(&buf).unwrap();
+        // word1 (0xDEAD) is skipped by the jump.
+        assert_eq!(writes, vec![(0x40, 0xBE)]);
+    }
+
+    #[test]
+    fn engine_call_and_return() {
+        // Layout (bytes) — subroutine sits BEFORE the main stream so
+        // the CALL target never coincides with PUT:
+        //   0: m_sub reg 0x80 = 0xBB   (subroutine body)
+        //   8: return
+        //  12: call → 0                (GET starts here)
+        //  16: m_main reg 0x40 = 0xAA  (after return)
+        //  PUT = 24
+        let m_sub = (1 << 18) | 0x200;  // reg 0x80
+        let m_main = (1 << 18) | 0x100; // reg 0x40
+        let call = 0u32 | CALL_CMD;     // target 0, low2 == 2
+        let buf = words(&[
+            m_sub, 0xBB,    // 0, 4
+            RETURN_CMD,     // 8
+            call,           // 12
+            m_main, 0xAA,   // 16, 20
+        ]);
+        let mut eng = FifoEngine::new(12, 24);
+        let writes = eng.run(&buf).unwrap();
+        // call→sub: (0x80,0xBB); return→16: (0x40,0xAA); get=24=PUT.
+        assert_eq!(writes, vec![(0x80, 0xBB), (0x40, 0xAA)]);
+        assert_eq!(eng.call_depth(), 0);
+    }
+
+    #[test]
+    fn engine_return_without_call_errors() {
+        let buf = words(&[RETURN_CMD, 0]);
+        let mut eng = FifoEngine::new(0, 8);
+        assert_eq!(eng.run(&buf), Err(FifoError::EmptyCallStack));
+    }
+
+    #[test]
+    fn engine_runaway_jump_loop_bails() {
+        // jump-to-self at byte 0.
+        let buf = words(&[OLD_JUMP_CMD | 0]);
+        let mut eng = FifoEngine::new(0, 4);
+        assert_eq!(eng.run(&buf), Err(FifoError::RunawayFifo));
+    }
+
+    #[test]
+    fn engine_empty_when_get_equals_put() {
+        let buf = words(&[(1 << 18) | 0x100, 0xAA]);
+        let mut eng = FifoEngine::new(8, 8);
+        assert_eq!(eng.run(&buf).unwrap(), vec![]);
     }
 }
