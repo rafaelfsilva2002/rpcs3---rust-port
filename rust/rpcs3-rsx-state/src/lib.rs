@@ -57,6 +57,25 @@ pub const INDEX_ARRAY_ADDRESS: u32 = 0x181C >> 2;
 /// `NV4097_SET_INDEX_ARRAY_DMA` (0x1820) — packs the index element
 /// type (bit 4) and the DMA context location (low 4 bits).
 pub const INDEX_ARRAY_DMA: u32 = 0x1820 >> 2;
+
+// Texture units: 16 units, registers strided 0x20 bytes (8 register
+// indices) apart. Base byte offsets from RPCS3 rsx_methods.h:
+//   NV4097_SET_TEXTURE_OFFSET     0x1A00
+//   NV4097_SET_TEXTURE_FORMAT     0x1A04
+//   NV4097_SET_TEXTURE_CONTROL0   0x1A0C  (bit 31 = unit enable)
+//   NV4097_SET_TEXTURE_IMAGE_RECT 0x1A18  (width<<16 | height)
+/// First texture unit's OFFSET register index.
+pub const TEXTURE_OFFSET_BASE: u32 = 0x1A00 >> 2;
+/// First texture unit's FORMAT register index.
+pub const TEXTURE_FORMAT_BASE: u32 = 0x1A04 >> 2;
+/// First texture unit's CONTROL0 register index.
+pub const TEXTURE_CONTROL0_BASE: u32 = 0x1A0C >> 2;
+/// First texture unit's IMAGE_RECT register index.
+pub const TEXTURE_IMAGE_RECT_BASE: u32 = 0x1A18 >> 2;
+/// Register-index stride between consecutive texture units (0x20/4).
+pub const TEXTURE_UNIT_STRIDE: u32 = 0x20 >> 2;
+/// Number of texture units.
+pub const TEXTURE_UNIT_COUNT: u32 = 16;
 /// `NV4097_SET_VIEWPORT_HORIZONTAL` (0x0A00).
 pub const VIEWPORT_HORIZONTAL: u32 = 0x0A00 >> 2;
 /// `NV4097_SET_VIEWPORT_VERTICAL` (0x0A04).
@@ -522,6 +541,103 @@ impl RsxState {
     }
 }
 
+// =====================================================================
+// R12.8 — texture descriptor (parse only; format decode is Camada D)
+// =====================================================================
+
+/// Texture dimensionality (FORMAT word bits 4..7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextureDimension {
+    /// 1D.
+    OneD,
+    /// 2D (the common case; cubemaps are 2D + the cubemap flag).
+    TwoD,
+    /// 3D / volume.
+    ThreeD,
+    /// Reserved / unrecognized dimension code.
+    Other(u8),
+}
+
+/// A parsed texture-unit descriptor. This is structural only — the
+/// `format_code` is the raw 8-bit FORMAT field (base format + flag
+/// bits); full format classification + pixel decode is the deferred
+/// texture-decode layer (Camada D).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextureDescriptor {
+    /// Raw 8-bit format field (FORMAT bits 8..15).
+    pub format_code: u8,
+    /// Texture dimensionality.
+    pub dimension: TextureDimension,
+    /// Mipmap level count (FORMAT bits 16..31).
+    pub mipmap_levels: u16,
+    /// Width (IMAGE_RECT bits 16..31).
+    pub width: u16,
+    /// Height (IMAGE_RECT bits 0..15).
+    pub height: u16,
+    /// Cubemap flag (FORMAT bit 2).
+    pub cubemap: bool,
+    /// Border flag (FORMAT bit 3).
+    pub border: bool,
+    /// DMA context location (FORMAT bits 0..1).
+    pub location: u8,
+    /// Byte offset of the texel data in the bound DMA context.
+    pub offset: u32,
+}
+
+fn texture_dimension_from_code(code: u8) -> TextureDimension {
+    match code {
+        1 => TextureDimension::OneD,
+        2 => TextureDimension::TwoD,
+        3 => TextureDimension::ThreeD,
+        other => TextureDimension::Other(other),
+    }
+}
+
+impl RsxState {
+    /// Register index of texture unit `i`'s field at `base`.
+    #[inline]
+    fn texture_reg(base: u32, i: u32) -> u32 {
+        base + i * TEXTURE_UNIT_STRIDE
+    }
+
+    /// Whether texture unit `i` is enabled (CONTROL0 bit 31).
+    #[must_use]
+    pub fn texture_enabled(&self, i: u32) -> bool {
+        if i >= TEXTURE_UNIT_COUNT {
+            return false;
+        }
+        self.read(Self::texture_reg(TEXTURE_CONTROL0_BASE, i)) & 0x8000_0000 != 0
+    }
+
+    /// Parse texture unit `i`'s descriptor. Returns `None` when the
+    /// unit's FORMAT word is 0 (nothing configured) or `i` is out of
+    /// range. Does not consult the CONTROL0 enable bit — use
+    /// [`Self::texture_enabled`] for that.
+    #[must_use]
+    pub fn texture(&self, i: u32) -> Option<TextureDescriptor> {
+        if i >= TEXTURE_UNIT_COUNT {
+            return None;
+        }
+        let fmt = self.read(Self::texture_reg(TEXTURE_FORMAT_BASE, i));
+        if fmt == 0 {
+            return None;
+        }
+        let rect = self.read(Self::texture_reg(TEXTURE_IMAGE_RECT_BASE, i));
+        let offset = self.read(Self::texture_reg(TEXTURE_OFFSET_BASE, i));
+        Some(TextureDescriptor {
+            format_code: ((fmt >> 8) & 0xFF) as u8,
+            dimension: texture_dimension_from_code(((fmt >> 4) & 0xF) as u8),
+            mipmap_levels: ((fmt >> 16) & 0xFFFF) as u16,
+            width: ((rect >> 16) & 0xFFFF) as u16,
+            height: (rect & 0xFFFF) as u16,
+            cubemap: fmt & 0x4 != 0,
+            border: fmt & 0x8 != 0,
+            location: (fmt & 0x3) as u8,
+            offset,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,6 +953,74 @@ mod tests {
         let ia = s.index_array();
         assert_eq!(ia.address, 0x4000);
         assert_eq!(ia.index_type, IndexType::U16);
+    }
+
+    // ---- R12.8: texture descriptor -------------------------------
+
+    /// Build a FORMAT word: location, cubemap, border, dimension,
+    /// format code, mip count.
+    fn tex_fmt(loc: u32, cube: bool, border: bool, dim: u32, fmt: u32, mips: u32) -> u32 {
+        (loc & 0x3)
+            | (u32::from(cube) << 2)
+            | (u32::from(border) << 3)
+            | ((dim & 0xF) << 4)
+            | ((fmt & 0xFF) << 8)
+            | ((mips & 0xFFFF) << 16)
+    }
+
+    #[test]
+    fn texture_descriptor_decode() {
+        let mut s = RsxState::new();
+        // unit 0: 2D, format 0x85, 3 mips, 256x128, main memory.
+        s.write(TEXTURE_FORMAT_BASE, tex_fmt(2, false, false, 2, 0x85, 3));
+        s.write(TEXTURE_IMAGE_RECT_BASE, (256u32 << 16) | 128);
+        s.write(TEXTURE_OFFSET_BASE, 0x0020_0000);
+        let t = s.texture(0).unwrap();
+        assert_eq!(t.dimension, TextureDimension::TwoD);
+        assert_eq!(t.format_code, 0x85);
+        assert_eq!(t.mipmap_levels, 3);
+        assert_eq!(t.width, 256);
+        assert_eq!(t.height, 128);
+        assert_eq!(t.location, 2);
+        assert_eq!(t.offset, 0x0020_0000);
+        assert!(!t.cubemap);
+    }
+
+    #[test]
+    fn texture_cubemap_and_border_flags() {
+        let mut s = RsxState::new();
+        s.write(TEXTURE_FORMAT_BASE, tex_fmt(1, true, true, 2, 0x9E, 1));
+        let t = s.texture(0).unwrap();
+        assert!(t.cubemap);
+        assert!(t.border);
+    }
+
+    #[test]
+    fn texture_disabled_when_format_zero() {
+        let s = RsxState::new();
+        assert_eq!(s.texture(0), None);
+        assert_eq!(s.texture(16), None); // out of range
+    }
+
+    #[test]
+    fn texture_enable_bit_from_control0() {
+        let mut s = RsxState::new();
+        assert!(!s.texture_enabled(3));
+        s.write(TEXTURE_CONTROL0_BASE + 3 * TEXTURE_UNIT_STRIDE, 0x8000_0000);
+        assert!(s.texture_enabled(3));
+    }
+
+    #[test]
+    fn texture_unit_striding() {
+        let mut s = RsxState::new();
+        // unit 5 lives 5*8 register indices past unit 0.
+        s.write(TEXTURE_FORMAT_BASE + 5 * TEXTURE_UNIT_STRIDE,
+            tex_fmt(1, false, false, 3, 0x40, 5));
+        let t = s.texture(5).unwrap();
+        assert_eq!(t.dimension, TextureDimension::ThreeD);
+        assert_eq!(t.mipmap_levels, 5);
+        // unit 0 untouched → disabled.
+        assert_eq!(s.texture(0), None);
     }
 
     #[test]
