@@ -1391,6 +1391,105 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                     store_string(ppu, mem, ea, op.rs(), n)?;
                 }
 
+                // ---- R11.7b: VMX load/store (P31 X-form) -----------
+                // lvx/stvx load/store a 16-byte vector at the 16-byte-
+                // aligned EA. lvebx/lvehx/lvewx load one element into
+                // its EA-determined lane (rest zeroed). lvsl/lvsr build
+                // permute-control vectors for unaligned access.
+                103 | 359 => {
+                    // lvx / lvxl vD, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32 & !0xF;
+                    let mut buf = [0u8; 16];
+                    mem.read(ea, &mut buf).map_err(Error::from)?;
+                    ppu.vr[op.vd() as usize] = u128::from_be_bytes(buf);
+                }
+                231 | 487 => {
+                    // stvx / stvxl vS, ra, rb
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32 & !0xF;
+                    let bytes = ppu.vr[op.vs() as usize].to_be_bytes();
+                    mem.write(ea, &bytes).map_err(Error::from)?;
+                }
+                7 | 39 | 71 => {
+                    // lvebx(7) / lvehx(39) / lvewx(71) — load one
+                    // element into its EA-aligned lane, zero the rest.
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    let mut out = [0u8; 16];
+                    match xo {
+                        7 => {
+                            let idx = (ea & 0xF) as usize;
+                            out[idx] = mem_read_u8(mem, ea)?;
+                        }
+                        39 => {
+                            let aligned = ea & !1;
+                            let idx = (aligned & 0xF) as usize;
+                            let v = mem_read_u16_be(mem, aligned)?;
+                            out[idx..idx + 2].copy_from_slice(&v.to_be_bytes());
+                        }
+                        71 => {
+                            let aligned = ea & !3;
+                            let idx = (aligned & 0xF) as usize;
+                            let v = mem_read_u32_be(mem, aligned)?;
+                            out[idx..idx + 4].copy_from_slice(&v.to_be_bytes());
+                        }
+                        _ => unreachable!(),
+                    }
+                    ppu.vr[op.vd() as usize] = u128::from_be_bytes(out);
+                }
+                135 | 167 | 199 => {
+                    // stvebx(135) / stvehx(167) / stvewx(199) — store
+                    // one element from its EA-aligned lane.
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    let bytes = ppu.vr[op.vs() as usize].to_be_bytes();
+                    match xo {
+                        135 => {
+                            let idx = (ea & 0xF) as usize;
+                            mem_write_u8(mem, ea, bytes[idx])?;
+                        }
+                        167 => {
+                            let aligned = ea & !1;
+                            let idx = (aligned & 0xF) as usize;
+                            mem_write_u16_be(
+                                mem,
+                                aligned,
+                                u16::from_be_bytes([bytes[idx], bytes[idx + 1]]),
+                            )?;
+                        }
+                        199 => {
+                            let aligned = ea & !3;
+                            let idx = (aligned & 0xF) as usize;
+                            mem_write_u32_be(
+                                mem,
+                                aligned,
+                                u32::from_be_bytes([
+                                    bytes[idx], bytes[idx + 1],
+                                    bytes[idx + 2], bytes[idx + 3],
+                                ]),
+                            )?;
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                6 | 38 => {
+                    // lvsl(6) / lvsr(38) — permute-control vector for
+                    // unaligned loads. sh = EA & 0xF.
+                    let ea = ra_or_zero(ppu, op.ra())
+                        .wrapping_add(ppu.gpr[op.rb() as usize]) as u32;
+                    let sh = (ea & 0xF) as u8;
+                    let mut out = [0u8; 16];
+                    for i in 0..16u8 {
+                        out[i as usize] = if xo == 6 {
+                            sh + i // lvsl
+                        } else {
+                            (16 - sh) + i // lvsr
+                        };
+                    }
+                    ppu.vr[op.vd() as usize] = u128::from_be_bytes(out);
+                }
+
                 // R9.1g.9 — additional P31 XO additions found via
                 // iterative smoke runs.
                 60 => {
@@ -4030,6 +4129,32 @@ pub mod encode {
         vcr_form(710, vd, va, vb, record)
     }
 
+    // -- R11.7b: VMX load/store (P31 X-form via xo31_dar) ---------
+    /// `lvx vD, ra, rb`. #[must_use]
+    pub const fn lvx(vd: u32, ra: u32, rb: u32) -> u32 { xo31_dar(vd, ra, rb, 103) }
+    /// `lvxl vD, ra, rb`. #[must_use]
+    pub const fn lvxl(vd: u32, ra: u32, rb: u32) -> u32 { xo31_dar(vd, ra, rb, 359) }
+    /// `stvx vS, ra, rb`. #[must_use]
+    pub const fn stvx(vs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(vs, ra, rb, 231) }
+    /// `stvxl vS, ra, rb`. #[must_use]
+    pub const fn stvxl(vs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(vs, ra, rb, 487) }
+    /// `lvebx vD, ra, rb`. #[must_use]
+    pub const fn lvebx(vd: u32, ra: u32, rb: u32) -> u32 { xo31_dar(vd, ra, rb, 7) }
+    /// `lvehx vD, ra, rb`. #[must_use]
+    pub const fn lvehx(vd: u32, ra: u32, rb: u32) -> u32 { xo31_dar(vd, ra, rb, 39) }
+    /// `lvewx vD, ra, rb`. #[must_use]
+    pub const fn lvewx(vd: u32, ra: u32, rb: u32) -> u32 { xo31_dar(vd, ra, rb, 71) }
+    /// `stvebx vS, ra, rb`. #[must_use]
+    pub const fn stvebx(vs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(vs, ra, rb, 135) }
+    /// `stvehx vS, ra, rb`. #[must_use]
+    pub const fn stvehx(vs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(vs, ra, rb, 167) }
+    /// `stvewx vS, ra, rb`. #[must_use]
+    pub const fn stvewx(vs: u32, ra: u32, rb: u32) -> u32 { xo31_dar(vs, ra, rb, 199) }
+    /// `lvsl vD, ra, rb`. #[must_use]
+    pub const fn lvsl(vd: u32, ra: u32, rb: u32) -> u32 { xo31_dar(vd, ra, rb, 6) }
+    /// `lvsr vD, ra, rb`. #[must_use]
+    pub const fn lvsr(vd: u32, ra: u32, rb: u32) -> u32 { xo31_dar(vd, ra, rb, 38) }
+
     /// `vperm vD, vA, vB, vC` — byte permutation (VA-form 6-bit XO = 43).
     #[must_use]
     pub const fn vperm(vd: u32, va: u32, vb: u32, vc: u32) -> u32 {
@@ -6611,5 +6736,64 @@ mod tests {
         step_ok(&mut ppu, &mut mem);
         // -((2*3)-10) = -(6-10) = 4
         assert_eq!(lanes_f32(ppu.vr[3]), [4.0, 4.0, 4.0, 4.0]);
+    }
+
+    // ---- R11.7b: VMX load/store -----------------------------------
+
+    #[test]
+    fn stvx_then_lvx_round_trip() {
+        let prog = [encode::stvx(6, 4, 5), encode::lvx(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        alloc_data(&mut mem, DATA_BASE);
+        ppu.gpr[4] = DATA_BASE as u64; // 16-byte aligned (0x2000)
+        ppu.gpr[5] = 0;
+        ppu.vr[6] = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF;
+        step_ok(&mut ppu, &mut mem);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.vr[3], 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF);
+    }
+
+    #[test]
+    fn lvx_aligns_ea_to_16() {
+        // store a known vector at 0x2000, then lvx with an offset of
+        // 5 (unaligned) — lvx masks EA to 0x2000 so it reads the same.
+        let prog = [encode::stvx(6, 4, 5), encode::lvx(3, 4, 7)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        alloc_data(&mut mem, DATA_BASE);
+        ppu.gpr[4] = DATA_BASE as u64;
+        ppu.gpr[5] = 0;
+        ppu.gpr[7] = 5; // unaligned; lvx masks low 4 bits
+        ppu.vr[6] = 0xDEAD_BEEF_0000_0000_0000_0000_CAFE_F00D;
+        step_ok(&mut ppu, &mut mem);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.vr[3], ppu.vr[6]);
+    }
+
+    #[test]
+    fn lvsl_builds_left_shift_control() {
+        // EA & 0xF == 3 → bytes [3,4,...,18].
+        let prog = [encode::lvsl(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.gpr[4] = 0;
+        ppu.gpr[5] = 3;
+        step_ok(&mut ppu, &mut mem);
+        let out = ppu.vr[3].to_be_bytes();
+        for i in 0..16 {
+            assert_eq!(out[i], 3 + i as u8);
+        }
+    }
+
+    #[test]
+    fn lvewx_loads_word_into_lane() {
+        // store a word via stw, then lvewx into its EA lane.
+        let prog = [encode::stw(6, 0, 4), encode::lvewx(3, 0, 4)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        alloc_data(&mut mem, DATA_BASE);
+        ppu.gpr[4] = DATA_BASE as u64; // lane index (0x2000 & 0xF)=0
+        ppu.gpr[6] = 0x1234_5678;
+        step_ok(&mut ppu, &mut mem);
+        step_ok(&mut ppu, &mut mem);
+        // word lands in lane 0 (the first 4 bytes).
+        assert_eq!(split_lanes(ppu.vr[3])[0], 0x1234_5678);
     }
 }
