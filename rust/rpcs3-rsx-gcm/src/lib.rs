@@ -230,6 +230,100 @@ impl GcmContext {
     }
 }
 
+// =====================================================================
+// R12.11a — command-buffer capture mechanism (Tier 3 foundation)
+// =====================================================================
+
+/// Errors from capturing a command buffer out of a memory image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureError {
+    /// `get`/`put` not 4-byte aligned.
+    Misaligned,
+    /// `get > put` (the consumer can't be ahead of the producer in a
+    /// single linear segment).
+    GetPastPut,
+    /// `[base+get .. base+put)` exceeds the memory image.
+    OutOfBounds,
+}
+
+/// Models the RSX DMA control: where the command buffer lives in guest
+/// memory and how far the producer (PUT) and consumer (GET) have
+/// advanced. This is the cellGcm-side state a real fixture sets up via
+/// `cellGcmInit` + `cellGcmFlush`; R12.11a captures the bytes the
+/// homebrew's inline libgcm wrote into `[base+get .. base+put)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GcmControl {
+    /// Byte offset of the command buffer in the memory image.
+    pub command_base: u32,
+    /// Producer offset (relative to `command_base`) — how far the
+    /// homebrew has written. = bytes of valid command data.
+    pub put: u32,
+    /// Consumer offset (relative to `command_base`). Normally 0 at
+    /// capture time (nothing consumed yet).
+    pub get: u32,
+}
+
+impl GcmControl {
+    /// A control block for a command buffer at `command_base`, with the
+    /// producer having written `put` bytes (consumer at 0).
+    #[must_use]
+    pub fn new(command_base: u32, put: u32) -> Self {
+        Self { command_base, put, get: 0 }
+    }
+}
+
+/// Capture the live command-stream bytes from a memory image: the
+/// slice `mem[command_base+get .. command_base+put]`. This is exactly
+/// what a real fixture capture reads after the homebrew flushes — the
+/// returned bytes feed straight into the decoder (`replay_gcm` /
+/// `FifoEngine`) with `put - get` as the decode PUT.
+pub fn capture_command_buffer<'a>(
+    mem: &'a [u8],
+    control: &GcmControl,
+) -> Result<&'a [u8], CaptureError> {
+    if control.get & 0x3 != 0 || control.put & 0x3 != 0 {
+        return Err(CaptureError::Misaligned);
+    }
+    if control.get > control.put {
+        return Err(CaptureError::GetPastPut);
+    }
+    let start = control
+        .command_base
+        .checked_add(control.get)
+        .ok_or(CaptureError::OutOfBounds)? as usize;
+    let end = control
+        .command_base
+        .checked_add(control.put)
+        .ok_or(CaptureError::OutOfBounds)? as usize;
+    mem.get(start..end).ok_or(CaptureError::OutOfBounds)
+}
+
+impl GcmContext {
+    /// Write this context's emitted command words into `mem` at
+    /// `command_base` (big-endian), as a homebrew's inline libgcm
+    /// would, and return the [`GcmControl`] describing the result
+    /// (PUT = bytes written). `mem` must be large enough; returns
+    /// [`CaptureError::OutOfBounds`] otherwise.
+    ///
+    /// Bridges the Tier-2 producer to the Tier-3 capture mechanism:
+    /// emit → write-to-memory → `capture_command_buffer` → decoder,
+    /// exercising the exact byte-snapshot path the real fixture uses.
+    pub fn write_into(
+        &self,
+        mem: &mut [u8],
+        command_base: u32,
+    ) -> Result<GcmControl, CaptureError> {
+        let bytes = self.finish();
+        let start = command_base as usize;
+        let end = start
+            .checked_add(bytes.len())
+            .ok_or(CaptureError::OutOfBounds)?;
+        let dst = mem.get_mut(start..end).ok_or(CaptureError::OutOfBounds)?;
+        dst.copy_from_slice(&bytes);
+        Ok(GcmControl::new(command_base, bytes.len() as u32))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +386,63 @@ mod tests {
                 (1 << 18) | (0x1680 + 4), 0x8000_2000, // offset reg+1
             ]
         );
+    }
+
+    // ---- R12.11a: capture mechanism ------------------------------
+
+    #[test]
+    fn write_into_then_capture_round_trips_bytes() {
+        let mut c = GcmContext::new();
+        c.set_clear_color(0x1122_3344);
+        c.clear_surface(0xF3);
+        let emitted = c.finish();
+
+        // memory image with the command buffer at offset 0x1000.
+        let mut mem = vec![0u8; 0x4000];
+        let control = c.write_into(&mut mem, 0x1000).unwrap();
+        assert_eq!(control.command_base, 0x1000);
+        assert_eq!(control.put, emitted.len() as u32);
+        assert_eq!(control.get, 0);
+
+        let captured = capture_command_buffer(&mem, &control).unwrap();
+        assert_eq!(captured, emitted.as_slice());
+    }
+
+    #[test]
+    fn capture_respects_get_offset() {
+        let mut mem = vec![0u8; 0x100];
+        // put 16 bytes of marker data at base 0x10.
+        for (i, b) in mem[0x10..0x20].iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let control = GcmControl { command_base: 0x10, get: 4, put: 12 };
+        let captured = capture_command_buffer(&mem, &control).unwrap();
+        // [base+4 .. base+12) = bytes 4..12 of the marker.
+        assert_eq!(captured, &[4, 5, 6, 7, 8, 9, 10, 11]);
+    }
+
+    #[test]
+    fn capture_rejects_misaligned_get_past_put_and_oob() {
+        let mem = vec![0u8; 0x20];
+        assert_eq!(
+            capture_command_buffer(&mem, &GcmControl { command_base: 0, get: 1, put: 8 }),
+            Err(CaptureError::Misaligned)
+        );
+        assert_eq!(
+            capture_command_buffer(&mem, &GcmControl { command_base: 0, get: 12, put: 8 }),
+            Err(CaptureError::GetPastPut)
+        );
+        assert_eq!(
+            capture_command_buffer(&mem, &GcmControl { command_base: 0x18, get: 0, put: 0x20 }),
+            Err(CaptureError::OutOfBounds)
+        );
+    }
+
+    #[test]
+    fn write_into_out_of_bounds() {
+        let mut c = GcmContext::new();
+        c.set_clear_color(0); // 8 bytes
+        let mut mem = vec![0u8; 4]; // too small
+        assert_eq!(c.write_into(&mut mem, 0), Err(CaptureError::OutOfBounds));
     }
 }

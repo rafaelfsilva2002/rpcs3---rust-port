@@ -101,6 +101,53 @@ behavior-freezable from a captured GCM stream.
 Texture *format classification* and *pixel decode* (vs the
 structural parse here) remain in Camada D.
 
+## Validation status — GCM replay oracles 2026-05-27
+
+Precise nomenclature (provenance tiers):
+
+| Slice | Commit | Name (precise) |
+|---|---|---|
+| R12.10a | `7e8b4cd9d` | **authored golden stream oracle** (Tier 1 — hand-authored hex) |
+| R12.10b | `b57839b75` | **GCM command builder + emit/decode round-trip oracle** (Tier 2 — emitted stream; producer-side. NOT "captured") |
+| R12.11 | (in progress) | **real captured stream infrastructure** (Tier 3) |
+
+`rpcs3-rsx-gcm::GcmContext` (Tier 2) emits a stream byte-identical to
+the R12.10a golden; both decode through `replay_gcm` → `RsxSnapshot`.
+Three RSX crates form a deterministic triangle:
+`rpcs3-rsx-gcm` (produce) → bytes → `rpcs3-rsx-fifo` (decode) →
+`rpcs3-rsx-state` (`replay_gcm` → `RsxSnapshot`).
+
+## R12.11 — real captured stream infrastructure (Tier 3)
+
+Goal: get GCM bytes produced by a real PSL1GHT fixture's libgcm
+(not authored, not our emitter), via a minimal cellGcm HLE rather
+than a C++ capture writer — we already have the Rust producer
+(GcmContext) and decoder, so the cellGcm path is the natural one.
+
+Success criterion: PSL1GHT fixture calls cellGcm-like API →
+EmuCore cellGcm HLE produces/exposes the command buffer → emitted
+stream → `replay_gcm` → expected `RsxSnapshot`.
+
+Sub-slices:
+- **R12.11a** (in-Rust, no Docker): the capture *mechanism* — a
+  `GcmControl` command-buffer model (base / PUT / GET / IO offset)
+  + a `capture_command_buffer(mem_image, control)` path that reads
+  `[base+GET .. base+PUT)` out of a memory image. Validated by
+  driving `GcmContext` writes into a mock memory region, setting
+  PUT, capturing, and replaying → the exact same snapshot. This is
+  the byte-snapshot logic the real fixture capture reuses.
+- **R12.11b** (needs Docker + EmuCore run): a CC0 PSL1GHT fixture
+  using libgcm (cellGcmInit + clear + flush); EmuCore wires
+  cellGcmInit (command-buffer region) + reads the buffer the
+  homebrew's inline libgcm wrote, via R12.11a's capture path; feed
+  `replay_gcm` → assert.
+
+Note: PSL1GHT libgcm command emission is mostly *inline* (writes
+words directly into the context's command buffer in guest memory),
+so capture = read `[GET..PUT)` from memory after flush — NOT
+per-command HLE interception. The few real PRX calls (cellGcmInit,
+flip, control register) are the HLE surface.
+
 ## Deferred — the GPU-backend giant tail (out of near-term scope)
 
 These need an actual GPU backend and are months of work; they do

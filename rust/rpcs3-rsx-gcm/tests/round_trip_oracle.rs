@@ -111,3 +111,33 @@ fn empty_context_replays_to_empty_snapshot() {
     assert!(snap.vertex_attributes.is_empty());
     assert!(snap.textures.is_empty());
 }
+
+/// R12.11a — capture-through-memory round trip: emit → write the
+/// stream into a guest-memory image at a command-buffer base → read
+/// it back via the capture mechanism (what the real fixture path
+/// does after `cellGcmFlush`) → decode. Exercises the exact byte
+/// snapshot logic R12.11b will use against a real PSL1GHT homebrew.
+#[test]
+fn capture_through_memory_round_trip() {
+    let ctx = emit_frame();
+
+    // 16 MB guest-memory image; command buffer at a non-zero base.
+    let mut mem = vec![0u8; 0x0100_0000];
+    const CMD_BASE: u32 = 0x0020_0000;
+    let control = ctx.write_into(&mut mem, CMD_BASE).expect("write_into");
+
+    // capture [base+get .. base+put) — the live command stream.
+    let captured = capture_command_buffer(&mem, &control).expect("capture");
+    let put = control.put - control.get;
+    let snap = replay_gcm(captured, put).expect("replay captured");
+
+    // Same snapshot as the direct emit→decode path.
+    assert_eq!(snap.draw_calls.len(), 1);
+    assert_eq!(snap.draw_calls[0].primitive, 5);
+    assert_eq!(snap.textures.len(), 1);
+    assert_eq!(snap.textures[0].1.format_code, 0x85);
+    assert_eq!(snap.surface.clip, (1280, 720));
+    assert_eq!(snap.index_array.index_type, IndexType::U16);
+    // And byte-identical to the directly-finished stream.
+    assert_eq!(captured, ctx.finish().as_slice());
+}
