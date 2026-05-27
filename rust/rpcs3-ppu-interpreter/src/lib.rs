@@ -405,6 +405,123 @@ fn vec_u32<F: Fn(u32, u32) -> u32>(a: u128, b: u128, f: F) -> u128 {
     ])
 }
 
+// R11.6e — VMX pack: combine va (low half of result) + vb (high
+// half) of wider lanes into narrower ones. Mode by XO.
+fn vmx_pack(xo: u32, a: u128, b: u128) -> u128 {
+    let ab = [a, b];
+    let mut out = [0u8; 16];
+    match xo {
+        14 | 142 | 270 | 398 => {
+            // u16 → u8 (8 results per source). out byte k.
+            for (src, &v) in ab.iter().enumerate() {
+                let bytes = v.to_be_bytes();
+                for j in 0..8 {
+                    let h = u16::from_be_bytes([bytes[j * 2], bytes[j * 2 + 1]]);
+                    out[src * 8 + j] = match xo {
+                        14 => h as u8,                          // vpkuhum modulo
+                        142 => h.min(0xFF) as u8,               // vpkuhus u-sat
+                        270 => (h as i16).clamp(0, 255) as u8,  // vpkshus s→u
+                        398 => (h as i16).clamp(-128, 127) as i8 as u8, // vpkshss
+                        _ => unreachable!(),
+                    };
+                }
+            }
+        }
+        78 | 206 | 334 | 462 => {
+            // u32 → u16 (4 results per source).
+            for (src, &v) in ab.iter().enumerate() {
+                let w = split_lanes(v);
+                for j in 0..4 {
+                    let r: u16 = match xo {
+                        78 => w[j] as u16,                       // vpkuwum modulo
+                        206 => w[j].min(0xFFFF) as u16,          // vpkuwus u-sat
+                        334 => (w[j] as i32).clamp(0, 65535) as u16, // vpkswus
+                        462 => (w[j] as i32).clamp(-32768, 32767) as i16 as u16, // vpkswss
+                        _ => unreachable!(),
+                    };
+                    let off = (src * 4 + j) * 2;
+                    out[off..off + 2].copy_from_slice(&r.to_be_bytes());
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+    u128::from_be_bytes(out)
+}
+
+// R11.6e — VMX unpack: sign-extend the high (h) or low (l) half of vb
+// to the next wider lane.
+fn vmx_unpack(xo: u32, b: u128) -> u128 {
+    let bytes = b.to_be_bytes();
+    match xo {
+        526 | 654 => {
+            // i8 → i16. high uses bytes 0..8, low uses 8..16.
+            let base = if xo == 526 { 0 } else { 8 };
+            let mut out = [0u8; 16];
+            for j in 0..8 {
+                let v = bytes[base + j] as i8 as i16 as u16;
+                out[j * 2..j * 2 + 2].copy_from_slice(&v.to_be_bytes());
+            }
+            u128::from_be_bytes(out)
+        }
+        590 | 718 => {
+            // i16 → i32. high uses halfwords 0..4, low 4..8.
+            let base = if xo == 590 { 0 } else { 8 };
+            let mut o = [0u32; 4];
+            for j in 0..4 {
+                let h = i16::from_be_bytes([bytes[base + j * 2], bytes[base + j * 2 + 1]]);
+                o[j] = h as i32 as u32;
+            }
+            join_lanes(o)
+        }
+        _ => unreachable!(),
+    }
+}
+
+// R11.6e — VMX multiply even/odd. Even multiplies element 2i of each
+// source; odd multiplies 2i+1. Byte sources → halfword results,
+// halfword sources → word results.
+fn vmx_mul_eo(xo: u32, a: u128, b: u128) -> u128 {
+    let ab = a.to_be_bytes();
+    let bb = b.to_be_bytes();
+    match xo {
+        8 | 264 | 520 | 776 => {
+            // byte → halfword (8 results). 8/264 odd, 520/776 even.
+            let odd = matches!(xo, 8 | 264);
+            let signed = matches!(xo, 264 | 776);
+            let mut out = [0u8; 16];
+            for j in 0..8 {
+                let idx = j * 2 + usize::from(odd);
+                let r: u16 = if signed {
+                    ((ab[idx] as i8 as i16) * (bb[idx] as i8 as i16)) as u16
+                } else {
+                    (ab[idx] as u16) * (bb[idx] as u16)
+                };
+                out[j * 2..j * 2 + 2].copy_from_slice(&r.to_be_bytes());
+            }
+            u128::from_be_bytes(out)
+        }
+        72 | 328 | 584 | 840 => {
+            // halfword → word (4 results). 72/328 odd, 584/840 even.
+            let odd = matches!(xo, 72 | 328);
+            let signed = matches!(xo, 328 | 840);
+            let mut o = [0u32; 4];
+            for j in 0..4 {
+                let idx = (j * 2 + usize::from(odd)) * 2;
+                let av = u16::from_be_bytes([ab[idx], ab[idx + 1]]);
+                let bv = u16::from_be_bytes([bb[idx], bb[idx + 1]]);
+                o[j] = if signed {
+                    ((av as i16 as i32) * (bv as i16 as i32)) as u32
+                } else {
+                    (av as u32) * (bv as u32)
+                };
+            }
+            join_lanes(o)
+        }
+        _ => unreachable!(),
+    }
+}
+
 // VMX compare lane mappers (R11.6c): each lane becomes all-ones when
 // the predicate holds, else all-zeros. Returns (result, all_true,
 // all_false) so the record (`.`) form can update CR6.
@@ -2405,6 +2522,31 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                     ppu.cia = cia.wrapping_add(4);
                     return Ok(StepOutcome::Continue);
                 }
+                42 => {
+                    // vsel vd, va, vb, vc — bit select: (vb&vc)|(va&~vc)
+                    let va = ppu.vr[op.va() as usize];
+                    let vb = ppu.vr[op.vb() as usize];
+                    let vc = ppu.vr[op.vc() as usize];
+                    ppu.vr[op.vd() as usize] = (vb & vc) | (va & !vc);
+                    ppu.cia = cia.wrapping_add(4);
+                    return Ok(StepOutcome::Continue);
+                }
+                44 => {
+                    // vsldoi vd, va, vb, SH — concatenate va:vb (32
+                    // bytes) and extract 16 bytes starting at byte SH.
+                    // SH is bits 22..25 (the shb field).
+                    let sh = ((inst >> 6) & 0xF) as usize;
+                    let a = ppu.vr[op.va() as usize].to_be_bytes();
+                    let b = ppu.vr[op.vb() as usize].to_be_bytes();
+                    let mut cat = [0u8; 32];
+                    cat[..16].copy_from_slice(&a);
+                    cat[16..].copy_from_slice(&b);
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&cat[sh..sh + 16]);
+                    ppu.vr[op.vd() as usize] = u128::from_be_bytes(o);
+                    ppu.cia = cia.wrapping_add(4);
+                    return Ok(StepOutcome::Continue);
+                }
                 _ => {}
             }
 
@@ -2541,6 +2683,33 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                     ppu.cia = cia.wrapping_add(4);
                     return Ok(StepOutcome::Continue);
                 }
+                // ---- R11.6e: VMX pack (u16→u8 / u32→u16) -----------
+                // va fills output low half, vb the high half. Modulo
+                // takes the low bits; *us = unsigned-sat, *ss/shus =
+                // signed-source saturate.
+                14 | 78 | 142 | 206 | 270 | 334 | 398 | 462 => {
+                    let a = ppu.vr[op.va() as usize];
+                    let b = ppu.vr[op.vb() as usize];
+                    ppu.vr[op.vd() as usize] = vmx_pack(xo11, a, b);
+                    ppu.cia = cia.wrapping_add(4);
+                    return Ok(StepOutcome::Continue);
+                }
+                // ---- R11.6e: VMX unpack (sign-extend high/low) -----
+                526 | 654 | 590 | 718 => {
+                    let b = ppu.vr[op.vb() as usize];
+                    ppu.vr[op.vd() as usize] = vmx_unpack(xo11, b);
+                    ppu.cia = cia.wrapping_add(4);
+                    return Ok(StepOutcome::Continue);
+                }
+                // ---- R11.6e: VMX multiply even/odd -----------------
+                8 | 72 | 264 | 328 | 520 | 584 | 776 | 840 => {
+                    let a = ppu.vr[op.va() as usize];
+                    let b = ppu.vr[op.vb() as usize];
+                    ppu.vr[op.vd() as usize] = vmx_mul_eo(xo11, a, b);
+                    ppu.cia = cia.wrapping_add(4);
+                    return Ok(StepOutcome::Continue);
+                }
+
                 // ---- R11.6d: VMX per-element shift/rotate ----------
                 // Shift amount is the low bits of each lane in vb
                 // (mod lane-width). vrl*=rotate, vsl*=shl, vsr*=shr
@@ -4154,6 +4323,60 @@ pub mod encode {
     pub const fn lvsl(vd: u32, ra: u32, rb: u32) -> u32 { xo31_dar(vd, ra, rb, 6) }
     /// `lvsr vD, ra, rb`. #[must_use]
     pub const fn lvsr(vd: u32, ra: u32, rb: u32) -> u32 { xo31_dar(vd, ra, rb, 38) }
+
+    // -- R11.6e: VMX pack/unpack/multiply + vsel/vsldoi -----------
+    /// `vsel vD, vA, vB, vC` (VA-form 6-bit XO=42).
+    #[must_use]
+    pub const fn vsel(vd: u32, va: u32, vb: u32, vc: u32) -> u32 {
+        (4 << 26) | ((vd & 0x1F) << 21) | ((va & 0x1F) << 16)
+            | ((vb & 0x1F) << 11) | ((vc & 0x1F) << 6) | 42
+    }
+    /// `vsldoi vD, vA, vB, SH` (VA-form 6-bit XO=44, SH at bits 22-25).
+    #[must_use]
+    pub const fn vsldoi(vd: u32, va: u32, vb: u32, sh: u32) -> u32 {
+        (4 << 26) | ((vd & 0x1F) << 21) | ((va & 0x1F) << 16)
+            | ((vb & 0x1F) << 11) | ((sh & 0xF) << 6) | 44
+    }
+    /// `vpkuhum`. #[must_use]
+    pub const fn vpkuhum(vd: u32, va: u32, vb: u32) -> u32 { vx_form(14, vd, va, vb) }
+    /// `vpkuwum`. #[must_use]
+    pub const fn vpkuwum(vd: u32, va: u32, vb: u32) -> u32 { vx_form(78, vd, va, vb) }
+    /// `vpkuhus`. #[must_use]
+    pub const fn vpkuhus(vd: u32, va: u32, vb: u32) -> u32 { vx_form(142, vd, va, vb) }
+    /// `vpkuwus`. #[must_use]
+    pub const fn vpkuwus(vd: u32, va: u32, vb: u32) -> u32 { vx_form(206, vd, va, vb) }
+    /// `vpkshus`. #[must_use]
+    pub const fn vpkshus(vd: u32, va: u32, vb: u32) -> u32 { vx_form(270, vd, va, vb) }
+    /// `vpkswus`. #[must_use]
+    pub const fn vpkswus(vd: u32, va: u32, vb: u32) -> u32 { vx_form(334, vd, va, vb) }
+    /// `vpkshss`. #[must_use]
+    pub const fn vpkshss(vd: u32, va: u32, vb: u32) -> u32 { vx_form(398, vd, va, vb) }
+    /// `vpkswss`. #[must_use]
+    pub const fn vpkswss(vd: u32, va: u32, vb: u32) -> u32 { vx_form(462, vd, va, vb) }
+    /// `vupkhsb vD, vB`. #[must_use]
+    pub const fn vupkhsb(vd: u32, vb: u32) -> u32 { vx_form(526, vd, 0, vb) }
+    /// `vupklsb vD, vB`. #[must_use]
+    pub const fn vupklsb(vd: u32, vb: u32) -> u32 { vx_form(654, vd, 0, vb) }
+    /// `vupkhsh vD, vB`. #[must_use]
+    pub const fn vupkhsh(vd: u32, vb: u32) -> u32 { vx_form(590, vd, 0, vb) }
+    /// `vupklsh vD, vB`. #[must_use]
+    pub const fn vupklsh(vd: u32, vb: u32) -> u32 { vx_form(718, vd, 0, vb) }
+    /// `vmuloub`. #[must_use]
+    pub const fn vmuloub(vd: u32, va: u32, vb: u32) -> u32 { vx_form(8, vd, va, vb) }
+    /// `vmulouh`. #[must_use]
+    pub const fn vmulouh(vd: u32, va: u32, vb: u32) -> u32 { vx_form(72, vd, va, vb) }
+    /// `vmulosb`. #[must_use]
+    pub const fn vmulosb(vd: u32, va: u32, vb: u32) -> u32 { vx_form(264, vd, va, vb) }
+    /// `vmulosh`. #[must_use]
+    pub const fn vmulosh(vd: u32, va: u32, vb: u32) -> u32 { vx_form(328, vd, va, vb) }
+    /// `vmuleub`. #[must_use]
+    pub const fn vmuleub(vd: u32, va: u32, vb: u32) -> u32 { vx_form(520, vd, va, vb) }
+    /// `vmuleuh`. #[must_use]
+    pub const fn vmuleuh(vd: u32, va: u32, vb: u32) -> u32 { vx_form(584, vd, va, vb) }
+    /// `vmulesb`. #[must_use]
+    pub const fn vmulesb(vd: u32, va: u32, vb: u32) -> u32 { vx_form(776, vd, va, vb) }
+    /// `vmulesh`. #[must_use]
+    pub const fn vmulesh(vd: u32, va: u32, vb: u32) -> u32 { vx_form(840, vd, va, vb) }
 
     /// `vperm vD, vA, vB, vC` — byte permutation (VA-form 6-bit XO = 43).
     #[must_use]
@@ -6795,5 +7018,108 @@ mod tests {
         step_ok(&mut ppu, &mut mem);
         // word lands in lane 0 (the first 4 bytes).
         assert_eq!(split_lanes(ppu.vr[3])[0], 0x1234_5678);
+    }
+
+    // ---- R11.6e: VMX pack/unpack/multiply + vsel/vsldoi -----------
+
+    #[test]
+    fn vsel_bit_select() {
+        let prog = [encode::vsel(3, 4, 5, 6)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = 0xAAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA;
+        ppu.vr[5] = 0xBBBB_BBBB_BBBB_BBBB_BBBB_BBBB_BBBB_BBBB;
+        ppu.vr[6] = 0xFFFF_FFFF_0000_0000_FFFF_FFFF_0000_0000; // mask
+        step_ok(&mut ppu, &mut mem);
+        // where mask=1 → vb(BB), where 0 → va(AA).
+        assert_eq!(
+            ppu.vr[3],
+            0xBBBB_BBBB_AAAA_AAAA_BBBB_BBBB_AAAA_AAAA
+        );
+    }
+
+    #[test]
+    fn vsldoi_shifts_concatenation() {
+        let prog = [encode::vsldoi(3, 4, 5, 4)]; // shift 4 bytes
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = 0x0001_0203_0405_0607_0809_0A0B_0C0D_0E0F;
+        ppu.vr[5] = 0x1011_1213_1415_1617_1819_1A1B_1C1D_1E1F;
+        step_ok(&mut ppu, &mut mem);
+        // bytes [4..20) of va:vb concatenation.
+        assert_eq!(
+            ppu.vr[3],
+            0x0405_0607_0809_0A0B_0C0D_0E0F_1011_1213
+        );
+    }
+
+    #[test]
+    fn vpkuhum_packs_low_bytes() {
+        let prog = [encode::vpkuhum(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        // each halfword 0x__XX → low byte XX.
+        ppu.vr[4] = 0x00AA_00BB_00CC_00DD_00EE_00FF_0011_0022;
+        ppu.vr[5] = 0x0033_0044_0055_0066_0077_0088_0099_00A0;
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(
+            ppu.vr[3],
+            0xAABB_CCDD_EEFF_1122_3344_5566_7788_99A0
+        );
+    }
+
+    #[test]
+    fn vpkuhus_saturates() {
+        let prog = [encode::vpkuhus(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = 0x0100_00FF_0000_0000_0000_0000_0000_0000;
+        ppu.vr[5] = 0;
+        step_ok(&mut ppu, &mut mem);
+        let out = ppu.vr[3].to_be_bytes();
+        assert_eq!(out[0], 0xFF); // 0x100 saturates to 0xFF
+        assert_eq!(out[1], 0xFF); // 0xFF stays
+    }
+
+    #[test]
+    fn vupkhsb_sign_extends() {
+        let prog = [encode::vupkhsb(3, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        // high byte 0 = 0xFF (-1) → halfword 0xFFFF.
+        let mut b = [0u8; 16];
+        b[0] = 0xFF;
+        b[1] = 0x7F;
+        ppu.vr[5] = u128::from_be_bytes(b);
+        step_ok(&mut ppu, &mut mem);
+        let out = ppu.vr[3].to_be_bytes();
+        assert_eq!(u16::from_be_bytes([out[0], out[1]]), 0xFFFF);
+        assert_eq!(u16::from_be_bytes([out[2], out[3]]), 0x007F);
+    }
+
+    #[test]
+    fn vmuleub_even_byte_multiply() {
+        let prog = [encode::vmuleub(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        // even byte 0 = 0x10 * 0x10 = 0x100.
+        let mut a = [0u8; 16];
+        let mut b = [0u8; 16];
+        a[0] = 0x10; b[0] = 0x10;
+        ppu.vr[4] = u128::from_be_bytes(a);
+        ppu.vr[5] = u128::from_be_bytes(b);
+        step_ok(&mut ppu, &mut mem);
+        let out = ppu.vr[3].to_be_bytes();
+        assert_eq!(u16::from_be_bytes([out[0], out[1]]), 0x0100);
+    }
+
+    #[test]
+    fn vmulosh_odd_halfword_signed() {
+        let prog = [encode::vmulosh(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        // odd halfword 1 (bytes 2..4) = -2 * 3 = -6.
+        let mut a = [0u8; 16];
+        let mut b = [0u8; 16];
+        a[2..4].copy_from_slice(&(-2i16).to_be_bytes());
+        b[2..4].copy_from_slice(&3i16.to_be_bytes());
+        ppu.vr[4] = u128::from_be_bytes(a);
+        ppu.vr[5] = u128::from_be_bytes(b);
+        step_ok(&mut ppu, &mut mem);
+        // result word 0 = -6.
+        assert_eq!(split_lanes(ppu.vr[3])[0] as i32, -6);
     }
 }
