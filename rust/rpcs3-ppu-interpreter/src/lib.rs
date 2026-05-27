@@ -2427,6 +2427,130 @@ pub fn step(ppu: &mut PpuThread, mem: &mut SparseBackend) -> Result<StepOutcome,
                     ppu.cia = cia.wrapping_add(4);
                     return Ok(StepOutcome::Continue);
                 }
+                // ---- R11.6d: VMX per-element shift/rotate ----------
+                // Shift amount is the low bits of each lane in vb
+                // (mod lane-width). vrl*=rotate, vsl*=shl, vsr*=shr
+                // logical, vsra*=shr arithmetic.
+                4 | 68 | 132 | 260 | 324 | 388
+                | 516 | 580 | 644 | 772 | 836 | 900 => {
+                    let a = ppu.vr[op.va() as usize];
+                    let b = ppu.vr[op.vb() as usize];
+                    let r = match xo11 {
+                        4 => vec_u8(a, b, |x, s| x.rotate_left((s & 7) as u32)),
+                        68 => vec_u16(a, b, |x, s| x.rotate_left((s & 15) as u32)),
+                        132 => vec_u32(a, b, |x, s| x.rotate_left(s & 31)),
+                        260 => vec_u8(a, b, |x, s| x << (s & 7)),
+                        324 => vec_u16(a, b, |x, s| x << (s & 15)),
+                        388 => vec_u32(a, b, |x, s| x << (s & 31)),
+                        516 => vec_u8(a, b, |x, s| x >> (s & 7)),
+                        580 => vec_u16(a, b, |x, s| x >> (s & 15)),
+                        644 => vec_u32(a, b, |x, s| x >> (s & 31)),
+                        772 => vec_u8(a, b, |x, s| ((x as i8) >> (s & 7)) as u8),
+                        836 => vec_u16(a, b, |x, s| ((x as i16) >> (s & 15)) as u16),
+                        900 => vec_u32(a, b, |x, s| ((x as i32) >> (s & 31)) as u32),
+                        _ => unreachable!(),
+                    };
+                    ppu.vr[op.vd() as usize] = r;
+                    ppu.cia = cia.wrapping_add(4);
+                    return Ok(StepOutcome::Continue);
+                }
+
+                // ---- R11.6d: VMX merge high/low --------------------
+                12 | 76 | 140 | 268 | 332 | 396 => {
+                    let a = ppu.vr[op.va() as usize].to_be_bytes();
+                    let b = ppu.vr[op.vb() as usize].to_be_bytes();
+                    let mut o = [0u8; 16];
+                    match xo11 {
+                        12 | 268 => {
+                            // vmrghb / vmrglb — interleave bytes.
+                            let base = if xo11 == 12 { 0 } else { 8 };
+                            for i in 0..8 {
+                                o[i * 2] = a[base + i];
+                                o[i * 2 + 1] = b[base + i];
+                            }
+                        }
+                        76 | 332 => {
+                            // vmrghh / vmrglh — interleave halfwords.
+                            let base = if xo11 == 76 { 0 } else { 8 };
+                            for i in 0..4 {
+                                o[i * 4..i * 4 + 2]
+                                    .copy_from_slice(&a[base + i * 2..base + i * 2 + 2]);
+                                o[i * 4 + 2..i * 4 + 4]
+                                    .copy_from_slice(&b[base + i * 2..base + i * 2 + 2]);
+                            }
+                        }
+                        140 | 396 => {
+                            // vmrghw / vmrglw — interleave words.
+                            let base = if xo11 == 140 { 0 } else { 8 };
+                            o[0..4].copy_from_slice(&a[base..base + 4]);
+                            o[4..8].copy_from_slice(&b[base..base + 4]);
+                            o[8..12].copy_from_slice(&a[base + 4..base + 8]);
+                            o[12..16].copy_from_slice(&b[base + 4..base + 8]);
+                        }
+                        _ => unreachable!(),
+                    }
+                    ppu.vr[op.vd() as usize] = u128::from_be_bytes(o);
+                    ppu.cia = cia.wrapping_add(4);
+                    return Ok(StepOutcome::Continue);
+                }
+
+                // ---- R11.6d: VMX splat (from element) --------------
+                // vsplt* vD, vB, UIMM — replicate element UIMM of vB.
+                // UIMM sits in the vA field.
+                524 | 588 | 652 => {
+                    let b = ppu.vr[op.vb() as usize].to_be_bytes();
+                    let uimm = op.va() as usize;
+                    let mut o = [0u8; 16];
+                    match xo11 {
+                        524 => {
+                            let v = b[uimm & 0xF];
+                            o = [v; 16];
+                        }
+                        588 => {
+                            let idx = (uimm & 0x7) * 2;
+                            let h = [b[idx], b[idx + 1]];
+                            for i in 0..8 {
+                                o[i * 2..i * 2 + 2].copy_from_slice(&h);
+                            }
+                        }
+                        652 => {
+                            let idx = (uimm & 0x3) * 4;
+                            let w = [b[idx], b[idx + 1], b[idx + 2], b[idx + 3]];
+                            for i in 0..4 {
+                                o[i * 4..i * 4 + 4].copy_from_slice(&w);
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                    ppu.vr[op.vd() as usize] = u128::from_be_bytes(o);
+                    ppu.cia = cia.wrapping_add(4);
+                    return Ok(StepOutcome::Continue);
+                }
+
+                // ---- R11.6d: VMX splat immediate (sign-ext 5-bit) --
+                // vspltis* vD, SIMM — SIMM is a signed 5-bit in vA.
+                780 | 844 | 908 => {
+                    let simm5 = op.va() as u32;
+                    // sign-extend 5 bits.
+                    let sval = ((simm5 << 27) as i32 >> 27) as i64;
+                    let r = match xo11 {
+                        780 => u128::from_be_bytes([sval as u8; 16]),
+                        844 => {
+                            let h = (sval as u16).to_be_bytes();
+                            let mut o = [0u8; 16];
+                            for i in 0..8 {
+                                o[i * 2..i * 2 + 2].copy_from_slice(&h);
+                            }
+                            u128::from_be_bytes(o)
+                        }
+                        908 => join_lanes([sval as u32; 4]),
+                        _ => unreachable!(),
+                    };
+                    ppu.vr[op.vd() as usize] = r;
+                    ppu.cia = cia.wrapping_add(4);
+                    return Ok(StepOutcome::Continue);
+                }
+
                 // ---- R11.6c: VMX compares (eq + gt, u/s) -----------
                 // VXR-form: Rc is bit 21 (LSB 10, mask 0x400). The
                 // record form (`.`) also writes CR6 = {all_true, 0,
@@ -3712,6 +3836,60 @@ pub mod encode {
     pub const fn vcmpgtsw(vd: u32, va: u32, vb: u32, record: bool) -> u32 {
         vcr_form(902, vd, va, vb, record)
     }
+
+    // -- R11.6d: VMX shift/rotate (per-element) -------------------
+    /// `vrlb`. #[must_use]
+    pub const fn vrlb(vd: u32, va: u32, vb: u32) -> u32 { vx_form(4, vd, va, vb) }
+    /// `vrlh`. #[must_use]
+    pub const fn vrlh(vd: u32, va: u32, vb: u32) -> u32 { vx_form(68, vd, va, vb) }
+    /// `vrlw`. #[must_use]
+    pub const fn vrlw(vd: u32, va: u32, vb: u32) -> u32 { vx_form(132, vd, va, vb) }
+    /// `vslb`. #[must_use]
+    pub const fn vslb(vd: u32, va: u32, vb: u32) -> u32 { vx_form(260, vd, va, vb) }
+    /// `vslh`. #[must_use]
+    pub const fn vslh(vd: u32, va: u32, vb: u32) -> u32 { vx_form(324, vd, va, vb) }
+    /// `vslw`. #[must_use]
+    pub const fn vslw(vd: u32, va: u32, vb: u32) -> u32 { vx_form(388, vd, va, vb) }
+    /// `vsrb`. #[must_use]
+    pub const fn vsrb(vd: u32, va: u32, vb: u32) -> u32 { vx_form(516, vd, va, vb) }
+    /// `vsrh`. #[must_use]
+    pub const fn vsrh(vd: u32, va: u32, vb: u32) -> u32 { vx_form(580, vd, va, vb) }
+    /// `vsrw`. #[must_use]
+    pub const fn vsrw(vd: u32, va: u32, vb: u32) -> u32 { vx_form(644, vd, va, vb) }
+    /// `vsrab`. #[must_use]
+    pub const fn vsrab(vd: u32, va: u32, vb: u32) -> u32 { vx_form(772, vd, va, vb) }
+    /// `vsrah`. #[must_use]
+    pub const fn vsrah(vd: u32, va: u32, vb: u32) -> u32 { vx_form(836, vd, va, vb) }
+    /// `vsraw`. #[must_use]
+    pub const fn vsraw(vd: u32, va: u32, vb: u32) -> u32 { vx_form(900, vd, va, vb) }
+
+    // -- R11.6d: VMX merge ----------------------------------------
+    /// `vmrghb`. #[must_use]
+    pub const fn vmrghb(vd: u32, va: u32, vb: u32) -> u32 { vx_form(12, vd, va, vb) }
+    /// `vmrghh`. #[must_use]
+    pub const fn vmrghh(vd: u32, va: u32, vb: u32) -> u32 { vx_form(76, vd, va, vb) }
+    /// `vmrghw`. #[must_use]
+    pub const fn vmrghw(vd: u32, va: u32, vb: u32) -> u32 { vx_form(140, vd, va, vb) }
+    /// `vmrglb`. #[must_use]
+    pub const fn vmrglb(vd: u32, va: u32, vb: u32) -> u32 { vx_form(268, vd, va, vb) }
+    /// `vmrglh`. #[must_use]
+    pub const fn vmrglh(vd: u32, va: u32, vb: u32) -> u32 { vx_form(332, vd, va, vb) }
+    /// `vmrglw`. #[must_use]
+    pub const fn vmrglw(vd: u32, va: u32, vb: u32) -> u32 { vx_form(396, vd, va, vb) }
+
+    // -- R11.6d: VMX splat (UIMM in va slot) ----------------------
+    /// `vspltb vD, vB, UIMM`. #[must_use]
+    pub const fn vspltb(vd: u32, vb: u32, uimm: u32) -> u32 { vx_form(524, vd, uimm, vb) }
+    /// `vsplth vD, vB, UIMM`. #[must_use]
+    pub const fn vsplth(vd: u32, vb: u32, uimm: u32) -> u32 { vx_form(588, vd, uimm, vb) }
+    /// `vspltw vD, vB, UIMM`. #[must_use]
+    pub const fn vspltw(vd: u32, vb: u32, uimm: u32) -> u32 { vx_form(652, vd, uimm, vb) }
+    /// `vspltisb vD, SIMM`. #[must_use]
+    pub const fn vspltisb(vd: u32, simm: u32) -> u32 { vx_form(780, vd, simm & 0x1F, 0) }
+    /// `vspltish vD, SIMM`. #[must_use]
+    pub const fn vspltish(vd: u32, simm: u32) -> u32 { vx_form(844, vd, simm & 0x1F, 0) }
+    /// `vspltisw vD, SIMM`. #[must_use]
+    pub const fn vspltisw(vd: u32, simm: u32) -> u32 { vx_form(908, vd, simm & 0x1F, 0) }
 
     /// `vperm vD, vA, vB, vC` — byte permutation (VA-form 6-bit XO = 43).
     #[must_use]
@@ -6137,5 +6315,80 @@ mod tests {
         let out = ppu.vr[3].to_be_bytes();
         assert_eq!(out[0], 0xFF);
         assert_eq!(out[1], 0x00);
+    }
+
+    // ---- R11.6d: VMX shift/rotate + merge + splat -----------------
+
+    #[test]
+    fn vslb_shifts_each_byte() {
+        let prog = [encode::vslb(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = u128::from_be_bytes([0x01; 16]);
+        ppu.vr[5] = u128::from_be_bytes([0x04; 16]); // shift 4
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.vr[3], u128::from_be_bytes([0x10; 16]));
+    }
+
+    #[test]
+    fn vsrab_arithmetic_shift_sign() {
+        let prog = [encode::vsrab(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = u128::from_be_bytes([0x80; 16]); // -128
+        ppu.vr[5] = u128::from_be_bytes([0x01; 16]); // >>1 arithmetic
+        step_ok(&mut ppu, &mut mem);
+        // -128 >> 1 = -64 = 0xC0
+        assert_eq!(ppu.vr[3], u128::from_be_bytes([0xC0; 16]));
+    }
+
+    #[test]
+    fn vrlw_rotates_words() {
+        let prog = [encode::vrlw(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = join_lanes([0x8000_0001; 4]);
+        ppu.vr[5] = join_lanes([1; 4]); // rotate-left 1
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.vr[3], join_lanes([0x0000_0003; 4]));
+    }
+
+    #[test]
+    fn vmrghb_interleaves_high_bytes() {
+        let prog = [encode::vmrghb(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        ppu.vr[4] = u128::from_be_bytes([0xAA; 16]);
+        ppu.vr[5] = u128::from_be_bytes([0xBB; 16]);
+        step_ok(&mut ppu, &mut mem);
+        // alternating AA,BB,AA,BB,...
+        let out = ppu.vr[3].to_be_bytes();
+        for i in 0..16 {
+            assert_eq!(out[i], if i % 2 == 0 { 0xAA } else { 0xBB });
+        }
+    }
+
+    #[test]
+    fn vspltb_replicates_element() {
+        let prog = [encode::vspltb(3, 4, 5)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        let mut a = [0u8; 16];
+        a[5] = 0x7E;
+        ppu.vr[4] = u128::from_be_bytes(a);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.vr[3], u128::from_be_bytes([0x7E; 16]));
+    }
+
+    #[test]
+    fn vspltisw_sign_extends_immediate() {
+        // SIMM = -1 (0x1F as 5-bit) → all words 0xFFFFFFFF.
+        let prog = [encode::vspltisw(3, 0x1F)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.vr[3], join_lanes([0xFFFF_FFFF; 4]));
+    }
+
+    #[test]
+    fn vspltisb_positive_immediate() {
+        let prog = [encode::vspltisb(3, 7)];
+        let (mut ppu, mut mem) = make_env(&prog);
+        step_ok(&mut ppu, &mut mem);
+        assert_eq!(ppu.vr[3], u128::from_be_bytes([7; 16]));
     }
 }
