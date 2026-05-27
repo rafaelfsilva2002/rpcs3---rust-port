@@ -63,6 +63,38 @@ header word `cmd`:
 (Exact masks cross-checked against RPCS3 `rsx::FIFO::fifo_engine`
 during R12.1.)
 
-## Validation status
+## Validation status — command/state layer CLOSED 2026-05-27
 
-- R12.1: (in progress)
+| Slice | Commit | Crate | Scope |
+|---|---|---|---|
+| R12.1 | `820e3a650` | new `rpcs3-rsx-fifo` | FIFO command decoder (header → method writes / jump / call / return / nop) |
+| R12.2 | `0d9ab06f2` | `rpcs3-rsx-fifo` | FifoEngine — DMA control PUT/GET + call stack + run-until-PUT |
+| R12.3 | `6f0bd593a` | new `rpcs3-rsx-state` | method register file `[u32;0x4000]` + FIFO-write apply + typed accessors |
+| R12.4 | `276e52a2f` | `rpcs3-rsx-state` | method-group classify + MethodEffect (semaphore/clear/begin-end) |
+| R12.5 | `0f17214e5` | `rpcs3-rsx-state` | DrawTracker — BEGIN/END + DRAW_ARRAYS/INDEX → DrawCall |
+
+**Result:** the RSX command/state pipeline is complete and pure:
+GCM command stream (BE bytes) → `FifoEngine::run` → `(reg,arg)`
+writes → `RsxState` register file + `MethodEffect` control events +
+`DrawTracker` draw calls. ~36 inline tests across the two new
+crates; workspace gate 270 result blocks, 0 fail. Fully testable
+without a GPU — the natural shape of a GCM-stream replay oracle.
+
+## Deferred — the GPU-backend giant tail (out of near-term scope)
+
+These need an actual GPU backend and are months of work; they do
+NOT fit the byte-exact behavior-freeze model (rendering varies by
+hardware/driver):
+- Vertex/fragment shader decompilation (→ GLSL/SPIR-V). Scaffolds
+  exist (`rsx-gl-decompiler`, `rsx-vk-decompiler`).
+- Texture decode (swizzled/compressed formats).
+- Surface / render-target / framebuffer management
+  (`rsx-surface-store` scaffold).
+- Vulkan / OpenGL backend (actual rendering).
+- Display / VBlank / flip.
+
+A future direction could capture GCM command streams from real
+homebrew (via the existing Docker pipeline) and promote the
+decode→state→drawcall pipeline to replay oracles — the tractable
+behavior-freeze target — while the rendering backend remains a
+separate, large undertaking.

@@ -1,6 +1,26 @@
-# Project Status — R11 CLOSED (PPU interpreter functionally complete: full scalar ISA + VMX/AltiVec ~120 vector ops + system ops; 216 ppu-interpreter lib tests; 268 release blocks; 0 regression)
+# Project Status — R12 RSX command/state layer landed (FIFO decode → engine → method register file → dispatch/effects → draw-call recognition; 2 new crates; 270 release blocks; 0 regression)
 
 **Authoritative current source of truth for the RPCS3 → Rust port.**
+
+R12 (RSX/GPU) is in progress. The **command/state layer** landed
+2026-05-27 across 5 slices (R12.1 → R12.5): two new crates
+`rpcs3-rsx-fifo` (GCM FIFO command decoder + DMA-control FifoEngine
+with PUT/GET + call stack) and `rpcs3-rsx-state` (the ~0x4000-entry
+method register file + method-group classification + MethodEffect
+control-event recognition + DrawTracker draw-call recognition). The
+pipeline is pure and testable end-to-end — a GCM command stream
+(BE bytes) decodes to method writes, applies to the register file,
+surfaces control effects (semaphore/clear/begin-end), and emits
+DrawCall records — without any GPU. ~36 new inline tests; workspace
+gate 270 result blocks, 0 fail. The GPU-backend giant tail (shader
+decompile, texture decode, surface/framebuffer, Vulkan/GL backend)
+is the deferred far end — months of work, needs a real backend, and
+doesn't fit the byte-exact behavior-freeze model. See
+`.planning/R12_RSX_GPU_PLAN.md`.
+
+Previous wave status follows below.
+
+---
 
 R11 (PPU interpreter completion) closed 2026-05-26 across 13
 commits (R11.1 → R11.8). The `rpcs3-ppu-interpreter` now covers
