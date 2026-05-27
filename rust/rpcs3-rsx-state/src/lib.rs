@@ -46,6 +46,71 @@ pub const VIEWPORT_HORIZONTAL: u32 = 0x0A00 >> 2;
 /// `NV4097_SET_VIEWPORT_VERTICAL` (0x0A04).
 pub const VIEWPORT_VERTICAL: u32 = 0x0A04 >> 2;
 
+// -- NV406E (DMA channel) control methods (R12.4) --------------------
+/// `NV406E_SET_REFERENCE` (0x0050).
+pub const SET_REFERENCE: u32 = 0x0050 >> 2;
+/// `NV406E_SEMAPHORE_OFFSET` (0x0064).
+pub const SEMAPHORE_OFFSET: u32 = 0x0064 >> 2;
+/// `NV406E_SEMAPHORE_ACQUIRE` (0x0068).
+pub const SEMAPHORE_ACQUIRE: u32 = 0x0068 >> 2;
+/// `NV406E_SEMAPHORE_RELEASE` (0x006C).
+pub const SEMAPHORE_RELEASE: u32 = 0x006C >> 2;
+/// `NV4097_SET_SEMAPHORE_OFFSET` / back-end write label (0x1D6C).
+pub const BACKEND_WRITE_SEMAPHORE_RELEASE: u32 = 0x1D70 >> 2;
+
+// =====================================================================
+// Method classification + effect recognition (R12.4)
+// =====================================================================
+
+/// Coarse RSX method class for a register. Bands are approximate —
+/// the precise per-method table is built in later slices; this is a
+/// diagnostic grouping for the common regions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MethodGroup {
+    /// NV406E DMA-channel control (semaphore / reference), byte
+    /// offsets `0x40..0x100`.
+    ChannelDma,
+    /// NV4097 Curie 3D state + commands, byte offsets `0x100..0x4000`.
+    Graphics3D,
+    /// Anything outside the recognized bands (M2MF, image blit,
+    /// surface 2D, vendor-specific) — refined in later slices.
+    Other,
+}
+
+/// Classify a method register into its coarse [`MethodGroup`].
+#[must_use]
+pub fn classify(reg: u32) -> MethodGroup {
+    let byte = reg << 2;
+    match byte {
+        0x40..=0xFF => MethodGroup::ChannelDma,
+        0x100..=0x3FFF => MethodGroup::Graphics3D,
+        _ => MethodGroup::Other,
+    }
+}
+
+/// The observable effect of applying one method write. Plain state
+/// writes are [`MethodEffect::SetState`]; control methods that do
+/// something beyond updating the register surface as their own
+/// variant so the command-processor layer can act on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MethodEffect {
+    /// Ordinary register write (the common case).
+    SetState,
+    /// `NV406E_SET_REFERENCE` — publish the channel reference value.
+    SetReference(u32),
+    /// `NV406E_SEMAPHORE_ACQUIRE` — wait until the semaphore reads
+    /// the given value.
+    SemaphoreAcquire(u32),
+    /// `NV406E_SEMAPHORE_RELEASE` / back-end write — store the value
+    /// to the bound semaphore.
+    SemaphoreRelease(u32),
+    /// `NV4097_CLEAR_SURFACE` — clear with the given mask.
+    ClearSurface(u32),
+    /// `NV4097_SET_BEGIN_END` — begin (non-zero mode) / end (0) a
+    /// primitive block.
+    BeginEnd(u32),
+}
+
 // =====================================================================
 // Register file
 // =====================================================================
@@ -92,6 +157,38 @@ impl RsxState {
         for &(reg, arg) in writes {
             self.write(reg, arg);
         }
+    }
+
+    /// Write the register AND classify the write into a
+    /// [`MethodEffect`]. Control methods (semaphore, clear,
+    /// begin/end) return their own variant so the command-processor
+    /// layer can act; everything else is `SetState`.
+    pub fn dispatch(&mut self, reg: u32, arg: u32) -> MethodEffect {
+        self.write(reg, arg);
+        match reg {
+            SET_REFERENCE => MethodEffect::SetReference(arg),
+            SEMAPHORE_ACQUIRE => MethodEffect::SemaphoreAcquire(arg),
+            SEMAPHORE_RELEASE | BACKEND_WRITE_SEMAPHORE_RELEASE => {
+                MethodEffect::SemaphoreRelease(arg)
+            }
+            CLEAR_SURFACE => MethodEffect::ClearSurface(arg),
+            BEGIN_END => MethodEffect::BeginEnd(arg),
+            _ => MethodEffect::SetState,
+        }
+    }
+
+    /// Apply a batch via [`Self::dispatch`], returning the sequence of
+    /// non-`SetState` effects in order (control events the command
+    /// processor must handle).
+    pub fn apply_with_effects(&mut self, writes: &[(u32, u32)]) -> Vec<MethodEffect> {
+        let mut effects = Vec::new();
+        for &(reg, arg) in writes {
+            let e = self.dispatch(reg, arg);
+            if e != MethodEffect::SetState {
+                effects.push(e);
+            }
+        }
+        effects
     }
 
     /// Convenience: run the FIFO over `buf` and apply every write.
@@ -226,5 +323,68 @@ mod tests {
         assert_eq!(CLEAR_SURFACE, 0x1D94 / 4);
         assert_eq!(BEGIN_END, 0x1808 / 4);
         assert_eq!(DRAW_ARRAYS, 0x1814 / 4);
+    }
+
+    // ---- R12.4: classify + dispatch effects -----------------------
+
+    #[test]
+    fn classify_bands() {
+        assert_eq!(classify(SEMAPHORE_RELEASE), MethodGroup::ChannelDma);
+        assert_eq!(classify(COLOR_CLEAR_VALUE), MethodGroup::Graphics3D);
+        assert_eq!(classify(CLEAR_SURFACE), MethodGroup::Graphics3D);
+        // byte 0 (reg 0) is below the ChannelDma band → Other.
+        assert_eq!(classify(0), MethodGroup::Other);
+        // a very high register is Other.
+        assert_eq!(classify(0x3000), MethodGroup::Other);
+    }
+
+    #[test]
+    fn dispatch_plain_write_is_setstate() {
+        let mut s = RsxState::new();
+        assert_eq!(s.dispatch(VIEWPORT_HORIZONTAL, 0x123), MethodEffect::SetState);
+        assert_eq!(s.read(VIEWPORT_HORIZONTAL), 0x123);
+    }
+
+    #[test]
+    fn dispatch_clear_surface_effect() {
+        let mut s = RsxState::new();
+        assert_eq!(s.dispatch(CLEAR_SURFACE, 0xF3), MethodEffect::ClearSurface(0xF3));
+        // register still updated.
+        assert_eq!(s.clear_surface_mask(), 0xF3);
+    }
+
+    #[test]
+    fn dispatch_semaphore_and_begin_end() {
+        let mut s = RsxState::new();
+        assert_eq!(
+            s.dispatch(SEMAPHORE_RELEASE, 0x42),
+            MethodEffect::SemaphoreRelease(0x42)
+        );
+        assert_eq!(
+            s.dispatch(SEMAPHORE_ACQUIRE, 0x7),
+            MethodEffect::SemaphoreAcquire(0x7)
+        );
+        assert_eq!(s.dispatch(SET_REFERENCE, 0x99), MethodEffect::SetReference(0x99));
+        assert_eq!(s.dispatch(BEGIN_END, 8), MethodEffect::BeginEnd(8));
+        assert_eq!(s.dispatch(BEGIN_END, 0), MethodEffect::BeginEnd(0));
+    }
+
+    #[test]
+    fn apply_with_effects_filters_setstate() {
+        let mut s = RsxState::new();
+        let writes = [
+            (VIEWPORT_HORIZONTAL, 0x10),   // SetState (filtered)
+            (CLEAR_SURFACE, 0xF3),         // effect
+            (COLOR_CLEAR_VALUE, 0xABCD),   // SetState (filtered)
+            (SEMAPHORE_RELEASE, 0x1),      // effect
+        ];
+        let effects = s.apply_with_effects(&writes);
+        assert_eq!(
+            effects,
+            vec![MethodEffect::ClearSurface(0xF3), MethodEffect::SemaphoreRelease(0x1)]
+        );
+        // plain writes still landed.
+        assert_eq!(s.read(VIEWPORT_HORIZONTAL), 0x10);
+        assert_eq!(s.color_clear_value(), 0xABCD);
     }
 }
