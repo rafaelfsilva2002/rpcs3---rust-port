@@ -1,0 +1,78 @@
+# frame_clear_textured_draw_v1.gcmhex — CC0 1.0 (public domain).
+#
+# AUTHORED GCM command stream (NOT a hardware/RPCS3 capture). Faithful
+# to the NV4097 method encoding libgcm emits for a realistic frame:
+# surface setup -> clear -> vertex/index/texture setup -> triangle
+# draw -> frame-end semaphore.
+#
+# Format: one big-endian u32 command word per line; `#` comments and
+# blank lines ignored. Each method here is a single-arg increment
+# header `(1<<18)|(reg<<2)` followed by its argument word.
+#
+# This is the R12.10a golden test rail (freezes the pure RSX decoder).
+# The R12.10a oracle (rust/rpcs3-rsx-state/tests/gcm_replay_oracle.rs)
+# asserts the parsed words equal golden_frame_words() and that the
+# full RsxSnapshot matches. A future R12.10b feeds a *real captured*
+# stream through the same replay_gcm harness.
+
+# --- surface / render-target setup ---
+0x00040200   # SET_SURFACE_CLIP_HORIZONTAL
+0x05000000   #   width 1280 (<<16)
+0x00040204   # SET_SURFACE_CLIP_VERTICAL
+0x02d00000   #   height 720 (<<16)
+0x00040208   # SET_SURFACE_FORMAT
+0x00000048   #   color 0x08, depth 0x2 (<<5)
+0x00040220   # SET_SURFACE_COLOR_TARGET
+0x00000001   #   target A
+0x00040210   # SET_SURFACE_COLOR_AOFFSET
+0x01000000
+0x00040218   # SET_SURFACE_PITCH_A
+0x00001400   #   1280 * 4
+0x00040214   # SET_SURFACE_ZETA_OFFSET
+0x00500000
+0x0004022c   # SET_SURFACE_PITCH_Z
+0x00001400
+
+# --- clear ---
+0x00041d90   # SET_COLOR_CLEAR_VALUE
+0xff202020
+0x00041d94   # CLEAR_SURFACE
+0x000000f3   #   color + depth + stencil
+
+# --- vertex attribute arrays ---
+0x00041740   # SET_VERTEX_DATA_ARRAY_FORMAT[0]
+0x00000c32   #   type F(2), count 3, stride 12
+0x00041680   # SET_VERTEX_DATA_ARRAY_OFFSET[0]
+0x80001000   #   main memory (bit31)
+0x00041744   # SET_VERTEX_DATA_ARRAY_FORMAT[1]
+0x00000444   #   type UB(4), count 4, stride 4
+0x00041684   # SET_VERTEX_DATA_ARRAY_OFFSET[1]
+0x80002000
+
+# --- index array ---
+0x0004181c   # SET_INDEX_ARRAY_ADDRESS
+0x00100000
+0x00041820   # SET_INDEX_ARRAY_DMA
+0x00000010   #   bit4 set -> u16 indices
+
+# --- texture unit 0 ---
+0x00041a00   # SET_TEXTURE_OFFSET[0]
+0x00200000
+0x00041a04   # SET_TEXTURE_FORMAT[0]
+0x00038522   #   loc 2, 2D, format 0x85, 3 mips
+0x00041a0c   # SET_TEXTURE_CONTROL0[0]
+0x80000000   #   enable (bit31)
+0x00041a18   # SET_TEXTURE_IMAGE_RECT[0]
+0x01000100   #   256 x 256
+
+# --- draw ---
+0x00041808   # SET_BEGIN_END
+0x00000005   #   triangles
+0x00041814   # DRAW_ARRAYS
+0x02000000   #   first 0, count 3
+0x00041808   # SET_BEGIN_END
+0x00000000   #   end
+
+# --- frame-end semaphore ---
+0x0004006c   # NV406E SEMAPHORE_RELEASE
+0x12345678

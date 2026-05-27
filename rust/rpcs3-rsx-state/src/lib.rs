@@ -19,7 +19,10 @@
 //! divided by 4).
 
 use rpcs3_rsx_fifo::{FifoEngine, FifoError};
-use rpcs3_rsx_vertex_data::VertexBaseType;
+// `pub use` both imports `VertexBaseType` for internal use and
+// re-exports it so consumers (and the replay oracle) get it without a
+// separate `rpcs3-rsx-vertex-data` import.
+pub use rpcs3_rsx_vertex_data::VertexBaseType;
 
 /// Number of u32 method registers (`0x10000` bytes / 4).
 pub const METHOD_COUNT: usize = 0x4000;
@@ -760,6 +763,74 @@ impl RsxState {
             clip: (w, h),
         }
     }
+}
+
+// =====================================================================
+// R12.10 — GCM stream replay harness (oracle support)
+// =====================================================================
+
+/// The full structured result of replaying a GCM command stream
+/// through the decode → state → descriptor pipeline. This is the
+/// "expected output" shape a replay oracle asserts against — reused
+/// by both the authored golden stream (R12.10a) and a real captured
+/// stream (R12.10b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RsxSnapshot {
+    /// Draw calls finalized during the stream, in order.
+    pub draw_calls: Vec<DrawCall>,
+    /// Non-`SetState` control effects (semaphore / clear / begin-end),
+    /// in order.
+    pub effects: Vec<MethodEffect>,
+    /// Enabled vertex attributes as `(index, descriptor)`.
+    pub vertex_attributes: Vec<(u32, VertexAttribute)>,
+    /// Bound index array.
+    pub index_array: IndexArray,
+    /// Configured texture units as `(unit, descriptor)` (FORMAT != 0).
+    pub textures: Vec<(u32, TextureDescriptor)>,
+    /// Surface / render-target binding.
+    pub surface: SurfaceDescriptor,
+}
+
+/// Replay a GCM command stream `buf` (raw big-endian bytes), running
+/// it from offset 0 to `put`, and return the full [`RsxSnapshot`].
+///
+/// Drives the complete pure pipeline in one pass: each decoded
+/// `(reg, arg)` write is dispatched into the register file (collecting
+/// [`MethodEffect`]s) and fed to a [`DrawTracker`] (collecting
+/// [`DrawCall`]s); afterwards every resource descriptor is read back
+/// from the final register state.
+pub fn replay_gcm(buf: &[u8], put: u32) -> Result<RsxSnapshot, FifoError> {
+    let mut engine = FifoEngine::new(0, put);
+    let writes = engine.run(buf)?;
+
+    let mut state = RsxState::new();
+    let mut tracker = DrawTracker::new();
+    let mut effects = Vec::new();
+    let mut draw_calls = Vec::new();
+
+    for &(reg, arg) in &writes {
+        // dispatch writes the register AND classifies the effect.
+        let e = state.dispatch(reg, arg);
+        if e != MethodEffect::SetState {
+            effects.push(e);
+        }
+        if let Some(dc) = tracker.process(reg, arg) {
+            draw_calls.push(dc);
+        }
+    }
+
+    let textures = (0..TEXTURE_UNIT_COUNT)
+        .filter_map(|i| state.texture(i).map(|t| (i, t)))
+        .collect();
+
+    Ok(RsxSnapshot {
+        draw_calls,
+        effects,
+        vertex_attributes: state.enabled_vertex_attributes(),
+        index_array: state.index_array(),
+        textures,
+        surface: state.surface(),
+    })
 }
 
 #[cfg(test)]
