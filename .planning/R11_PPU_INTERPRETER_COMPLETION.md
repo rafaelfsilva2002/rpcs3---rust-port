@@ -75,10 +75,14 @@ ISA (integer/FP/branch/CR/load-store all forms) + VMX/AltiVec
 baseline); workspace gate held at 268 result blocks, 0 fail
 across all 13 commits.
 
-**Deferred (none block user-mode PPC execution):**
-- R11.4b: OE-enabled arithmetic overflow tracking (addo/subfo/
-  mulldo etc.) — low frequency.
-- mftb real monotonic clock (currently stub → 0).
-- supervisor TLB/SLB ops, rfid.
+| R11.4b | `6f90f1afc` | 223 | OE-arithmetic (addo/subfo/nego/carry-chain/mul/div) + XER.OV/SO |
+
+**R11.4b closed the last deferred PPU-interpreter gap** — the
+interpreter is now 100% for user-mode PPC.
+
+**Remaining stubs (NOT reachable by ordinary user-mode game code):**
+- mftb real monotonic clock (currently stub → 0; PpuThread has
+  no `tb` field).
+- supervisor TLB/SLB ops, rfid, mtmsr (no-op stubs).
 - VMX: vmsum* multiply-sum family, vcmpbfp, crypto (vcipher),
   exotic packs (vpkpx) — rare in practice.
