@@ -1,4 +1,36 @@
-# Project Status — R12 RSX pure-pipeline CLOSED (command/state + resource descriptors + GCM replay oracles across all 3 provenance tiers incl. real PSL1GHT-libgcm capture; 3 RSX crates; 274 release blocks; 0 regression)
+# Project Status — R12 RSX pure-pipeline CLOSED + R13.1 cellGcm init HLE LANDED (single_gcm_init_v1 rsxInit runs end-to-end to 0xC0DE through the real cellGcm HLE; 3 RSX crates; 276 release blocks; 0 regression)
+
+> **R13.1 cellGcm init HLE landed 2026-05-28** (commit `f0ef80774`).
+> Two `cellGcmSys` PRX NIDs are now handled in `EmuCore`, mirroring
+> RPCS3's `Emu/Cell/Modules/cellGcmSys.cpp`: `_cellGcmInitBody`
+> (`0x15bae46b`) builds the `CellGcmContextData` + `CellGcmControl`
+> structs in a reserved RSX region, writes `*context`, and backs the
+> local video-memory region `[0xC0000000, +0xf900000)`;
+> `cellGcmGetConfiguration` (`0xe315a0b2`) fills the 24-byte
+> `CellGcmConfig` (local 0xC0000000 / 0xf900000, io, 650 MHz / 500
+> MHz per cellGcmSys.cpp:436-441). NID `0xe315a0b2` was identified
+> by reimplementing RPCS3's `ppu_generate_id` hash
+> (`SHA1(name + suffix)[..4]` LE, `PPUModule.cpp:55`) and matching
+> across all `cellGcmSys` `REG_FUNC` names. Root cause was RE'd with
+> a host-side Python PPC64-BE decoder (Docker objdump unreliable):
+> the routine at `0x126c0` (called from rsxInit at `0x10858`) is
+> **PSL1GHT's local-memory pool allocator**, not a cellGcm consumer;
+> it reads `config.localAddress` / `localSize` and writes a free-block
+> header at the base AND a boundary tag near the end — a zero config
+> → null store at CIA `0x12784`. `single_gcm_init_v1` rsxInit now
+> runs end-to-end → `return 0xC0DE`. New test `rsx_gcm_init` freezes
+> the exact context/control layout per `cellGcmSys.cpp:451-453`. Gate
+> `cargo test --workspace --tests --release` = 276 blocks, 0 fail;
+> 20 SPU oracles intact. See `.planning/R13_CELLGCM_HLE_PLAN.md`.
+>
+> **Next slice R13.2:** non-empty real-libgcm capture through the
+> cellGcm-init'd context (`single_gcm_emit_v1`: rsxInit +
+> rsxClearSurface via the real context → capture `[begin .. current)`
+> → `replay_gcm` → assert `ClearSurface`). Source prepped at
+> `behavior-freeze/fixtures/rsx/sources/single_gcm_emit_v1/`; build
+> needs the PSL1GHT Docker toolchain (currently blocked —
+> `com.docker.service` STOPPED this session). Decode/replay pipeline
+> already proven on real PSL1GHT bytes by R12.11b.
 
 > **R12 RSX wave (pure pipeline) closed 2026-05-27.** Deterministic
 > triangle: `rpcs3-rsx-gcm` (emit) → bytes → `rpcs3-rsx-fifo` (decode)
@@ -10,10 +42,11 @@
 > in `EmuCore::run_self`, dumps via `sysTtyWrite`, and `replay_gcm`
 > decodes `ClearSurface(0xF3)`. Earlier slices: R12.1-5 command/state
 > core, R12.6-9 resource descriptors (vertex/index/texture/surface).
-> **Next advance (separate sub-wave):** gcmInitDefault + draw + flip
-> needs a cellGcm HLE / RSX memory setup. **Deferred giant tail
-> (need GPU, not behavior-freezable):** shader decompile, texture
-> pixel-decode, Vulkan/GL backend. See `.planning/R12_RSX_GPU_PLAN.md`.
+> **R13 sub-wave (cellGcm HLE)** is the "separate sub-wave" the R12
+> closure flagged — R13.1 above landed the init unblock. **Deferred
+> giant tail (need GPU, not behavior-freezable):** shader decompile,
+> texture pixel-decode, Vulkan/GL backend. See
+> `.planning/R12_RSX_GPU_PLAN.md`.
 
 **Authoritative current source of truth for the RPCS3 → Rust port.**
 
