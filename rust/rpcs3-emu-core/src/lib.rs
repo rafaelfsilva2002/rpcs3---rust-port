@@ -306,6 +306,15 @@ pub struct EmuCore {
     /// (+ future mutex/sema/cond/event/rwlock) handle pool. State is
     /// per-`EmuCore`, never shared; reset on `EmuCore::new`.
     pub lv2_sync_state: Lv2SyncState,
+    /// R13.1 — cellGcm HLE state. `_cellGcmInitBody` allocates the
+    /// `CellGcmContextData` + `CellGcmControl` + records the io
+    /// region; `cellGcmGetControlRegister` / `GetConfiguration`
+    /// return these. 0 until init. Layout mirrors RPCS3
+    /// `cellGcmSys.cpp` / `Emu/RSX/GCM.h`.
+    pub gcm_context_addr: u32,
+    pub gcm_control_addr: u32,
+    pub gcm_io_address: u32,
+    pub gcm_io_size: u32,
 }
 
 impl Default for EmuCore {
@@ -331,6 +340,10 @@ impl EmuCore {
             spu_exit_status: None,
             step_budget: 100_000,
             lv2_sync_state: Lv2SyncState::new(),
+            gcm_context_addr: 0,
+            gcm_control_addr: 0,
+            gcm_io_address: 0,
+            gcm_io_size: 0,
         }
     }
 
@@ -1436,6 +1449,140 @@ impl EmuCore {
                                  → {written}: {formatted:?}",
                             );
                             self.ppu.gpr[3] = formatted.len() as u64;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // R13.1 — cellGcmSys: _cellGcmInitBody. Ports
+                        // the guest-visible state setup of RPCS3
+                        // cellGcmSys.cpp:390 (no renderer / GPU):
+                        // build the CellGcmContextData + CellGcmControl
+                        // in a reserved RSX region, write *context, and
+                        // record the io region. Struct layouts from
+                        // Emu/RSX/GCM.h (Context = 4×u32 be; Control =
+                        // 3×u32 be).
+                        0x15bae46b => {
+                            // _cellGcmInitBody(context**, cmdSize,
+                            //                  ioSize, ioAddress)
+                            let context_pp = r3_in as u32;
+                            let _cmd_size = r4_in as u32;
+                            let io_size = self.ppu.gpr[5] as u32;
+                            let io_address = self.ppu.gpr[6] as u32;
+
+                            // Reserved RSX region for the kernel-side
+                            // gcm structs (RPCS3 uses render->device_addr
+                            // + dma_address; we carve a fixed unused page).
+                            const GCM_CTX_ADDR: u32 = 0x3000_0000;
+                            const GCM_CONTROL_ADDR: u32 = 0x3000_0040;
+                            // alloc_at errors if already mapped (e.g. a
+                            // second init); ignore — the writes below are
+                            // what matter.
+                            let _ = self.mem.alloc_at(
+                                GCM_CTX_ADDR,
+                                0x1000,
+                                PageFlags::READABLE | PageFlags::WRITABLE,
+                            );
+
+                            // Local (video) memory region — RPCS3
+                            // cellGcmSys.cpp:404-406 falloc(local_mem_base,
+                            // local_size, vm::video). PSL1GHT's rsxInit
+                            // builds a local-memory pool allocator over this
+                            // span: it writes a free-block header at the base
+                            // AND a boundary tag near the end (disasm: the
+                            // pool init at 0x126c0 does std at [base] and
+                            // stdx at [base + size - 16]), so the WHOLE
+                            // region must be backed, not just the base page.
+                            const GCM_LOCAL_ADDR: u32 = 0xC000_0000;
+                            const GCM_LOCAL_SIZE: u32 = 0x0f90_0000;
+                            let _ = self.mem.alloc_at(
+                                GCM_LOCAL_ADDR,
+                                GCM_LOCAL_SIZE,
+                                PageFlags::READABLE | PageFlags::WRITABLE,
+                            );
+
+                            // CellGcmContextData: begin/end/current/
+                            // callback (cellGcmSys.cpp:451-454).
+                            let begin = io_address.wrapping_add(4096);
+                            let end =
+                                io_address.wrapping_add(32 * 1024 - 4);
+                            let mut ctx = [0u8; 16];
+                            ctx[0..4].copy_from_slice(&begin.to_be_bytes());
+                            ctx[4..8].copy_from_slice(&end.to_be_bytes());
+                            ctx[8..12].copy_from_slice(&begin.to_be_bytes());
+                            // callback = 0: small frames never reach the
+                            // buffer-full flush path that would call it.
+                            ctx[12..16].copy_from_slice(&0u32.to_be_bytes());
+                            self.mem.write(GCM_CTX_ADDR, &ctx).ok();
+
+                            // *context = GCM_CTX_ADDR (cellGcmSys.cpp:462).
+                            self.mem
+                                .write(context_pp, &GCM_CTX_ADDR.to_be_bytes())
+                                .ok();
+
+                            // CellGcmControl { put, get, ref }: ref starts
+                            // 0xffffffff per hardware; put/get 0.
+                            let mut ctrl = [0u8; 12];
+                            ctrl[8..12]
+                                .copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+                            self.mem.write(GCM_CONTROL_ADDR, &ctrl).ok();
+
+                            self.gcm_context_addr = GCM_CTX_ADDR;
+                            self.gcm_control_addr = GCM_CONTROL_ADDR;
+                            self.gcm_io_address = io_address;
+                            self.gcm_io_size = io_size;
+                            eprintln!(
+                                "[R13.1] _cellGcmInitBody(ctx**=0x{context_pp:x}, \
+                                 io=0x{io_address:x}, ioSize=0x{io_size:x}) → \
+                                 ctx@0x{GCM_CTX_ADDR:x} begin=0x{begin:x}",
+                            );
+                            self.ppu.gpr[3] = 0; // CELL_OK
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // R13.1 — cellGcmSys: cellGcmGetConfiguration
+                        // (NID confirmed via RPCS3's NID hash:
+                        // SHA1("cellGcmGetConfiguration"+suffix)[..4] LE
+                        // == 0xe315a0b2). Copies the CellGcmConfig that
+                        // _cellGcmInitBody populated to *config
+                        // (cellGcmSys.cpp:342-346). Layout = 6 BE u32
+                        // (GCM.h:12): localAddress, ioAddress, localSize,
+                        // ioSize, memoryFrequency, coreFrequency. PSL1GHT's
+                        // rsxInit reads localAddress (off 0) + localSize
+                        // (off 8) from here to seed its local-memory pool
+                        // allocator (disasm 0x10844-0x10858) — a zero
+                        // config makes that allocator store to null.
+                        0xe315a0b2 => {
+                            let config_ptr = r3_in as u32;
+                            // local mem constants mirror _cellGcmInitBody
+                            // (cellGcmSys.cpp:404-405; local_mem_base
+                            // 0xC0000000, size 0xf900000).
+                            const GCM_LOCAL_ADDR: u32 = 0xC000_0000;
+                            const GCM_LOCAL_SIZE: u32 = 0x0f90_0000;
+                            let mut cfg = [0u8; 24];
+                            cfg[0..4]
+                                .copy_from_slice(&GCM_LOCAL_ADDR.to_be_bytes());
+                            cfg[4..8].copy_from_slice(
+                                &self.gcm_io_address.to_be_bytes(),
+                            );
+                            cfg[8..12]
+                                .copy_from_slice(&GCM_LOCAL_SIZE.to_be_bytes());
+                            cfg[12..16]
+                                .copy_from_slice(&self.gcm_io_size.to_be_bytes());
+                            // memoryFrequency 650 MHz, coreFrequency 500 MHz
+                            // (cellGcmSys.cpp:440-441).
+                            cfg[16..20].copy_from_slice(
+                                &650_000_000u32.to_be_bytes(),
+                            );
+                            cfg[20..24].copy_from_slice(
+                                &500_000_000u32.to_be_bytes(),
+                            );
+                            self.mem.write(config_ptr, &cfg).ok();
+                            eprintln!(
+                                "[R13.1] cellGcmGetConfiguration(config=\
+                                 0x{config_ptr:x}) → local=0x{GCM_LOCAL_ADDR:x} \
+                                 io=0x{:x} localSize=0x{GCM_LOCAL_SIZE:x}",
+                                self.gcm_io_address,
+                            );
+                            self.ppu.gpr[3] = 0; // void; CELL_OK is harmless
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }

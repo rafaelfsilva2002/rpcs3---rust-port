@@ -78,39 +78,67 @@ Risk: faithfully reproducing the exact struct layouts + memory
 addresses PSL1GHT expects is iterative — a wrong field offset →
 another downstream fault. Each re-run pins the next.
 
-## R13.1 status — BLOCKED on tooling + source (2026-05-27)
+## R13.1 status — RESOLVED 2026-05-27 (init unblocked; uncommitted)
 
-Attempted the implementation grind. Hit a real wall on two fronts:
+Both walls fell: the clean RPCS3 source IS in the tree at
+`rpcs3/Emu/Cell/Modules/cellGcmSys.cpp`, and a host-side Python
+PPC64-BE decoder (reads the `.elf` directly) replaced the broken
+Docker→objdump capture for the RE.
 
-1. **cellGcmInitBody is firmware-PRX behavior with no source in our
-   tree.** It's not in the homebrew ELF (it's a PRX import resolved
-   from PS3 firmware), and the RPCS3 C++ reimplementation
-   (`cellGcmSys.cpp`) is NOT in `rpcs3-upstream-clean/`. So its exact
-   guest-memory/struct setup (where the command buffer lands, the
-   gcmConfiguration layout, the control-register placement, what
-   `*context` points at) must be reverse-engineered from rsxInit's
-   expectations or obtained from the RPCS3 source. Guessing the
-   struct offsets would just move the fault downstream silently —
-   worse than an honest stop.
-2. **The Docker→output capture is unreliable in this session.** The
-   `.self` *builds* land on the host fine, but `objdump` disassembly
-   (redirected to the mount OR piped to stdout) comes back empty
-   through the harness — only one small early window ever captured.
-   The disassembly-driven RE this grind needs can't iterate reliably
-   here.
+**Root cause (RE-confirmed, no guessing):**
+1. The second cellGcm NID `0xe315a0b2` = **`cellGcmGetConfiguration`**
+   — proved by reimplementing RPCS3's NID hash
+   (`SHA1(name + suffix)[..4]` little-endian, `PPUModule.cpp:55`) and
+   matching it across all 100 cellGcmSys names (`_cellGcmInitBody`
+   → `0x15bae46b` was the sanity check). NOT GetControlRegister (the
+   earlier guess, correctly reverted).
+2. The faulting routine at `0x126c0` (called from rsxInit at
+   `0x10858`) is PSL1GHT's **local-memory pool allocator**, not a
+   cellGcm consumer. The caller (`0x10810`-`0x10858`) does:
+   `bl 0x26650` (= cellGcmGetConfiguration) → `lwz r4,0(r30)`
+   (config.localAddress) + `lwz r5,8(r30)` (config.localSize) →
+   `bl 0x126c0`. The allocator writes a free-block header at the
+   base (`std r8,0(r9)`, r9 = localAddress) AND a boundary tag near
+   the end (`stdx r31,r31,r9` ≈ localAddress + localSize − 16). With
+   the config left zero, localAddress = 0 → null store at `0x12784`.
 
-**To unblock R13 (either path):**
-- Provide / locate the RPCS3 `cellGcmSys.cpp` (or the PSL1GHT
-  `libgcm_sys` source) so cellGcmInitBody's behavior is known
-  exactly, OR
-- A working disassembly path (e.g. run `objdump -d` outside the
-  harness and paste the rsxInit window, or a host-side ppu objdump)
-  to RE rsxInit's expectations of the cellGcm returns.
+**Fix (uncommitted, `rust/rpcs3-emu-core/src/lib.rs`), all values
+from the RPCS3 reference:**
+- `cellGcmGetConfiguration` (0xe315a0b2): writes the 24-byte
+  `CellGcmConfig` (GCM.h:12) to `*config` — localAddress 0xC0000000,
+  ioAddress, localSize 0xf900000, ioSize, memoryFreq 650 MHz,
+  coreFreq 500 MHz (cellGcmSys.cpp:436-441).
+- `_cellGcmInitBody` (0x15bae46b): additionally backs the local
+  video-memory region `[0xC0000000, +0xf900000)` (cellGcmSys.cpp:404-
+  406 `vm::falloc(local_mem_base, local_size, vm::video)`) so the
+  pool allocator's base + end-boundary writes land on real pages.
 
-What IS known + committed: the blocker is precisely
-`cellGcmInitBody` (NID 0x15bae46b) + the second init call
-(0xe315a0b2) returning 0 → null store at CIA 0x12784 (`std r8,
-0(r9)`, r9=0). The probe + fixture are committed and reproduce it.
+**Validated:** `rsx_init_probe` + new `rsx_gcm_init` test — fixture
+runs rsxInit to completion, `return 0xC0DE` (exit 49374), NO null
+store at 0x12784. Context (begin=0x10201000, end=0x10207ffc,
+current=begin) + control (ref=0xffffffff) match cellGcmSys.cpp
+exactly. Gate: `cargo test --workspace --tests --release` = 276
+blocks, 0 fail; 20 SPU oracles intact.
+
+**Capture status:** single_gcm_init_v1 emits NO commands (rsxInit
+then return), so `[GET..PUT)` is empty by design — the test asserts
+init + capture-wiring against the real context. A NON-EMPTY real-
+libgcm capture is R13.2 below (Docker-gated; Docker unresponsive
+this session). The decode/replay pipeline is already proven on real
+PSL1GHT bytes by R12.11b.
+
+## R13.2 — next: emitting fixture for non-empty real capture
+
+`single_gcm_emit_v1` (source prepared, pending Docker build):
+rsxInit (now works) → `rsxSetClearColor`/`rsxClearSurface` through
+the **real** cellGcm-init'd context (inline writes into the io
+buffer at begin=ioAddress+4096) → return 0xC0DE. Then a test reads
+`[begin .. current)` from EmuCore memory (current advances as
+libgcm emits) and `replay_gcm` → asserts `ClearSurface` from a REAL
+full-gcm-path stream (vs R12.11b's manual context). Avoids
+cellGcmFlush/SetFlip (new NIDs) by capturing from the context's
+current pointer, not a flush. Build needs the PSL1GHT Docker
+toolchain.
 
 ## Proposed slice decomposition (R9.1g-style iterative)
 
