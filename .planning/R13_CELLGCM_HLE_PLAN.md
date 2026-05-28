@@ -1,12 +1,16 @@
 # R13 — cellGcm HLE (gcmInitDefault + draw + flip)
 
-**Status:** R13.1 + R13.2 LANDED (2026-05-28). R13.1 unblocked
-`rsxInit` (cellGcm init HLE, commit `f0ef80774`). R13.2 captured the
-first NON-EMPTY real-libgcm GCM stream through the full cellGcm-init
-path — 10 NV4097 words decoded to `ClearSurface(0xF3)`. Next slices
-(R13.3+) walk further into the gcmInitDefault path (cellGcmFlush /
-cellGcmSetFlip / cellGcmSetDisplayBuffer / `sys_rsx_*`) to reach a
-full clear+draw+flip frame.
+**Status:** R13.1 + R13.2 + R13.3 LANDED (2026-05-28). R13.1
+unblocked `rsxInit` (cellGcm init HLE, commit `f0ef80774`). R13.2
+captured the first NON-EMPTY real-libgcm GCM stream — 10 NV4097
+words → `ClearSurface(0xF3)`. R13.3 added the first **real
+DrawCall** captured through the FULL cellGcm path —
+`rsxDrawVertexArray(GCM_TYPE_TRIANGLES, 0, 3)` decoded to
+`DrawCall { primitive=5, kind=Arrays, ranges=[(0,3)] }` alongside
+the clear (20 words / 80 bytes). Next slices (R13.4+) walk further
+into the gcmInitDefault path (cellGcmFlush / cellGcmSetFlip /
+cellGcmSetDisplayBuffer / `sys_rsx_*`) to reach a full clear + draw
++ flip frame.
 
 ## Empirical scoping (R13 probe, 2026-05-27)
 
@@ -157,6 +161,40 @@ emulator memory) — no TTY-hex bridge, no manual flushing.
 `sys_rsx_*` lv2 syscalls (668/669/672/673/674/676/677). Each likely
 surfaces as the next unmet NID/syscall when the fixture set grows
 to include flip+display logic.
+
+## R13.3 status — LANDED 2026-05-28 (first real DrawCall captured)
+
+`single_gcm_draw_v1` (1.7 MB `.self` built via PSL1GHT Docker)
+extends R13.2 by adding a single
+`rsxDrawVertexArray(ctx, GCM_TYPE_TRIANGLES, 0, 3)` — PSL1GHT
+librsx expands this inline into NV4097_SET_BEGIN_END(5) +
+NV4097_DRAW_ARRAYS + NV4097_SET_BEGIN_END(0). The `DrawTracker`
+in `rpcs3-rsx-state` recognises the trio as a complete `DrawCall`.
+
+**Result:** new test `rsx_gcm_draw.rs` captured
+`begin = 0x10201000`, `current = 0x10201050` → **20 GCM words (80
+bytes)**. `replay_gcm` decoded **4 effects** (ClearSurface(0xF3) +
+the begin/end pair from the draw) and **1 DrawCall =
+`{ primitive: 5, kind: Arrays, ranges: [(0, 3)] }`** — exactly what
+the libgcm call emits. Gate
+`cargo test --workspace --tests --release` = **278 blocks, 0 fail,
+6013 asserts**; SPU oracles intact.
+
+**What this closes:** the FULL command-stream layer
+(`rpcs3-rsx-fifo` decode → `rpcs3-rsx-state` register file →
+`DrawTracker`) now cycles on REAL libgcm bytes coming through the
+REAL cellGcm-init'd context, end to end — the behavior-freezable
+half of the RSX pipeline is replay-validated against real PSL1GHT
+output for clears AND draws. GPU rendering (shaders, texture pixel
+decode, Vulkan/GL) stays Camadas C/D/E.
+
+**Docker note (recurring):** the daemon flipped to hung state
+mid-session twice (`docker info` returns then later returns the
+"named pipe ... cannot find" error). User-side restart of Docker
+Desktop fixed it both times. Also: Docker 29.5 dropped recognition
+of `subst` drives in `-v` mounts — use the literal Windows path
+quoted (`-v "c:\full\path:/work"`) under
+`MSYS_NO_PATHCONV=1 bash`.
 
 ## Proposed slice decomposition (R9.1g-style iterative)
 
