@@ -1,4 +1,4 @@
-# Project Status — R12 RSX pure-pipeline CLOSED + R13.1 cellGcm init HLE LANDED (single_gcm_init_v1 rsxInit runs end-to-end to 0xC0DE through the real cellGcm HLE; 3 RSX crates; 276 release blocks; 0 regression)
+# Project Status — R12 RSX pure-pipeline CLOSED + R13.1 cellGcm init HLE + R13.2 first NON-EMPTY real-libgcm capture via full cellGcm path (10 NV4097 words from PSL1GHT librsx through the real rsxInit → ClearSurface(0xF3) decoded; 3 RSX crates; 277 release blocks; 0 regression)
 
 > **R13.1 cellGcm init HLE landed 2026-05-28** (commit `f0ef80774`).
 > Two `cellGcmSys` PRX NIDs are now handled in `EmuCore`, mirroring
@@ -23,14 +23,24 @@
 > `cargo test --workspace --tests --release` = 276 blocks, 0 fail;
 > 20 SPU oracles intact. See `.planning/R13_CELLGCM_HLE_PLAN.md`.
 >
-> **Next slice R13.2:** non-empty real-libgcm capture through the
-> cellGcm-init'd context (`single_gcm_emit_v1`: rsxInit +
-> rsxClearSurface via the real context → capture `[begin .. current)`
-> → `replay_gcm` → assert `ClearSurface`). Source prepped at
-> `behavior-freeze/fixtures/rsx/sources/single_gcm_emit_v1/`; build
-> needs the PSL1GHT Docker toolchain (currently blocked —
-> `com.docker.service` STOPPED this session). Decode/replay pipeline
-> already proven on real PSL1GHT bytes by R12.11b.
+> **R13.2 landed 2026-05-28** — first NON-EMPTY real-libgcm capture
+> via the full cellGcm path. CC0 fixture `single_gcm_emit_v1` (1.7 MB
+> `.self` built via the PSL1GHT Docker toolchain) drives the real
+> `rsxInit` (R13.1) + PSL1GHT librsx emission
+> (`rsxSetClearColor(0xff202020)` / `rsxClearSurface(0xF3)` /
+> `rsxSetWriteCommandLabel`). The new test `rsx_gcm_emit` reads
+> `[context.begin .. context.current)` directly from EmuCore memory
+> (the R12.11a `capture_command_buffer` path applied to the real
+> cellGcm-init'd context) and decodes the stream: **10 GCM words /
+> 40 bytes at `begin=0x10201000`, `current=0x10201028`; 2 effects
+> including `ClearSurface(0xF3)`, 0 draw calls**. This closes the
+> R12.11b → R13 advance: same byte origin (real PSL1GHT librsx), now
+> through the FULL cellGcm init path rather than a manual
+> `gcmContextData` over a static buffer. Gate 277 blocks, 0 fail.
+> Next slices R13.3+ walk further into the gcmInitDefault path
+> (`cellGcmFlush`, `cellGcmSetFlip`, `cellGcmSetDisplayBuffer`,
+> `cellGcmGetFlipStatus`, plus the `sys_rsx_*` lv2 syscalls) toward
+> a full clear+draw+flip frame.
 
 > **R12 RSX wave (pure pipeline) closed 2026-05-27.** Deterministic
 > triangle: `rpcs3-rsx-gcm` (emit) → bytes → `rpcs3-rsx-fifo` (decode)
