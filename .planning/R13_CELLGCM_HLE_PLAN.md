@@ -1,11 +1,12 @@
 # R13 — cellGcm HLE (gcmInitDefault + draw + flip)
 
-**Status:** SCOPING (2026-05-27). The separate sub-wave flagged at
-R12 closure: get a real PSL1GHT homebrew using the FULL gcm path
-(rsxInit/gcmInitDefault → surface → clear → draw → flip) to run
-through EmuCore and capture its command buffer for `replay_gcm`.
-R12.11b deliberately avoided this (manual context) precisely
-because gcmInitDefault needs broad HLE.
+**Status:** R13.1 + R13.2 LANDED (2026-05-28). R13.1 unblocked
+`rsxInit` (cellGcm init HLE, commit `f0ef80774`). R13.2 captured the
+first NON-EMPTY real-libgcm GCM stream through the full cellGcm-init
+path — 10 NV4097 words decoded to `ClearSurface(0xF3)`. Next slices
+(R13.3+) walk further into the gcmInitDefault path (cellGcmFlush /
+cellGcmSetFlip / cellGcmSetDisplayBuffer / `sys_rsx_*`) to reach a
+full clear+draw+flip frame.
 
 ## Empirical scoping (R13 probe, 2026-05-27)
 
@@ -78,7 +79,7 @@ Risk: faithfully reproducing the exact struct layouts + memory
 addresses PSL1GHT expects is iterative — a wrong field offset →
 another downstream fault. Each re-run pins the next.
 
-## R13.1 status — RESOLVED 2026-05-27 (init unblocked; uncommitted)
+## R13.1 status — LANDED 2026-05-27 (init unblocked, commit `f0ef80774`)
 
 Both walls fell: the clean RPCS3 source IS in the tree at
 `rpcs3/Emu/Cell/Modules/cellGcmSys.cpp`, and a host-side Python
@@ -127,18 +128,35 @@ libgcm capture is R13.2 below (Docker-gated; Docker unresponsive
 this session). The decode/replay pipeline is already proven on real
 PSL1GHT bytes by R12.11b.
 
-## R13.2 — next: emitting fixture for non-empty real capture
+## R13.2 status — LANDED 2026-05-28 (non-empty real-libgcm capture)
 
-`single_gcm_emit_v1` (source prepared, pending Docker build):
-rsxInit (now works) → `rsxSetClearColor`/`rsxClearSurface` through
-the **real** cellGcm-init'd context (inline writes into the io
-buffer at begin=ioAddress+4096) → return 0xC0DE. Then a test reads
-`[begin .. current)` from EmuCore memory (current advances as
-libgcm emits) and `replay_gcm` → asserts `ClearSurface` from a REAL
-full-gcm-path stream (vs R12.11b's manual context). Avoids
-cellGcmFlush/SetFlip (new NIDs) by capturing from the context's
-current pointer, not a flush. Build needs the PSL1GHT Docker
-toolchain.
+`single_gcm_emit_v1` built via the PSL1GHT Docker toolchain (1.7 MB
+`.self`) drives the real `rsxInit` (R13.1) followed by PSL1GHT
+librsx emission — `rsxSetClearColor(0xff202020)`,
+`rsxClearSurface(0xF3)`, `rsxSetWriteCommandLabel(0, 0x12345678)` —
+which writes NV4097 method words inline into the cellGcm-init'd
+io command buffer at `begin = ioAddress + 4096`.
+
+**Result:** new test `rsx_gcm_emit.rs` captured
+`begin = 0x10201000`, `current = 0x10201028` → **10 GCM words (40
+bytes)** of REAL libgcm output. `replay_gcm` decoded the stream to
+**2 effects, including `ClearSurface(0xF3)`**, 0 draw calls (only
+clear + label by design). Gate
+`cargo test --workspace --tests --release` = **277 blocks, 0 fail**;
+SPU oracles intact.
+
+**What this closes vs R12.11b:** same byte origin (real PSL1GHT
+librsx), but now through the FULL cellGcm init path rather than a
+manual `gcmContextData` over a static buffer. Capture pattern is
+the R12.11a `capture_command_buffer` path applied to the real
+context (`[context.begin .. context.current)` read straight from
+emulator memory) — no TTY-hex bridge, no manual flushing.
+
+**Out of this slice (R13.3+):** `cellGcmFlush`, `cellGcmSetFlip`,
+`cellGcmSetDisplayBuffer`, `cellGcmGetFlipStatus`, plus the
+`sys_rsx_*` lv2 syscalls (668/669/672/673/674/676/677). Each likely
+surfaces as the next unmet NID/syscall when the fixture set grows
+to include flip+display logic.
 
 ## Proposed slice decomposition (R9.1g-style iterative)
 
