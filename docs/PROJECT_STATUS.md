@@ -1,4 +1,4 @@
-# Project Status — R12 RSX pure-pipeline CLOSED + R13.1 cellGcm init HLE + R13.2 first NON-EMPTY real-libgcm capture via full cellGcm path (10 NV4097 words from PSL1GHT librsx through the real rsxInit → ClearSurface(0xF3) decoded; 3 RSX crates; 277 release blocks; 0 regression)
+# Project Status — R12 RSX pure-pipeline CLOSED + R13.1 cellGcm init HLE + R13.2 first NON-EMPTY real-libgcm capture + R13.3 first real DrawCall captured via full cellGcm path (rsxDrawVertexArray TRIANGLES → DrawCall{primitive=5, kind=Arrays, ranges=[(0,3)]} alongside ClearSurface(0xF3); 3 RSX crates; 278 release blocks; 0 regression)
 
 > **R13.1 cellGcm init HLE landed 2026-05-28** (commit `f0ef80774`).
 > Two `cellGcmSys` PRX NIDs are now handled in `EmuCore`, mirroring
@@ -23,6 +23,23 @@
 > `cargo test --workspace --tests --release` = 276 blocks, 0 fail;
 > 20 SPU oracles intact. See `.planning/R13_CELLGCM_HLE_PLAN.md`.
 >
+> **R13.3 landed 2026-05-28** — first real DrawCall captured through
+> the full cellGcm path. CC0 fixture `single_gcm_draw_v1` extends
+> `single_gcm_emit_v1` by one call:
+> `rsxDrawVertexArray(ctx, GCM_TYPE_TRIANGLES, 0, 3)`. PSL1GHT
+> librsx expands this inline into
+> `NV4097_SET_BEGIN_END(5) + NV4097_DRAW_ARRAYS + NV4097_SET_BEGIN_END(0)`,
+> which the `DrawTracker` in `rpcs3-rsx-state` recognises as a
+> complete `DrawCall`. New test `rsx_gcm_draw` reads
+> `[context.begin .. context.current)` from EmuCore memory: **20 GCM
+> words / 80 bytes at `begin=0x10201000`, `current=0x10201050`;
+> 4 effects including `ClearSurface(0xF3)`, and 1 DrawCall =
+> `{ primitive: 5, kind: Arrays, ranges: [(0, 3)] }`** — exactly what
+> the libgcm call emits. Gate **278 blocks, 0 fail, 6013 asserts**.
+> The full behavior-freezable command-stream layer (FIFO decode +
+> register state + DrawTracker) is now replay-validated against REAL
+> libgcm output for clears AND draws through the REAL cellGcm path.
+>
 > **R13.2 landed 2026-05-28** — first NON-EMPTY real-libgcm capture
 > via the full cellGcm path. CC0 fixture `single_gcm_emit_v1` (1.7 MB
 > `.self` built via the PSL1GHT Docker toolchain) drives the real
@@ -36,8 +53,8 @@
 > including `ClearSurface(0xF3)`, 0 draw calls**. This closes the
 > R12.11b → R13 advance: same byte origin (real PSL1GHT librsx), now
 > through the FULL cellGcm init path rather than a manual
-> `gcmContextData` over a static buffer. Gate 277 blocks, 0 fail.
-> Next slices R13.3+ walk further into the gcmInitDefault path
+> `gcmContextData` over a static buffer.
+> Next slices R13.4+ walk further into the gcmInitDefault path
 > (`cellGcmFlush`, `cellGcmSetFlip`, `cellGcmSetDisplayBuffer`,
 > `cellGcmGetFlipStatus`, plus the `sys_rsx_*` lv2 syscalls) toward
 > a full clear+draw+flip frame.
