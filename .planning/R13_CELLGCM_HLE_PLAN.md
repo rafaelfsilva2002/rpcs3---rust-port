@@ -1,16 +1,16 @@
 # R13 — cellGcm HLE (gcmInitDefault + draw + flip)
 
-**Status:** R13.1 + R13.2 + R13.3 LANDED (2026-05-28). R13.1
-unblocked `rsxInit` (cellGcm init HLE, commit `f0ef80774`). R13.2
-captured the first NON-EMPTY real-libgcm GCM stream — 10 NV4097
-words → `ClearSurface(0xF3)`. R13.3 added the first **real
-DrawCall** captured through the FULL cellGcm path —
-`rsxDrawVertexArray(GCM_TYPE_TRIANGLES, 0, 3)` decoded to
-`DrawCall { primitive=5, kind=Arrays, ranges=[(0,3)] }` alongside
-the clear (20 words / 80 bytes). Next slices (R13.4+) walk further
-into the gcmInitDefault path (cellGcmFlush / cellGcmSetFlip /
-cellGcmSetDisplayBuffer / `sys_rsx_*`) to reach a full clear + draw
-+ flip frame.
+**Status:** R13.1 → R13.4 LANDED (2026-05-28). The full PSL1GHT
+flip path now runs end-to-end through EmuCore: rsxInit → clear →
+draw → gcmSetDisplayBuffer → gcmSetFlip → rsxFlushBuffer →
+gcmGetFlipStatus spin → gcmResetFlipStatus → return 0xC0DE. Two new
+cellGcmSys NID handlers (cellGcmGetControlRegister 0xa547adde +
+cellGcmAddressToOffset 0x21ac3697) were the load-bearing additions;
+SetDisplayBuffer / SetFlip / GetFlipStatus / ResetFlipStatus all
+tolerate silent-0 returns (no OUT pointers, status-only callers).
+Captured stream unchanged from R13.3 (20 words / 80 bytes / 4
+effects / 1 DrawCall) — rsxFlushBuffer's PUT update lands in
+control memory, not the cmd buffer.
 
 ## Empirical scoping (R13 probe, 2026-05-27)
 
@@ -187,6 +187,61 @@ REAL cellGcm-init'd context, end to end — the behavior-freezable
 half of the RSX pipeline is replay-validated against real PSL1GHT
 output for clears AND draws. GPU rendering (shaders, texture pixel
 decode, Vulkan/GL) stays Camadas C/D/E.
+
+## R13.4 status — LANDED 2026-05-28 (full flip path runs end-to-end)
+
+CC0 fixture `single_gcm_setdisplay_v1` (PSL1GHT Docker build)
+extends R13.3 by chaining the full flip sequence:
+`gcmSetDisplayBuffer(0,0,640*4,640,480)` → `gcmSetFlip(ctx, 0)` →
+`rsxFlushBuffer(ctx)` → `while (gcmGetFlipStatus() != 0) spin` →
+`gcmResetFlipStatus()` → label → `return 0xC0DE`.
+
+**RE method (same as R13.1):** the diagnostic probe
+`rsx_setdisplay_probe.rs` faulted with a null instruction-fetch at
+CIA 0x10990. Identified the silent imports involved by hashing the
+trampoline-region NIDs against RPCS3's `ppu_generate_id`
+(SHA1(name + suffix)[..4] LE) over the full `cellGcmSys` REG_FUNC
+list:
+| NID | Name | OUT / return |
+|---|---|---|
+| `0xa53d12ae` | `cellGcmSetDisplayBuffer` | status-only |
+| `0xdc09357e` | `cellGcmSetFlip` | status-only |
+| `0xa547adde` | `cellGcmGetControlRegister` | **returns ptr** |
+| `0x21ac3697` | `cellGcmAddressToOffset` | **OUT param** |
+| `0x72a577ce` | `cellGcmGetFlipStatus` | status-only |
+| `0xb2e761d4` | `cellGcmResetFlipStatus` | void |
+
+Of these, only the two with non-trivial returns/OUTs were the wall —
+the rest tolerate silent-0 returns (the spin loop on
+`gcmGetFlipStatus` even exits immediately because 0 == "flip done").
+
+**Handlers added to `rpcs3-emu-core/src/lib.rs` (no guessing — both
+mirror RPCS3 cellGcmSys.cpp):**
+- `cellGcmGetControlRegister` (0xa547adde): returns
+  `self.gcm_control_addr` (= `GCM_CONTROL_ADDR = 0x30000040` from
+  R13.1 `_cellGcmInitBody`; `cellGcmSys.cpp:260`).
+- `cellGcmAddressToOffset` (0x21ac3697): EA → IO offset, default
+  1:1 io mapping per `_cellGcmInitBody`. `[io_address,
+  io_address+io_size)` → `addr - io_address`; `[0xC0000000,
+  +0xf900000)` (local mem) → `addr - 0xC0000000`; otherwise
+  `CELL_GCM_ERROR_FAILURE` (0x802100ff).
+
+**Validated:** new test `rsx_gcm_flip.rs` (mirror of
+`rsx_gcm_draw.rs`) captures `[context.begin..current)` from EmuCore
+memory and asserts the snapshot still contains
+`ClearSurface(0xF3)` + the TRIANGLES DrawCall after the entire flip
+sequence runs. Stream content is identical to R13.3 (20 words /
+80 bytes / 4 effects / 1 DrawCall) because rsxFlushBuffer's PUT
+update lands in control memory (separate region), not the cmd
+buffer's `[begin..current)` range. Gate
+`cargo test --workspace --tests --release` = **280 blocks, 0 fail,
+6015 asserts**; 20 SPU oracles intact.
+
+**What this closes:** the complete clear+draw+flip frame path is
+now exercise-validated end-to-end through real PSL1GHT libgcm. The
+remaining gcm-init flow (gcmInitDefault, surface setup, vertex
+program upload, etc.) is incremental — each new fixture surfaces
+the next unmet NID/syscall via the same RE methodology.
 
 **Docker note (recurring):** the daemon flipped to hung state
 mid-session twice (`docker info` returns then later returns the

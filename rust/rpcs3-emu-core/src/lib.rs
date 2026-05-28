@@ -1586,6 +1586,71 @@ impl EmuCore {
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
+                        // R13.4 — cellGcmGetControlRegister() ->
+                        // vm::ptr<CellGcmControl>. cellGcmSys.cpp:260
+                        // returns gcm_info.control_addr. Our R13.1
+                        // _cellGcmInitBody placed the control block at
+                        // GCM_CONTROL_ADDR (0x30000040); return that as
+                        // a 32-bit guest pointer in r3. Callers (libgcm
+                        // flip path) deref this for put/get/ref — a
+                        // silent return of 0 was the real R13.4 wall
+                        // (the addressToOffset gap was a side branch).
+                        0xa547adde => {
+                            let ctrl = self.gcm_control_addr;
+                            eprintln!(
+                                "[R13.4] cellGcmGetControlRegister() → \
+                                 0x{ctrl:08x}"
+                            );
+                            self.ppu.gpr[3] = ctrl as u64;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // R13.4 — cellGcmAddressToOffset(address, *offset).
+                        // Translates a PPU effective address to an RSX IO
+                        // offset (cellGcmSys.cpp). The result is returned
+                        // via the *r4 OUT pointer; our prior fast-path
+                        // returning 0 without writing left libgcm wrappers
+                        // (gcmSetDisplayBuffer / gcmSetFlip / …) reading
+                        // uninitialised storage → downstream null deref.
+                        //
+                        // Mapping per R13.1 _cellGcmInitBody (default 1:1
+                        // io binding): an address in [io_address,
+                        // io_address+io_size) maps to (address-io_address);
+                        // an address in the local-mem region
+                        // [0xC0000000, +0xf900000) maps to
+                        // (address-0xC0000000). Otherwise return
+                        // CELL_GCM_ERROR_FAILURE (0x802100ff).
+                        0x21ac3697 => {
+                            let address = r3_in as u32;
+                            let offset_ptr = self.ppu.gpr[4] as u32;
+                            const LOCAL_BASE: u32 = 0xC000_0000;
+                            const LOCAL_SIZE: u32 = 0x0f90_0000;
+                            let io_base = self.gcm_io_address;
+                            let io_size = self.gcm_io_size;
+                            let (io_offset, status) = if io_size != 0
+                                && address >= io_base
+                                && address < io_base.saturating_add(io_size)
+                            {
+                                (address - io_base, 0u32)
+                            } else if address >= LOCAL_BASE
+                                && address < LOCAL_BASE + LOCAL_SIZE
+                            {
+                                (address - LOCAL_BASE, 0u32)
+                            } else {
+                                (0u32, 0x802100ffu32)
+                            };
+                            self.mem
+                                .write(offset_ptr, &io_offset.to_be_bytes())
+                                .ok();
+                            eprintln!(
+                                "[R13.4] cellGcmAddressToOffset(addr=\
+                                 0x{address:08x}, *offset=0x{offset_ptr:08x}) \
+                                 → offset=0x{io_offset:08x} status=0x{status:x}"
+                            );
+                            self.ppu.gpr[3] = status as u64;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
                         _ => {}
                     }
 
