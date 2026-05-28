@@ -1,4 +1,4 @@
-# Project Status — R12 RSX pure-pipeline CLOSED + R13.1 cellGcm init HLE + R13.2 first NON-EMPTY real-libgcm capture + R13.3 first real DrawCall captured via full cellGcm path (rsxDrawVertexArray TRIANGLES → DrawCall{primitive=5, kind=Arrays, ranges=[(0,3)]} alongside ClearSurface(0xF3); 3 RSX crates; 278 release blocks; 0 regression)
+# Project Status — R12 RSX pure-pipeline CLOSED + R13.1..R13.4 cellGcm HLE (full PSL1GHT clear+draw+FLIP frame runs end-to-end through EmuCore: rsxInit → clear → draw → setDisplayBuffer → setFlip → flushBuffer → getFlipStatus spin → resetFlipStatus → 0xC0DE; 3 RSX crates; 280 release blocks; 0 regression)
 
 > **R13.1 cellGcm init HLE landed 2026-05-28** (commit `f0ef80774`).
 > Two `cellGcmSys` PRX NIDs are now handled in `EmuCore`, mirroring
@@ -22,6 +22,30 @@
 > the exact context/control layout per `cellGcmSys.cpp:451-453`. Gate
 > `cargo test --workspace --tests --release` = 276 blocks, 0 fail;
 > 20 SPU oracles intact. See `.planning/R13_CELLGCM_HLE_PLAN.md`.
+>
+> **R13.4 landed 2026-05-28** — full PSL1GHT clear+draw+flip frame
+> runs end-to-end through EmuCore. CC0 fixture
+> `single_gcm_setdisplay_v1` chains
+> `gcmSetDisplayBuffer → gcmSetFlip → rsxFlushBuffer →
+> gcmGetFlipStatus spin → gcmResetFlipStatus → 0xC0DE`. RE'd via the
+> diagnostic probe `rsx_setdisplay_probe` plus NID-hashing all
+> trampoline-region candidates against the full cellGcmSys
+> `REG_FUNC` list: of the 6 NIDs called, only two had non-trivial
+> returns and were the wall — `cellGcmGetControlRegister`
+> (0xa547adde) returns the `CellGcmControl*` (R13.1's
+> `0x30000040`), and `cellGcmAddressToOffset` (0x21ac3697) maps an
+> EA to RSX IO offset via the default 1:1 io binding plus the
+> 0xC0000000 local-mem region. The other four (SetDisplayBuffer,
+> SetFlip, GetFlipStatus, ResetFlipStatus) tolerate silent-0 returns
+> (no OUT pointers; the spin loop on getFlipStatus even exits
+> immediately because 0 means "flip done"). New test
+> `rsx_gcm_flip` captures the cmd buffer and re-asserts
+> ClearSurface(0xF3) + the TRIANGLES DrawCall after the full flip
+> sequence — stream content unchanged from R13.3 (20 words / 80
+> bytes / 4 effects / 1 DrawCall) because flushBuffer's PUT update
+> lands in control memory, not the cmd buffer. Gate **280 blocks,
+> 0 fail, 6015 asserts**. The complete clear+draw+flip frame is
+> now exercise-validated end-to-end through real PSL1GHT libgcm.
 >
 > **R13.3 landed 2026-05-28** — first real DrawCall captured through
 > the full cellGcm path. CC0 fixture `single_gcm_draw_v1` extends
