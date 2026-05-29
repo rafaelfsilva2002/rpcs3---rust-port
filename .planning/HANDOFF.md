@@ -225,15 +225,24 @@ VideoOutManager field. Serialises resolution@0/format@1/aspect@2/pitch@12(BE) in
 the guest `videoConfiguration`. Fixture `single_videoout_config_v1` → **2 (720p)
 post-wire vs 0 pre-wire**. Gate **296/0/6031**.
 
-HLE wave so far (12 functions / 5 crates / 7 modules this run): cellSysutil
+**R13.16 (cellGameGetParamInt + EmuGameConfig provider) LANDED 2026-05-29** — NID
+`0xb7a45caf` → `cell_game_get_param_int` backed by a new `EmuGameConfig` (9-method
+`GameState` provider, parental level=1). Dispatches cleanly with NO BootCheck
+lifecycle. Param-id gotcha: PSL1GHT game.h omits APP_VERSION → its ids ≥102 are
+off-by-one vs real-PS3/crate (crate ParentalLevel=103); fixture passes real id 103.
+Fixture `single_game_paramint_v1` → **1 post-wire vs 0x55 pre-wire**. Gate
+**297/0/6032**. (Caught + fixed an accidental .self commit via amend + per-dir
+.gitignore — binary kept out of history.)
+
+HLE wave so far (13 functions / 6 crates / 8 modules this run): cellSysutil
 int+string; cellSysModule load+isloaded; cellVideoOut resolution+numdevices
-+resavail+getconfig; sys_net inet_addr; cellNetCtl init+getstate+getinfo-MTU. All
-3 wiring shapes + dep/field-reuse proven. **Backlog of easy targets nearly empty.**
-STOP-class confirmed: jpgDec/pngDec=callback (jpgCbCtrlMalloc), cellAudioOut=not
-exposed, dialogs=callbacks. Remaining maybe-viable: cellGame (verify lifecycle),
-font (verify NID-dispatch vs inlined), cellVideoOut GetState (redundant w/ config)
-/ GetDeviceInfo (crate doesn't fill struct). When these run out → wave done,
-give consolidated summary.
++resavail+getconfig; sys_net inet_addr; cellNetCtl init+getstate+getinfo-MTU;
+cellGame getparamint. All 3 wiring shapes + dep/field-reuse proven. **Easy-target
+backlog essentially exhausted.** STOP-class confirmed: jpgDec/pngDec=callback
+(jpgCbCtrlMalloc), cellAudioOut=not-exposed, dialogs=callbacks, savedata=callbacks,
+font-open/fs=real-TTF/FS. Last candidate to probe: font `fontGetStubRevisionFlags`
+(may be inlined). When it runs out → wave done; give consolidated summary +
+what a future session needs (guest-PPU-callback support or a VFS layer).
 
 Next options: (a) continue the HLE wave — next PSL1GHT-exposed module with a
 NON-ZERO distinguishable return (`cellVideoOutGetState`, `cellGameGetParamInt`,
