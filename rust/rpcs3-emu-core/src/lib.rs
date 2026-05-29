@@ -78,6 +78,10 @@ use rpcs3_hle_cellnetctl::{
     NetInfo, StubConnectedBackend,
 };
 use rpcs3_hle_cellgame::cell_game_get_param_int;
+use rpcs3_hle_cellmsgdialog::{
+    cell_msg_dialog_close, cell_msg_dialog_open, last_button as msg_last_button,
+    DialogManager, TypeFlags as MsgTypeFlags,
+};
 #[cfg(feature = "spu-recompiler")]
 use rpcs3_spu_differential::{ExecutionStopReason, SpuExecutor, SpuProgram};
 #[cfg(feature = "spu-recompiler")]
@@ -484,6 +488,10 @@ pub struct EmuCore {
     /// [`EmuCore::call_guest_function`] (the first guest-PPU-callback consumer).
     pub sysutil_callbacks: CallbackTable,
     pub sysutil_queue: CallbackQueue,
+    /// Callback wave — cellMsgDialog state. `cellMsgDialogOpen2` opens it and
+    /// (headless) auto-confirms, invoking the guest dialog callback via
+    /// [`EmuCore::call_guest_function`] with the default button.
+    pub msgdialog: DialogManager,
 }
 
 impl Default for EmuCore {
@@ -519,6 +527,7 @@ impl EmuCore {
             videoout: VideoOutManager::default(),
             sysutil_callbacks: CallbackTable::default(),
             sysutil_queue: CallbackQueue::default(),
+            msgdialog: DialogManager::default(),
         }
     }
 
@@ -1154,6 +1163,21 @@ impl EmuCore {
             return Err(Error::CallbackStepsExhausted);
         }
         Ok(ret)
+    }
+
+    /// Read a NUL-terminated guest C string (BE-agnostic raw bytes), bounded to
+    /// `max` bytes. Reads one byte at a time and stops at the first NUL or read
+    /// error, so it never over-reads past a mapped page. Lossy-UTF-8 decoded.
+    fn read_guest_cstr(&self, addr: u32, max: usize) -> String {
+        let mut bytes = Vec::new();
+        for i in 0..max {
+            let mut b = [0u8; 1];
+            if self.mem.read(addr + i as u32, &mut b).is_err() || b[0] == 0 {
+                break;
+            }
+            bytes.push(b[0]);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     /// Dispatch the syscall that just triggered. The syscall number
@@ -2324,6 +2348,42 @@ impl EmuCore {
                                 )?;
                             }
                             self.ppu.gpr[3] = 0; // CELL_OK
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // Callback wave — cellMsgDialog::cellMsgDialogOpen2
+                        // (NID 0x7603d3db). r3 = type flags, r4 = message ptr,
+                        // r5 = callback FD, r6 = userdata, r7 = unused. With no
+                        // user, emu-core headless-auto-confirms: open -> close
+                        // (default button per type) -> invoke the guest callback
+                        // cb(button, userdata) via call_guest_function.
+                        0x7603d3db => {
+                            let type_flags = self.ppu.gpr[3] as u32;
+                            let msg_ptr = self.ppu.gpr[4] as u32;
+                            let cb_fd = self.ppu.gpr[5] as u32;
+                            let usrdata = self.ppu.gpr[6] as u32;
+                            let message = self.read_guest_cstr(msg_ptr, 256);
+                            match cell_msg_dialog_open(
+                                &mut self.msgdialog,
+                                MsgTypeFlags(type_flags),
+                                &message,
+                            ) {
+                                Ok(()) => {
+                                    let _ =
+                                        cell_msg_dialog_close(&mut self.msgdialog, 0);
+                                    let button = msg_last_button(&self.msgdialog);
+                                    if cb_fd != 0 {
+                                        let _ = self.call_guest_function(
+                                            cb_fd,
+                                            &[button as i64 as u64, u64::from(usrdata)],
+                                        )?;
+                                    }
+                                    self.ppu.gpr[3] = 0; // CELL_OK
+                                }
+                                Err(e) => {
+                                    self.ppu.gpr[3] = u64::from(u32::from(e));
+                                }
+                            }
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }

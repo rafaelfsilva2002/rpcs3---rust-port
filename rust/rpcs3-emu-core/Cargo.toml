@@ -41,6 +41,9 @@ rpcs3-hle-sys-net-user = { path = "../rpcs3-hle-sys-net-user" }
 rpcs3-hle-cellnetctl   = { path = "../rpcs3-hle-cellnetctl" }
 # HLE wave — cellGame (GameState provider for PSF param lookups).
 rpcs3-hle-cellgame     = { path = "../rpcs3-hle-cellgame" }
+# Callback wave — cellMsgDialog (DialogManager; first call_guest_function consumer
+# beyond cellSysutil).
+rpcs3-hle-cellmsgdialog = { path = "../rpcs3-hle-cellmsgdialog" }
 # Optional: the Cranelift SPU JIT, gated behind the `spu-recompiler`
 # feature so default builds stay lean (no Cranelift) and the gate keeps
 # using the interpreter unless explicitly opted in.
