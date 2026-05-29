@@ -33,6 +33,8 @@ rpcs3-lv2-cond         = { path = "../rpcs3-lv2-cond" }
 rpcs3-hle-cellsysutil  = { path = "../rpcs3-hle-cellsysutil" }
 # HLE wave — cellSysModule dynamic loader (stateful: SysmoduleManager field).
 rpcs3-hle-cellsysmodule = { path = "../rpcs3-hle-cellsysmodule" }
+# HLE wave — cellVideoOut (stateless resolution-id -> width/height lookup).
+rpcs3-hle-cellvideoout = { path = "../rpcs3-hle-cellvideoout" }
 # Optional: the Cranelift SPU JIT, gated behind the `spu-recompiler`
 # feature so default builds stay lean (no Cranelift) and the gate keeps
 # using the interpreter unless explicitly opted in.

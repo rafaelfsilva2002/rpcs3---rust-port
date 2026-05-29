@@ -65,6 +65,7 @@ use rpcs3_hle_cellsysutil::{
 use rpcs3_hle_cellsysmodule::{
     cell_sysmodule_is_loaded, cell_sysmodule_load_module, SysmoduleManager,
 };
+use rpcs3_hle_cellvideoout::cell_video_out_get_resolution;
 #[cfg(feature = "spu-recompiler")]
 use rpcs3_spu_differential::{ExecutionStopReason, SpuExecutor, SpuProgram};
 #[cfg(feature = "spu-recompiler")]
@@ -1773,6 +1774,29 @@ impl EmuCore {
                                     let n = s.len().min(max);
                                     self.mem.write(buf_ptr, &s.as_bytes()[..n])?;
                                     self.mem.write(buf_ptr + n as u32, &[0u8])?;
+                                    self.ppu.gpr[3] = 0; // CELL_OK
+                                }
+                                Err(e) => {
+                                    self.ppu.gpr[3] = u64::from(u32::from(e));
+                                }
+                            }
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE wave — cellVideoOut::cellVideoOutGetResolution
+                        // (NID 0xe558748d). STATELESS table lookup. r3 =
+                        // resolution id, r4 = OUT *videoResolution{u16 w;u16 h}.
+                        0xe558748d => {
+                            let id = self.ppu.gpr[3] as u8;
+                            let out_ptr = self.ppu.gpr[4] as u32;
+                            match cell_video_out_get_resolution(id) {
+                                Ok(r) => {
+                                    self.mem
+                                        .write(out_ptr, &(r.width as u16).to_be_bytes())?;
+                                    self.mem.write(
+                                        out_ptr + 2,
+                                        &(r.height as u16).to_be_bytes(),
+                                    )?;
                                     self.ppu.gpr[3] = 0; // CELL_OK
                                 }
                                 Err(e) => {
