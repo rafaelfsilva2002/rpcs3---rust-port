@@ -59,7 +59,9 @@ use rpcs3_lv2_spu_group::{
 use rpcs3_lv2_spu_image::{deploy as deploy_image, build_image, SpuImage, SpuPhdr};
 use rpcs3_spu_interpreter::{run_n as spu_run_n, StepOutcome as SpuStepOutcome, Error as SpuError};
 use rpcs3_spu_thread::SpuThread;
-use rpcs3_hle_cellsysutil::cell_sysutil_get_system_param_int;
+use rpcs3_hle_cellsysutil::{
+    cell_sysutil_get_system_param_int, cell_sysutil_get_system_param_string,
+};
 use rpcs3_hle_cellsysmodule::{
     cell_sysmodule_is_loaded, cell_sysmodule_load_module, SysmoduleManager,
 };
@@ -103,8 +105,13 @@ impl rpcs3_hle_cellsysutil::SysutilState for EmuSysutilConfig {
             _ => None,
         }
     }
-    fn get_param_string(&self, _id: rpcs3_hle_cellsysutil::SysParamId) -> Option<&str> {
-        None
+    fn get_param_string(&self, id: rpcs3_hle_cellsysutil::SysParamId) -> Option<&str> {
+        use rpcs3_hle_cellsysutil::SysParamId as P;
+        match id {
+            // Default account nickname / username. Fixed config, RPCS3-style.
+            P::Nickname | P::CurrentUsername => Some("RPCS3"),
+            _ => None,
+        }
     }
     fn media_ver(&self) -> &str {
         "04.5500"
@@ -1739,6 +1746,33 @@ impl EmuCore {
                             match cell_sysutil_get_system_param_int(&EmuSysutilConfig, id) {
                                 Ok(v) => {
                                     self.mem.write(value_ptr, &v.to_be_bytes())?;
+                                    self.ppu.gpr[3] = 0; // CELL_OK
+                                }
+                                Err(e) => {
+                                    self.ppu.gpr[3] = u64::from(u32::from(e));
+                                }
+                            }
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE wave — cellSysutil::cellSysutilGetSystemParamString
+                        // (NID 0x938013a0). r3 = param id, r4 = OUT *buf,
+                        // r5 = bufsize. Copies the string into the guest buffer,
+                        // truncated to bufsize-1 and NUL-terminated.
+                        0x938013a0 => {
+                            let id = self.ppu.gpr[3] as i32;
+                            let buf_ptr = self.ppu.gpr[4] as u32;
+                            let bufsize = self.ppu.gpr[5] as u32;
+                            match cell_sysutil_get_system_param_string(
+                                &EmuSysutilConfig,
+                                id,
+                                bufsize,
+                            ) {
+                                Ok(s) => {
+                                    let max = (bufsize as usize).saturating_sub(1);
+                                    let n = s.len().min(max);
+                                    self.mem.write(buf_ptr, &s.as_bytes()[..n])?;
+                                    self.mem.write(buf_ptr + n as u32, &[0u8])?;
                                     self.ppu.gpr[3] = 0; // CELL_OK
                                 }
                                 Err(e) => {
