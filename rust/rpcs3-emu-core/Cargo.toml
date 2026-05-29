@@ -46,6 +46,9 @@ spu-recompiler = ["dep:rpcs3-spu-recompiler", "dep:rpcs3-spu-differential"]
 # R12.11b — decode the captured RSX command stream from the gcm
 # fixture's TTY dump.
 rpcs3-rsx-state = { path = "../rpcs3-rsx-state" }
+# R13.5d — decode a captured RSX stream into an RsxState to assert SetState
+# registers (viewport) that aren't exposed in RsxSnapshot.
+rpcs3-rsx-fifo  = { path = "../rpcs3-rsx-fifo" }
 
 [lints]
 workspace = true
