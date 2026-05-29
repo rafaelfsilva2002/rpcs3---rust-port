@@ -92,9 +92,17 @@ No NID walls expected — these are pure inline emission slices:
 | **R13.5e texture binding** | `rsxLoadTexture` populating `TextureDescriptor` | validates Camada B `TextureDescriptor` against real libgcm |
 | **R13.5f cross-frame** | `rsxFlip × 2` with reset between | exercises the flip-reset cycle |
 
-Recommended order: **R13.5c (surface)** first — it adds the most
-descriptor-coverage value per slice (validates a whole Camada B
-struct against real bytes).
+**R13.5c (surface) LANDED 2026-05-29** (commit `7538323a5`) — `single_gcm_surface_v1`
+validates the full `SurfaceDescriptor` against real libgcm AND found+fixed an
+NV4097 PITCH_A wrong-address decode bug (0x0218→0x020C) in BOTH `rpcs3-rsx-state`
+and `rpcs3-rsx-gcm` (self-referential unit tests missed it; the real capture +
+round-trip oracle caught it). Gate 282/0/6017, pushed.
+
+Remaining candidates: R13.5a (multi-draw), R13.5b (indexed draw),
+R13.5d (viewport/depth), R13.5e (texture binding), R13.5f (cross-frame).
+Next recommended: **R13.5e (texture)** — same high descriptor-coverage value
+(validates `TextureDescriptor` against real bytes), and may surface the
+analogous wrong-address question for the NV4097 texture method block.
 
 Out of scope (still deferred): shader decompilation, texture pixel
 decode, Vulkan/GL backend, actual rendering. These need a GPU and
