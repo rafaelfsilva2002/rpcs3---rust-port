@@ -57,6 +57,35 @@ image buffer + the multi-arm Create/Open/ReadHeader SEQ), cellSaveData
 bleed into image-decode / VFS work. Strategic checkpoint: breadth (more callback
 families) vs a VFS layer vs the GPU backend.
 
+## R15 — in-memory VFS, slice 1 LANDED (2026-05-29)
+
+Chose the **VFS layer** (unlocks cellFs + savedata + font). The lv2 fs engine
+already existed (`rpcs3-lv2-fs`: `FileSystem` trait + `FdTable` + generic
+`sys_fs_*`); slice 1 adds an in-memory backend + wires the syscalls.
+
+- **`rpcs3-emu-core/src/vfs.rs` — `MemVfs`** (new module): a RAM `FileSystem`
+  (path→bytes + per-open cursor), lifted from the proven `#[cfg(test)] MemFs` in
+  rpcs3-lv2-fs. EmuCore gains `pub vfs: MemVfs` + `pub fd_table: FdTable` (fds
+  from 4). Tests pre-seed via `core.vfs_add_file(path, data)` BEFORE run_self
+  (deterministic stand-in for on-disk content). Dep `rpcs3-lv2-fs` added.
+- **NUMBERED lv2 syscalls wired** (PSL1GHT `sysLv2Fs*` issue raw `sc`, NOT cell*
+  NID imports): **#801 sys_fs_open, #802 sys_fs_read, #804 sys_fs_close** in the
+  `match number` block (next to existing #803/#809 stubs). Numbered arms set
+  `gpr[3]` and DO NOT touch `cia` (unlike NID arms). OUT ptrs BE; CellError →
+  `u64::from(u32::from(e))`.
+- Fixture `single_fs_read_v1` (uses `sysLv2FsOpen/Read/Close` — `sysFs*` don't
+  link; the `sysLv2Fs*` LV2_SYSCALL stubs are inline) → **0xC0DE** (read seeded
+  16 bytes, sum 0x88) vs **0xBAD0** negative control (no seed → ENOENT). New
+  helper `read_guest_cstr` reused for the path. Design: `.planning/VFS_DESIGN.md`.
+
+GOTCHAS for later slices (from VFS_DESIGN §5): CellFsStat is 52 bytes with
+`be_t<,4>` packing (offsets in the doc); lv2-fs open-flag constants are POSIX-bit
+not octal (`O_CREAT=0x4` vs real `0o100`) — dormant for RDONLY slice 1 but blocks
+CREAT/TRUNC (savedata); #803 write / #809 fstat are EXISTING TTY/stdio stubs to
+EDIT (branch fd>=4 → VFS), not duplicate. Next slices: #808 stat + #818 lseek +
+#809 fstat (font needs fd→path), then dir enum, then write + cellFs HLE, then
+savedata/cellFont.
+
 ## Audit snapshot (2026-05-28)
 
 A full 6-agent code audit (verified against a green gate) produced
