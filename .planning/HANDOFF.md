@@ -165,10 +165,28 @@ gates the *numbered* syscalls. So a probe test can run with `permissive=false`;
 the unwired NID still prints in the log (and the strict assert just fails until
 wired).
 
-Next options: (a) continue the HLE wave — next PSL1GHT-exposed module (`cellGame`
-sysutil/game.h, `cellMsgDialog` sysutil/msg.h, `cellAudio` audio/audio.h,
-`cellIo`), each a mechanical gated slice; (b) the other big waves — GPU rendering
-backend, or commercial-game / SELF-decrypt boot. See docs/PORT_STATUS_AND_ROADMAP.md.
+**R13.9 (cellVideoOut — first STATELESS HLE crate) LANDED 2026-05-29** —
+`cellVideoOutGetResolution` (NID `0xe558748d`, runtime-captured; PSL1GHT links it
+into libsysutil so the log tags it `cellSysutil::`) → `rpcs3-hle-cellvideoout::
+cell_video_out_get_resolution`, a pure id→width/height table lookup with **no
+EmuCore state field and no provider** (unlike cellSysutil/cellSysModule). The arm
+writes width/height as BE `u16` into the guest `videoResolution{u16 w;u16 h}`.
+Fixture `single_videoout_resolution_v1` packs `(w<<16)|h` → **0x050002D0
+(1280×720) post-wire vs 0 pre-wire**. Gate **290/0/6025**. This completes the
+trio of HLE wiring shapes: **provider** (cellSysutil fixed config), **stateful
+EmuCore field** (cellSysModule SysmoduleManager), **stateless lookup**
+(cellVideoOut).
+
+HLE wave so far (5 functions / 3 crates this run): cellSysutil int+string,
+cellSysModule load+isloaded, cellVideoOut resolution. NID-dispatch + 3 wiring
+shapes proven; the remaining 134 crates are mechanical variations.
+
+Next options: (a) continue the HLE wave — next PSL1GHT-exposed module with a
+NON-ZERO distinguishable return (`cellVideoOutGetState`, `cellGameGetParamInt`,
+`cellAudioOutGetSoundAvailability`; NOTE cellPad/cellAudioInit return zeros = not
+distinguishable from the return-0 stub, skip); (b) the other big waves — GPU
+rendering backend, or commercial-game / SELF-decrypt boot. See
+docs/PORT_STATUS_AND_ROADMAP.md.
 
 Out of scope (still deferred): shader decompilation, texture pixel
 decode, Vulkan/GL backend, actual rendering. These need a GPU and
