@@ -84,8 +84,8 @@ use rpcs3_hle_cellmsgdialog::{
 };
 use rpcs3_lv2_fs::{
     sys_fs_close, sys_fs_closedir, sys_fs_lseek, sys_fs_open, sys_fs_opendir,
-    sys_fs_read, sys_fs_readdir, sys_fs_stat, CellFsStat, FdTable, FS_TYPE_DIRECTORY,
-    FS_TYPE_REGULAR,
+    sys_fs_read, sys_fs_readdir, sys_fs_stat, sys_fs_write, CellFsStat, FdTable,
+    FS_TYPE_DIRECTORY, FS_TYPE_REGULAR,
 };
 
 mod vfs;
@@ -323,6 +323,27 @@ fn cellfsstat_to_be(st: &CellFsStat) -> [u8; 52] {
     b[36..44].copy_from_slice(&st.size.to_be_bytes());
     b[44..52].copy_from_slice(&st.blksize.to_be_bytes());
     b
+}
+
+/// Translate a guest lv2 open-flags word (REAL octal ABI) into the flag space
+/// `rpcs3-lv2-fs` expects (which froze POSIX-style bit values, not the octal
+/// ABI). The access mode (RDONLY=0 / WRONLY=1 / RDWR=2) matches both spaces;
+/// only the modifier bits differ.
+fn translate_fs_oflags(guest: u32) -> u32 {
+    let mut f = guest & 0x3; // access mode matches both spaces
+    if guest & 0o100 != 0 {
+        f |= 0x4; // O_CREAT  (0o100 -> lv2-fs 0x4)
+    }
+    if guest & 0o200 != 0 {
+        f |= 0x80; // O_EXCL   (0o200 -> lv2-fs 0x80)
+    }
+    if guest & 0o1000 != 0 {
+        f |= 0x10; // O_TRUNC  (0o1000 -> lv2-fs 0x10)
+    }
+    if guest & 0o2000 != 0 {
+        f |= 0x8; // O_APPEND (0o2000 -> lv2-fs 0x8)
+    }
+    f
 }
 
 // =====================================================================
@@ -1219,6 +1240,12 @@ impl EmuCore {
     /// guest passes to `sysFsOpen`.
     pub fn vfs_add_file(&mut self, path: &str, data: Vec<u8>) {
         self.vfs.add_file(path, data);
+    }
+
+    /// Seed an (empty) VFS directory before `run_self` — e.g. the parent an
+    /// `O_CREAT` open will create a file into.
+    pub fn vfs_add_dir(&mut self, path: &str) {
+        self.vfs.add_dir(path);
     }
 
     /// Dispatch the syscall that just triggered. The syscall number
@@ -3148,7 +3175,9 @@ impl EmuCore {
             // touch cia (the `sc` handler already advanced it).
             801 => {
                 let path_ptr = r3 as u32;
-                let flags = r4 as u32;
+                // Guest passes REAL octal oflags; translate to the lv2-fs flag
+                // space (RDONLY=0 -> 0, so slice-1 reads are unaffected).
+                let flags = translate_fs_oflags(r4 as u32);
                 let fd_out = self.ppu.gpr[5] as u32;
                 let path = self.read_guest_cstr(path_ptr, 1024);
                 match sys_fs_open(&mut self.vfs, &mut self.fd_table, &path, flags) {
@@ -3297,21 +3326,35 @@ impl EmuCore {
                 if size > 0 {
                     self.mem.read(buf_ptr, &mut payload).ok();
                 }
-                if fd == 1 || fd == 2 {
-                    let s = String::from_utf8_lossy(&payload).into_owned();
-                    let mut written: u32 = 0;
-                    let _ = self.tty.write(
-                        3, Some(&s), size, Some(&mut written),
-                    );
-                    eprintln!(
-                        "[R9.1i] sys_fs_write(fd={fd}, *0x{buf_ptr:x}, {size}) \
-                         → {written}: {s:?}",
-                    );
+                if fd >= 4 {
+                    // VFS wave — real file write.
+                    match sys_fs_write(&mut self.vfs, &mut self.fd_table, fd as u32, &payload)
+                    {
+                        Ok(n) => {
+                            if pwritten_ptr != 0 {
+                                self.mem.write(pwritten_ptr, &n.to_be_bytes())?;
+                            }
+                            self.ppu.gpr[3] = 0; // CELL_OK
+                        }
+                        Err(e) => {
+                            self.ppu.gpr[3] = u64::from(u32::from(e));
+                        }
+                    }
+                } else {
+                    if fd == 1 || fd == 2 {
+                        let s = String::from_utf8_lossy(&payload).into_owned();
+                        let mut written: u32 = 0;
+                        let _ = self.tty.write(3, Some(&s), size, Some(&mut written));
+                        eprintln!(
+                            "[R9.1i] sys_fs_write(fd={fd}, *0x{buf_ptr:x}, {size}) \
+                             → {written}: {s:?}",
+                        );
+                    }
+                    if pwritten_ptr != 0 {
+                        self.mem.write(pwritten_ptr, &(size as u64).to_be_bytes())?;
+                    }
+                    self.ppu.gpr[3] = 0;
                 }
-                if pwritten_ptr != 0 {
-                    self.mem.write(pwritten_ptr, &(size as u64).to_be_bytes())?;
-                }
-                self.ppu.gpr[3] = 0;
             }
             809 => {
                 // sys_fs_fstat(fd, *stat_out). VFS wave: a real file fd (>=4,

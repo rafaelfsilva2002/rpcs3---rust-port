@@ -55,6 +55,17 @@ impl MemVfs {
         self.files.insert(path.to_owned(), data);
     }
 
+    /// Seed an (empty) directory at `path`, auto-creating ancestor dirs. Lets a
+    /// test set up the parent directory an `O_CREAT` open will create into.
+    pub fn add_dir(&mut self, path: &str) {
+        let mut acc = String::new();
+        for comp in path.split('/').filter(|s| !s.is_empty()) {
+            acc.push('/');
+            acc.push_str(comp);
+            self.dirs.insert(acc.clone());
+        }
+    }
+
     fn ensure_parent(&self, path: &str) -> Result<(), CellError> {
         let parent = path
             .rsplit_once('/')
