@@ -68,6 +68,7 @@ use rpcs3_hle_cellsysmodule::{
 use rpcs3_hle_cellvideoout::{
     cell_video_out_get_number_of_device, cell_video_out_get_resolution,
 };
+use rpcs3_hle_sys_net_user::inet_addr_stub;
 #[cfg(feature = "spu-recompiler")]
 use rpcs3_spu_differential::{ExecutionStopReason, SpuExecutor, SpuProgram};
 #[cfg(feature = "spu-recompiler")]
@@ -1818,6 +1819,15 @@ impl EmuCore {
                                     Ok(n) => u64::from(n as u32),
                                     Err(e) => u64::from(u32::from(e)),
                                 };
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE wave — sys_net::inet_addr (NID 0xdabbc2c0).
+                        // Firmware stub: unconditionally returns INET_ADDR_NONE
+                        // (0xFFFFFFFF), byte-exact with RPCS3 sys_net_.cpp. r3 =
+                        // const char* ip (ignored by the stub).
+                        0xdabbc2c0 => {
+                            self.ppu.gpr[3] = u64::from(inet_addr_stub(true));
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
