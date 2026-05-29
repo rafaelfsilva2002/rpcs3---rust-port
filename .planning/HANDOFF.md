@@ -213,14 +213,21 @@ more arm, no new dep/field — the field-reuse path for stateful crates). INFO_M
 `single_netctl_mtu_v1` → **1500 (0x5DC) post-wire vs 0 pre-wire**. Gate
 **294/0/6029**.
 
-HLE wave so far (10 functions / 5 crates / 7 modules this run): cellSysutil
-int+string, cellSysModule load+isloaded, cellVideoOut resolution+numdevices,
-sys_net inet_addr, cellNetCtl init+getstate+getinfo-MTU. All 3 wiring shapes
-(provider/stateful/stateless + combos) + the dep/field-reuse path proven.
-Remaining backlog (`.planning/HLE_BACKLOG.md`) thins out: jpgdec (multi-arm
-Create+Open, check for callbacks), font (verify NID-dispatch vs inlined), cellGame
-(verify exposure + lifecycle). If those need callbacks/inline/lifecycle, that's
-the natural STOP point for the wave.
+**R13.14 (cellVideoOutGetResolutionAvailability + VideoOutManager field) LANDED
+2026-05-29** — NID `0xa322db75` → `cell_video_out_get_resolution_availability`.
+Introduces a stateful `videoout: VideoOutManager` field (the prior cellVideoOut
+fns were stateless); default supported set includes 720p → returns 1. Fixture
+`single_videoout_resavail_v1` → **1 post-wire vs 0 pre-wire**. Gate **295/0/6030**.
+
+HLE wave so far (11 functions / 5 crates / 7 modules this run): cellSysutil
+int+string, cellSysModule load+isloaded, cellVideoOut resolution+numdevices
++resavail, sys_net inet_addr, cellNetCtl init+getstate+getinfo-MTU. All 3 wiring
+shapes + dep/field-reuse proven. **Backlog nearly exhausted of easy targets:**
+jpgDec is CALLBACK-driven (jpgDecCreate takes jpgCbCtrlMalloc) → STOP like
+pngDec; cellAudioOut NOT PSL1GHT-exposed → STOP. Remaining maybe-viable:
+cellVideoOut GetConfiguration/GetState (reuse videoout field), cellGame
+(lifecycle?), font (verify NID-dispatch vs inlined). When those run out, the wave
+is done — give the consolidated summary.
 
 Next options: (a) continue the HLE wave — next PSL1GHT-exposed module with a
 NON-ZERO distinguishable return (`cellVideoOutGetState`, `cellGameGetParamInt`,
