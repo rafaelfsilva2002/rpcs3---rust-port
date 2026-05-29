@@ -83,7 +83,9 @@ use rpcs3_hle_cellmsgdialog::{
     DialogManager, TypeFlags as MsgTypeFlags,
 };
 use rpcs3_lv2_fs::{
-    sys_fs_close, sys_fs_lseek, sys_fs_open, sys_fs_read, sys_fs_stat, CellFsStat, FdTable,
+    sys_fs_close, sys_fs_closedir, sys_fs_lseek, sys_fs_open, sys_fs_opendir,
+    sys_fs_read, sys_fs_readdir, sys_fs_stat, CellFsStat, FdTable, FS_TYPE_DIRECTORY,
+    FS_TYPE_REGULAR,
 };
 
 mod vfs;
@@ -3221,6 +3223,64 @@ impl EmuCore {
                     Err(e) => {
                         self.ppu.gpr[3] = u64::from(u32::from(e));
                     }
+                }
+            }
+            // VFS wave — sys_fs_opendir (#805): r3=path ptr, r4=*fd_out.
+            805 => {
+                let path_ptr = r3 as u32;
+                let fd_out = r4 as u32;
+                let path = self.read_guest_cstr(path_ptr, 1024);
+                match sys_fs_opendir(&mut self.vfs, &mut self.fd_table, &path) {
+                    Ok(fd) => {
+                        self.mem.write(fd_out, &fd.to_be_bytes())?;
+                        self.ppu.gpr[3] = 0; // CELL_OK
+                    }
+                    Err(e) => {
+                        self.ppu.gpr[3] = u64::from(u32::from(e));
+                    }
+                }
+            }
+            // VFS wave — sys_fs_readdir (#806): r3=fd, r4=*dirent (258-byte
+            // CellFsDirent {d_type@0, d_namlen@1, d_name@2[256]}), r5=*nread.
+            // *nread = 258 on a hit, 0 at EOF. NOTE the lv2-fs FS_TYPE_* d_type
+            // is INVERTED vs the real ABI — map crate -> real
+            // (regular -> 2, directory -> 1) when writing the guest dirent.
+            806 => {
+                let fd = r3 as u32;
+                let dirent_ptr = r4 as u32;
+                let nread_ptr = self.ppu.gpr[5] as u32;
+                match sys_fs_readdir(&mut self.vfs, &mut self.fd_table, fd) {
+                    Ok(Some(e)) => {
+                        let real_dtype: u8 = match e.d_type {
+                            FS_TYPE_REGULAR => 2,   // CELL_FS_TYPE_REGULAR
+                            FS_TYPE_DIRECTORY => 1, // CELL_FS_TYPE_DIRECTORY
+                            other => other,
+                        };
+                        let name = e.name.as_bytes();
+                        let nlen = name.len().min(255);
+                        let mut buf = [0u8; 258];
+                        buf[0] = real_dtype;
+                        buf[1] = nlen as u8;
+                        buf[2..2 + nlen].copy_from_slice(&name[..nlen]);
+                        self.mem.write(dirent_ptr, &buf)?;
+                        self.mem.write(nread_ptr, &258u64.to_be_bytes())?;
+                        self.ppu.gpr[3] = 0; // CELL_OK
+                    }
+                    Ok(None) => {
+                        // EOF: nread = 0, no entry written.
+                        self.mem.write(nread_ptr, &0u64.to_be_bytes())?;
+                        self.ppu.gpr[3] = 0; // CELL_OK
+                    }
+                    Err(e) => {
+                        self.ppu.gpr[3] = u64::from(u32::from(e));
+                    }
+                }
+            }
+            // VFS wave — sys_fs_closedir (#807): r3=fd.
+            807 => {
+                match sys_fs_closedir(&mut self.vfs, &mut self.fd_table, r3 as u32) {
+                    Ok(()) => self.ppu.gpr[3] = 0, // CELL_OK
+                    Err(e) => self.ppu.gpr[3] = u64::from(u32::from(e)),
                 }
             }
             803 => {
