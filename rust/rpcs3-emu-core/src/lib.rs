@@ -66,8 +66,9 @@ use rpcs3_hle_cellsysmodule::{
     cell_sysmodule_is_loaded, cell_sysmodule_load_module, SysmoduleManager,
 };
 use rpcs3_hle_cellvideoout::{
-    cell_video_out_get_number_of_device, cell_video_out_get_resolution,
-    cell_video_out_get_resolution_availability, VideoOutManager,
+    cell_video_out_get_configuration, cell_video_out_get_number_of_device,
+    cell_video_out_get_resolution, cell_video_out_get_resolution_availability,
+    VideoOutManager,
 };
 use rpcs3_hle_sys_net_user::inet_addr_stub;
 use rpcs3_hle_cellnetctl::{
@@ -1821,6 +1822,31 @@ impl EmuCore {
                                     self.ppu.gpr[3] = u64::from(u32::from(e));
                                 }
                             }
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE wave — cellVideoOut::cellVideoOutGetConfiguration
+                        // (NID 0x15b0b0cd). Stateful (VideoOutManager). r3 = port,
+                        // r4 = OUT *videoConfiguration {resolution@0,format@1,
+                        // aspect@2, padding[9], pitch@12 (u32)}. r5 = option.
+                        0x15b0b0cd => {
+                            let port = self.ppu.gpr[3] as u32;
+                            let cfg_ptr = self.ppu.gpr[4] as u32;
+                            self.ppu.gpr[3] = match cell_video_out_get_configuration(
+                                &self.videoout,
+                                port,
+                            ) {
+                                Ok(c) => {
+                                    self.mem.write(
+                                        cfg_ptr,
+                                        &[c.resolution_id, c.format, c.aspect],
+                                    )?;
+                                    self.mem
+                                        .write(cfg_ptr + 12, &c.pitch.to_be_bytes())?;
+                                    0 // CELL_OK
+                                }
+                                Err(e) => u64::from(u32::from(e)),
+                            };
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
