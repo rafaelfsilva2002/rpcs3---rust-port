@@ -334,6 +334,36 @@ low-thousands of executed instructions.
 
 ---
 
+## 4.3 Lever #1 — wired AND validated end-to-end (commit `35eecb4af`)
+
+Lever #1 is no longer just "mostly EXISTS": the Cranelift SPU JIT is wired into
+`emu-core` behind the `spu-recompiler` feature (runtime `EmuCore::spu_backend`,
+default Interpreter) **and validated end-to-end through `EmuCore::run_self`
+with a real PSL1GHT `.self`** — both backends produce a byte-identical SPU
+`OUT_MBOX`.
+
+- Fixture `single_spu_selfcompute_v1` (self-contained: no IN_MBOX / DMA / args —
+  the only shape that boots through the synchronous single-SPU run_self path).
+- Test `rust/rpcs3-emu-core/tests/spu_selfcompute_jit.rs`: interpreter +
+  recompiler both yield `OUT_MBOX = 0x7A314`. Gate **281 blocks / 0 fail /
+  6016 tests** (was 280/6015 — zero regression).
+- **Bug fixed along the way:** emu-core's `sysSpuImageImport` (NID `0xebe5f72f`)
+  over-read a fixed 256 KB blob and silently swallowed failures, so **no
+  PSL1GHT homebrew had ever actually run its SPU through `run_self`** (R9
+  validated SPU only via the `run_spu_group_single` helper). Now reads the
+  largest mappable span + logs failures.
+
+Remaining (does not block the JIT validation, tracked as follow-ups):
+- **Tiered promotion** — the JIT is still all-or-nothing per the selector; the
+  §4.2 data says the right model is *interpret cold/short, JIT hot* (hotness
+  counter + background compile). Not built.
+- **Faithful PPU exit code for SPU homebrews** — `sysSpuImageClose` / the
+  newlib exit import (`sysPrxForUser 0xe0da8efd`) are unimplemented, so the PPU
+  *process* exit code is unreliable through run_self (the test asserts on the
+  SPU OUT_MBOX instead).
+
+---
+
 ## 5. Honest reality check
 
 Running a **real commercial game on low-end hardware is far off** —
