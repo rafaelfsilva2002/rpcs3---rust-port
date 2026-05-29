@@ -35,7 +35,7 @@ use rpcs3_loader_elf_self::{
 use rpcs3_memory::PageFlags;
 use rpcs3_memory_backing::{Error as MemError, SparseBackend};
 use rpcs3_ppu_interpreter::{step, Error as InterpError, StepOutcome};
-use rpcs3_ppu_thread::{PpuThread, PPU_ID_BASE};
+use rpcs3_ppu_thread::{CrBits, PpuThread, Xer, PPU_ID_BASE};
 use rpcs3_lv2_tty::SysTty;
 use rpcs3_lv2_sync::{BlockOutcome, Lv2SyncState, MutexAttr, SemaAttr, SyncTable};
 use rpcs3_lv2_event::{EventRegistry, QueueAttr, ReceiveOutcome};
@@ -60,7 +60,9 @@ use rpcs3_lv2_spu_image::{deploy as deploy_image, build_image, SpuImage, SpuPhdr
 use rpcs3_spu_interpreter::{run_n as spu_run_n, StepOutcome as SpuStepOutcome, Error as SpuError};
 use rpcs3_spu_thread::SpuThread;
 use rpcs3_hle_cellsysutil::{
-    cell_sysutil_get_system_param_int, cell_sysutil_get_system_param_string,
+    cell_sysutil_check_callback, cell_sysutil_get_system_param_int,
+    cell_sysutil_get_system_param_string, cell_sysutil_register_callback,
+    cell_sysutil_unregister_callback, CallbackQueue, CallbackTable,
 };
 use rpcs3_hle_cellsysmodule::{
     cell_sysmodule_is_loaded, cell_sysmodule_load_module, SysmoduleManager,
@@ -203,6 +205,11 @@ pub enum Error {
     UnsupportedSyscall { number: u64, cia: u32 },
     /// The step budget was exhausted before the program exited.
     StepsExhausted,
+    /// A guest-callback invocation (`call_guest_function`) ran past the
+    /// step budget without returning to the sentinel — the callback
+    /// likely faulted or looped. The register frame is restored before
+    /// this is surfaced.
+    CallbackStepsExhausted,
     /// The ELF file doesn't have a usable PT_LOAD within the PPU main
     /// RAM window.
     ElfNotLoadable(&'static str),
@@ -247,6 +254,9 @@ impl core::fmt::Display for Error {
                 write!(f, "unsupported syscall #{number} at CIA 0x{cia:08x}")
             }
             Error::StepsExhausted => f.write_str("step budget exhausted"),
+            Error::CallbackStepsExhausted => {
+                f.write_str("guest callback exceeded the step budget")
+            }
             Error::ElfNotLoadable(r) => write!(f, "ELF not loadable: {r}"),
             Error::Spu(e) => write!(f, "SPU: {e:?}"),
             Error::SpuGroup(e) => write!(f, "SPU group: cell error 0x{:08x}", e.0),
@@ -256,6 +266,34 @@ impl core::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// Return-sentinel `lr` value installed before invoking a guest callback
+/// via [`EmuCore::call_guest_function`]. 4-byte aligned, OUTSIDE the
+/// import-stub window (`0xD0010000..0xD0020000`), and never a mapped code
+/// page — the callback's terminal `blr` lands `cia` here, which the
+/// nested run loop detects to stop (the check runs BEFORE `step`, so the
+/// sentinel is never executed).
+pub const GUEST_CALLBACK_SENTINEL: u32 = 0xD0FF_0000;
+
+/// Snapshot of the full architectural PPU register frame, taken before a
+/// re-entrant guest-callback invocation and restored after it. `PpuThread`
+/// is not `Clone` (it carries a `CpuState`), so the arch registers a
+/// callback could clobber are copied out individually. Memory is
+/// deliberately NOT snapshotted — guest writes during the callback are the
+/// observable behavior we keep.
+struct PpuRegSnapshot {
+    gpr: [u64; 32],
+    fpr: [f64; 32],
+    vr: [u128; 32],
+    cr: CrBits,
+    fpscr: u32,
+    lr: u64,
+    ctr: u64,
+    xer: Xer,
+    cia: u32,
+    vrsave: u32,
+    nj: bool,
+}
 
 // =====================================================================
 // EmuCore
@@ -440,6 +478,12 @@ pub struct EmuCore {
     /// config/state). Backs GetResolutionAvailability (and future GetState /
     /// GetConfiguration / GetDeviceInfo arms).
     pub videoout: VideoOutManager,
+    /// HLE wave — cellSysutil callback registry (slot -> guest fn ptr +
+    /// userdata) + a pending-event queue. `cellSysutilCheckCallback` drains the
+    /// queue and invokes each registered guest callback via
+    /// [`EmuCore::call_guest_function`] (the first guest-PPU-callback consumer).
+    pub sysutil_callbacks: CallbackTable,
+    pub sysutil_queue: CallbackQueue,
 }
 
 impl Default for EmuCore {
@@ -473,6 +517,8 @@ impl EmuCore {
             sysmodule: SysmoduleManager::default(),
             netctl: NetCtlManager::default(),
             videoout: VideoOutManager::default(),
+            sysutil_callbacks: CallbackTable::default(),
+            sysutil_queue: CallbackQueue::default(),
         }
     }
 
@@ -990,6 +1036,126 @@ impl EmuCore {
         Err(Error::StepsExhausted)
     }
 
+    /// Invoke a guest PPU function (e.g. a registered HLE callback) and
+    /// run it to completion, returning its `r3`. The full architectural
+    /// register frame is snapshotted and restored, so the calling HLE arm
+    /// can resume the original guest caller; memory side-effects persist.
+    ///
+    /// `fd_ptr` is a PSL1GHT compact 4-byte function descriptor (the
+    /// function pointer the guest handed us, e.g. via RegisterCallback);
+    /// its first BE u32 is the real `.text` code address. `args` are
+    /// marshalled into `r3..=r10` (max 8, PPC64 GPR arg registers).
+    ///
+    /// The nested run loop mirrors [`EmuCore::run`] but stops when the
+    /// callback returns to [`GUEST_CALLBACK_SENTINEL`]. This makes
+    /// `dispatch_syscall` RE-ENTRANT: a callback that itself calls an HLE
+    /// import resolves through the same dispatcher. The first re-entrant
+    /// control flow in the port — see `.planning/GUEST_CALLBACK_DESIGN.md`.
+    pub fn call_guest_function(&mut self, fd_ptr: u32, args: &[u64]) -> Result<u64, Error> {
+        // Resolve the compact 4-byte function descriptor -> code address.
+        // Guest memory is BIG-endian: raw read + from_be_bytes (never _le).
+        // PSL1GHT function-pointer descriptors are full PPC64 OPD entries:
+        // {code @0, toc @4, env @8} (4-byte BE fields on PS3's 32-bit address
+        // space). Calling through a descriptor sets r2 = descriptor.toc so the
+        // callee can reach its TOC-relative globals/literals. The import-stub
+        // trampoline path leaves r2 = 0, so we MUST install the callback's own
+        // toc here — without it the callback faults on its first TOC load.
+        // (The compact 4-byte e_entry FD at boot is a separate special case.)
+        let mut fd_bytes = [0u8; 4];
+        self.mem.read(fd_ptr, &mut fd_bytes)?;
+        let code_addr = u32::from_be_bytes(fd_bytes);
+        let mut toc_bytes = [0u8; 4];
+        self.mem.read(fd_ptr + 4, &mut toc_bytes)?;
+        let toc = u32::from_be_bytes(toc_bytes);
+
+        // Snapshot the full arch register frame (PpuThread is not Clone).
+        // Memory is intentionally NOT saved — callback writes must persist.
+        let snap = PpuRegSnapshot {
+            gpr: self.ppu.gpr,
+            fpr: self.ppu.fpr,
+            vr: self.ppu.vr,
+            cr: self.ppu.cr,
+            fpscr: self.ppu.fpscr,
+            lr: self.ppu.lr,
+            ctr: self.ppu.ctr,
+            xer: self.ppu.xer,
+            cia: self.ppu.cia,
+            vrsave: self.ppu.vrsave,
+            nj: self.ppu.nj,
+        };
+
+        // Seed the call frame: r2 = callback's TOC, args -> r3..=r10,
+        // lr -> sentinel, cia -> code.
+        self.ppu.gpr[2] = u64::from(toc);
+        for (i, a) in args.iter().take(8).enumerate() {
+            self.ppu.gpr[3 + i] = *a;
+        }
+        self.ppu.lr = u64::from(GUEST_CALLBACK_SENTINEL);
+        self.ppu.cia = code_addr;
+
+        // Nested run loop — like `run`, but stops on the sentinel. The
+        // guest callback's terminal `blr` sets cia = (lr & !0x3) = sentinel.
+        let budget = if self.step_budget == 0 {
+            usize::MAX
+        } else {
+            self.step_budget
+        };
+        // Capture any step/dispatch error so the frame is ALWAYS restored
+        // before it propagates (a faulting callback must not leave the outer
+        // caller's registers corrupted).
+        let mut hit = false;
+        let mut loop_err: Option<Error> = None;
+        for _ in 0..budget {
+            if self.ppu.cia == (GUEST_CALLBACK_SENTINEL & !0x3) {
+                hit = true;
+                break;
+            }
+            match step(&mut self.ppu, &mut self.mem) {
+                Ok(StepOutcome::Continue) => {}
+                // Re-entrant: a callback that calls an HLE import dispatches
+                // here. A callback that exits the process ends the nested loop
+                // (pathological; not expected).
+                Ok(StepOutcome::Syscall) => match self.dispatch_syscall() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {}
+                    Err(e) => {
+                        loop_err = Some(e);
+                        break;
+                    }
+                },
+                Err(e) => {
+                    loop_err = Some(Error::from(e));
+                    break;
+                }
+            }
+        }
+
+        let ret = self.ppu.gpr[3];
+
+        // Restore the saved frame (even on the budget-exhausted path) so
+        // the outer HLE arm's `cia = lr & !3; return Ok(None)` resumes the
+        // original caller correctly.
+        self.ppu.gpr = snap.gpr;
+        self.ppu.fpr = snap.fpr;
+        self.ppu.vr = snap.vr;
+        self.ppu.cr = snap.cr;
+        self.ppu.fpscr = snap.fpscr;
+        self.ppu.lr = snap.lr;
+        self.ppu.ctr = snap.ctr;
+        self.ppu.xer = snap.xer;
+        self.ppu.cia = snap.cia;
+        self.ppu.vrsave = snap.vrsave;
+        self.ppu.nj = snap.nj;
+
+        if let Some(e) = loop_err {
+            return Err(e);
+        }
+        if !hit {
+            return Err(Error::CallbackStepsExhausted);
+        }
+        Ok(ret)
+    }
+
     /// Dispatch the syscall that just triggered. The syscall number
     /// is in `r11` by LV2 convention. Returns `Some(ExitStatus)` if
     /// the program is ending.
@@ -1013,6 +1179,13 @@ impl EmuCore {
                 if let Some(stub_meta) = plan.lookup_by_trampoline(self.ppu.cia) {
                     let nid = stub_meta.nid;
                     let module = stub_meta.module_name.clone();
+                    // Copy the diagnostic fields too, so `stub_meta` (and the
+                    // `plan` borrow it derives from) is NOT used past this point.
+                    // This frees the immutable `self.import_plan` borrow before
+                    // the match, letting arms call `&mut self` methods like
+                    // `call_guest_function` (re-entrant guest callbacks).
+                    let trampoline_vaddr = stub_meta.trampoline_vaddr;
+                    let addrs_slot = stub_meta.addrs_slot;
                     let r3_in = self.ppu.gpr[3];
                     let r4_in = self.ppu.gpr[4];
 
@@ -2092,14 +2265,76 @@ impl EmuCore {
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
+                        // HLE wave — cellSysutil::cellSysutilRegisterCallback
+                        // (NID 0x9d98afa0). Stores a guest callback fn-ptr +
+                        // userdata in a slot. NO guest call here. r3 = slot,
+                        // r4 = callback fn descriptor ptr, r5 = userdata.
+                        0x9d98afa0 => {
+                            let slot = self.ppu.gpr[3] as u32;
+                            let func = self.ppu.gpr[4] as u32;
+                            let userdata = self.ppu.gpr[5] as u32;
+                            self.ppu.gpr[3] = match cell_sysutil_register_callback(
+                                &mut self.sysutil_callbacks,
+                                slot,
+                                func,
+                                userdata,
+                            ) {
+                                Ok(()) => 0, // CELL_OK
+                                Err(e) => u64::from(u32::from(e)),
+                            };
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE wave — cellSysutil::cellSysutilUnregisterCallback
+                        // (NID 0x02ff3c1b). Clears a slot. r3 = slot.
+                        0x02ff3c1b => {
+                            let slot = self.ppu.gpr[3] as u32;
+                            self.ppu.gpr[3] = match cell_sysutil_unregister_callback(
+                                &mut self.sysutil_callbacks,
+                                slot,
+                            ) {
+                                Ok(()) => 0, // CELL_OK
+                                Err(e) => u64::from(u32::from(e)),
+                            };
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE wave — cellSysutil::cellSysutilCheckCallback
+                        // (NID 0x189a74da). Drains the pending-event queue and
+                        // INVOKES each registered guest callback via
+                        // call_guest_function — the FIRST re-entrant guest call
+                        // driven by an HLE arm. cellSysutil callback ABI:
+                        // cb(u64 status, u64 param, void* userdata).
+                        0x189a74da => {
+                            // Drain into an OWNED Vec (the stub_meta/plan borrow
+                            // already ended above, so &mut self is free here).
+                            let dispatches = cell_sysutil_check_callback(
+                                &self.sysutil_callbacks,
+                                &mut self.sysutil_queue,
+                            );
+                            for d in dispatches {
+                                // void callback -> ignore the returned r3.
+                                let _ = self.call_guest_function(
+                                    d.cb.fn_addr,
+                                    &[
+                                        u64::from(d.event),
+                                        d.param,
+                                        u64::from(d.cb.user_data),
+                                    ],
+                                )?;
+                            }
+                            self.ppu.gpr[3] = 0; // CELL_OK
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
                         _ => {}
                     }
 
                     eprintln!(
                         "[R9.1g.7] unimplemented import: {module}::0x{nid:08x} \
-                         (trampoline=0x{:08x} addrs_slot=0x{:08x}) r3=0x{r3_in:x} \
+                         (trampoline=0x{trampoline_vaddr:08x} \
+                         addrs_slot=0x{addrs_slot:08x}) r3=0x{r3_in:x} \
                          r4=0x{r4_in:x} — returning 0",
-                        stub_meta.trampoline_vaddr, stub_meta.addrs_slot,
                     );
                     self.ppu.gpr[3] = 0;
                     self.ppu.cia = (self.ppu.lr as u32) & !0x3;
@@ -3411,6 +3646,114 @@ mod tests {
             out.extend_from_slice(&i.to_be_bytes());
         }
         out
+    }
+
+    // --- Guest-PPU callback primitive (Slice 1) -----------------------
+    // First re-entrant guest-call mechanism: invoke a hand-assembled guest
+    // function via a compact FD, run it to the sentinel, capture r3, and
+    // prove the caller's register frame is fully restored. No HLE wiring.
+    const RWX: PageFlags = PageFlags::READABLE
+        .union(PageFlags::WRITABLE)
+        .union(PageFlags::EXECUTABLE);
+
+    #[test]
+    fn call_guest_function_runs_then_restores_frame() {
+        let mut core = EmuCore::new();
+        let code_addr: u32 = 0x0001_0000;
+        let fd_addr: u32 = 0x0002_0000;
+        core.mem.alloc_at(code_addr, 0x1000, RWX).unwrap();
+        core.mem.alloc_at(fd_addr, 0x1000, RWX).unwrap();
+        // fn(x) -> x + 1:  addi r3, r3, 1 ; blr
+        core.mem
+            .write(code_addr, &assemble(&[0x3863_0001, 0x4E80_0020]))
+            .unwrap();
+        core.mem.write(fd_addr, &code_addr.to_be_bytes()).unwrap();
+
+        // Caller-frame sentinels — must survive the nested call.
+        core.ppu.gpr[3] = 0x0000_DEAD;
+        core.ppu.gpr[5] = 0x5555_5555;
+        core.ppu.lr = 0x0000_CAFE;
+        core.ppu.cia = 0x0000_1234;
+
+        let ret = core
+            .call_guest_function(fd_addr, &[41])
+            .expect("call_guest_function");
+        assert_eq!(ret, 42, "addi r3,r3,1 on 41 -> 42");
+        assert_eq!(core.ppu.gpr[3], 0x0000_DEAD, "r3 restored");
+        assert_eq!(core.ppu.gpr[5], 0x5555_5555, "r5 restored");
+        assert_eq!(core.ppu.lr, 0x0000_CAFE, "lr restored");
+        assert_eq!(core.ppu.cia, 0x0000_1234, "cia restored");
+    }
+
+    #[test]
+    fn call_guest_function_passes_multiple_args() {
+        let mut core = EmuCore::new();
+        let code_addr: u32 = 0x0003_0000;
+        let fd_addr: u32 = 0x0004_0000;
+        core.mem.alloc_at(code_addr, 0x1000, RWX).unwrap();
+        core.mem.alloc_at(fd_addr, 0x1000, RWX).unwrap();
+        // fn(a, b) -> a + b:  add r3, r3, r4 ; blr
+        core.mem
+            .write(code_addr, &assemble(&[0x7C63_2214, 0x4E80_0020]))
+            .unwrap();
+        core.mem.write(fd_addr, &code_addr.to_be_bytes()).unwrap();
+
+        let ret = core
+            .call_guest_function(fd_addr, &[1000, 337])
+            .expect("call_guest_function");
+        assert_eq!(ret, 1337, "add r3,r3,r4 on (1000,337) -> 1337");
+    }
+
+    // --- cellSysutil callback chain (Slice 3, synthetic) --------------
+    // register -> enqueue -> drain -> call_guest_function -> guest cb writes a
+    // sentinel to memory. Exercises the exact logic the CheckCallback NID arm
+    // runs, end-to-end and deterministically, with a hand-assembled guest cb
+    // (no PSL1GHT fixture). The NID-dispatch wrapper is validated separately by
+    // the real CC0 fixture.
+    #[test]
+    fn cellsysutil_check_callback_invokes_guest_callback() {
+        let mut core = EmuCore::new();
+        let cb_code: u32 = 0x0005_0000;
+        let cb_fd: u32 = 0x0006_0000;
+        let sentinel_cell: u32 = 0x0007_0000;
+        core.mem.alloc_at(cb_code, 0x1000, RWX).unwrap();
+        core.mem.alloc_at(cb_fd, 0x1000, RWX).unwrap();
+        core.mem.alloc_at(sentinel_cell, 0x1000, RWX).unwrap();
+        // cb(status=r3, param=r4, userdata=r5): stw r3, 0(r5) ; blr
+        // (writes the low 32 bits of `status` to *userdata).
+        core.mem
+            .write(cb_code, &assemble(&[0x9065_0000, 0x4E80_0020]))
+            .unwrap();
+        core.mem.write(cb_fd, &cb_code.to_be_bytes()).unwrap();
+
+        // Register slot 0 with userdata = the sentinel cell's address.
+        cell_sysutil_register_callback(&mut core.sysutil_callbacks, 0, cb_fd, sentinel_cell)
+            .unwrap();
+        // Host enqueues one event (status = 0x0101, param = 0).
+        core.sysutil_queue.push(0x0101, 0);
+
+        // Drive exactly what the CheckCallback arm does.
+        let dispatches =
+            cell_sysutil_check_callback(&core.sysutil_callbacks, &mut core.sysutil_queue);
+        assert_eq!(dispatches.len(), 1, "one slot * one event");
+        for d in dispatches {
+            core.call_guest_function(
+                d.cb.fn_addr,
+                &[u64::from(d.event), d.param, u64::from(d.cb.user_data)],
+            )
+            .unwrap();
+        }
+
+        // The guest callback wrote `status` (0x0101) to *userdata (BE u32),
+        // and the side-effect persisted in self.mem.
+        let mut buf = [0u8; 4];
+        core.mem.read(sentinel_cell, &mut buf).unwrap();
+        assert_eq!(
+            u32::from_be_bytes(buf),
+            0x0101,
+            "guest callback wrote status to *userdata"
+        );
+        assert!(core.sysutil_queue.is_empty(), "queue drained");
     }
 
     fn run_program(insts: &[u32]) -> Result<ExitStatus, Error> {
