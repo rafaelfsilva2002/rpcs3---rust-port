@@ -82,9 +82,21 @@ GOTCHAS for later slices (from VFS_DESIGN §5): CellFsStat is 52 bytes with
 `be_t<,4>` packing (offsets in the doc); lv2-fs open-flag constants are POSIX-bit
 not octal (`O_CREAT=0x4` vs real `0o100`) — dormant for RDONLY slice 1 but blocks
 CREAT/TRUNC (savedata); #803 write / #809 fstat are EXISTING TTY/stdio stubs to
-EDIT (branch fd>=4 → VFS), not duplicate. Next slices: #808 stat + #818 lseek +
-#809 fstat (font needs fd→path), then dir enum, then write + cellFs HLE, then
-savedata/cellFont.
+EDIT (branch fd>=4 → VFS), not duplicate.
+
+**VFS slice 2 LANDED 2026-05-29:** #808 sys_fs_stat + #818 sys_fs_lseek + #809
+sys_fs_fstat (edited the stdio stub: fd>=4 → real VFS stat). Added
+`cellfsstat_to_be` (52-byte BE serializer; sysFSStat is `__attribute__((packed))`,
+offsets verified) + `FdTable::file_handle` (rpcs3-lv2-fs, fd→handle) +
+`MemVfs::stat_handle` (handle→path→stat, since lv2 generic sys_fs_fstat is
+ENOSYS). Fixture `single_fs_stat_v1` → 0xC0DE (stat=16, fstat=16, lseek SET 8,
+read sum 0x64) vs 0xBAD0 negative. Gate green.
+
+Next VFS slices (loop active): slice 3 dir enum (#805 opendir / #806 readdir /
+#807 closedir — GOTCHA: lv2-fs FS_TYPE_* d_type is INVERTED vs real ABI, map
+crate→real when marshalling; sysFSDirent=258 bytes); slice 4 write (#803 edit
+fd>=4 + REAL OCTAL O_CREAT/O_TRUNC flags, not the lv2-fs POSIX-bit constants);
+slice 5 savedata + cellFont (may need a strategic checkpoint).
 
 ## Audit snapshot (2026-05-28)
 
