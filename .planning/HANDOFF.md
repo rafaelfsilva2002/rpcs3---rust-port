@@ -149,11 +149,26 @@ the `hle/` fixture Makefiles (negation existed for spu/lv2/rsx, not hle) — add
 the hle negation and committed both the cellSysModule and cellSysutil Makefiles.
 Gate **288/0/6023**.
 
-Next options: (a) continue the HLE wave — `cellSysutilGetSystemParamString` next
-(reuses the cellSysutil dep + `EmuSysutilConfig`, OUT string buffer), then other
-PSL1GHT-exposed modules (`cellGame`, `cellMsgDialog`, audio/io), each a mechanical
-gated slice; (b) the other big waves — GPU rendering backend, or commercial-game /
-SELF-decrypt boot. See docs/PORT_STATUS_AND_ROADMAP.md.
+**R13.8 (cellSysutil string param) LANDED 2026-05-29** — extends the cellSysutil
+integration to the **string** path, reusing the dep + `EmuSysutilConfig`.
+`cellSysutilGetSystemParamString` (NID `0x938013a0`, runtime-captured) → the arm
+copies the returned string into the guest buffer (truncated to bufsize-1 +
+NUL-terminated); `EmuSysutilConfig::get_param_string` returns a default nickname
+`"RPCS3"` for Nickname/CurrentUsername. Fixture `single_sysutil_string_v1`
+byte-sums the buffer → **363 ("RPCS3") post-wire vs 0 pre-wire** (stub never
+writes), proving CONTENT end-to-end (not just that the call returned). Gate
+**289/0/6024**.
+
+Useful gotcha learned: the import-trampoline path (`[R9.1g.7]`) ALWAYS logs the
+NID + returns 0 regardless of `permissive_unknown_syscalls` — that flag only
+gates the *numbered* syscalls. So a probe test can run with `permissive=false`;
+the unwired NID still prints in the log (and the strict assert just fails until
+wired).
+
+Next options: (a) continue the HLE wave — next PSL1GHT-exposed module (`cellGame`
+sysutil/game.h, `cellMsgDialog` sysutil/msg.h, `cellAudio` audio/audio.h,
+`cellIo`), each a mechanical gated slice; (b) the other big waves — GPU rendering
+backend, or commercial-game / SELF-decrypt boot. See docs/PORT_STATUS_AND_ROADMAP.md.
 
 Out of scope (still deferred): shader decompilation, texture pixel
 decode, Vulkan/GL backend, actual rendering. These need a GPU and
