@@ -59,6 +59,7 @@ use rpcs3_lv2_spu_group::{
 use rpcs3_lv2_spu_image::{deploy as deploy_image, build_image, SpuImage, SpuPhdr};
 use rpcs3_spu_interpreter::{run_n as spu_run_n, StepOutcome as SpuStepOutcome, Error as SpuError};
 use rpcs3_spu_thread::SpuThread;
+use rpcs3_hle_cellsysutil::cell_sysutil_get_system_param_int;
 #[cfg(feature = "spu-recompiler")]
 use rpcs3_spu_differential::{ExecutionStopReason, SpuExecutor, SpuProgram};
 #[cfg(feature = "spu-recompiler")]
@@ -74,6 +75,37 @@ pub enum SpuBackend {
     #[default]
     Interpreter,
     Recompiler,
+}
+
+/// Fixed system-config provider backing HLE `cellSysutil` param lookups
+/// (R13.6, first HLE-crate integration). Values mirror RPCS3's default system
+/// parameters (English-US language, cross-confirm, etc.). Stateless: the params
+/// are fixed config, so a unit struct suffices (no EmuCore field needed yet).
+struct EmuSysutilConfig;
+
+impl rpcs3_hle_cellsysutil::SysutilState for EmuSysutilConfig {
+    fn get_param_int(&self, id: rpcs3_hle_cellsysutil::SysParamId) -> Option<i32> {
+        use rpcs3_hle_cellsysutil::SysParamId as P;
+        match id {
+            P::Lang => Some(1), // CELL_SYSUTIL_LANG_ENGLISH_US
+            P::EnterButtonAssign => Some(1),
+            P::DateFormat => Some(1),
+            P::TimeFormat => Some(1),
+            P::Timezone => Some(0),
+            P::Summertime => Some(0),
+            P::GameParentalLevel => Some(1),
+            P::CurrentUserHasNpAccount => Some(0),
+            P::CameraPlfreq => Some(0),
+            P::PadAutoOff => Some(0),
+            _ => None,
+        }
+    }
+    fn get_param_string(&self, _id: rpcs3_hle_cellsysutil::SysParamId) -> Option<&str> {
+        None
+    }
+    fn media_ver(&self) -> &str {
+        "04.5500"
+    }
 }
 
 // =====================================================================
@@ -1686,6 +1718,25 @@ impl EmuCore {
                                  → offset=0x{io_offset:08x} status=0x{status:x}"
                             );
                             self.ppu.gpr[3] = status as u64;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // R13.6 — cellSysutil::cellSysutilGetSystemParamInt
+                        // (NID 0x40e895d3). First HLE-crate integration: route
+                        // to rpcs3-hle-cellsysutil backed by EmuSysutilConfig.
+                        // r3 = param id, r4 = OUT *value.
+                        0x40e895d3 => {
+                            let id = self.ppu.gpr[3] as i32;
+                            let value_ptr = self.ppu.gpr[4] as u32;
+                            match cell_sysutil_get_system_param_int(&EmuSysutilConfig, id) {
+                                Ok(v) => {
+                                    self.mem.write(value_ptr, &v.to_be_bytes())?;
+                                    self.ppu.gpr[3] = 0; // CELL_OK
+                                }
+                                Err(e) => {
+                                    self.ppu.gpr[3] = u64::from(u32::from(e));
+                                }
+                            }
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
