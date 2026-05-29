@@ -75,6 +75,7 @@ use rpcs3_hle_cellnetctl::{
     cell_net_ctl_get_info, cell_net_ctl_get_state, cell_net_ctl_init, NetCtlManager,
     NetInfo, StubConnectedBackend,
 };
+use rpcs3_hle_cellgame::cell_game_get_param_int;
 #[cfg(feature = "spu-recompiler")]
 use rpcs3_spu_differential::{ExecutionStopReason, SpuExecutor, SpuProgram};
 #[cfg(feature = "spu-recompiler")]
@@ -125,6 +126,47 @@ impl rpcs3_hle_cellsysutil::SysutilState for EmuSysutilConfig {
     }
     fn media_ver(&self) -> &str {
         "04.5500"
+    }
+}
+
+/// HLE wave — fixed cellGame content/PSF provider. A homebrew run via `run_self`
+/// has no real game content, so these are RPCS3-style deterministic defaults.
+/// Only the PSF parental level is exercised by a fixture today; the rest are
+/// safe placeholders for the (not-yet-wired) BootCheck/ContentPermit/DataCheck.
+struct EmuGameConfig;
+
+impl rpcs3_hle_cellgame::GameState for EmuGameConfig {
+    fn game_type(&self) -> rpcs3_hle_cellgame::GameType {
+        rpcs3_hle_cellgame::GameType::Hdd
+    }
+    fn attributes(&self) -> u32 {
+        0
+    }
+    fn size_kb(&self) -> u64 {
+        0
+    }
+    fn dir_name(&self) -> &str {
+        ""
+    }
+    fn content_info_path(&self) -> &str {
+        ""
+    }
+    fn usrdir_path(&self) -> &str {
+        ""
+    }
+    fn psf_string(&self, _id: rpcs3_hle_cellgame::GameParamId) -> Option<&str> {
+        None
+    }
+    fn psf_int(&self, id: rpcs3_hle_cellgame::GameParamId) -> Option<i32> {
+        use rpcs3_hle_cellgame::GameParamId as P;
+        match id {
+            // PSF PARENTAL_LEVEL — least-restrictive non-zero default.
+            P::ParentalLevel => Some(1),
+            _ => None,
+        }
+    }
+    fn game_data_exists(&self, _dir_name: &str) -> bool {
+        false
     }
 }
 
@@ -1958,6 +2000,24 @@ impl EmuCore {
                                     }
                                     Err(e) => u64::from(u32::from(e)),
                                 };
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE wave — cellGame::cellGameGetParamInt (NID 0xb7a45caf).
+                        // Provider (EmuGameConfig). r3 = PSF param id (real PS3
+                        // numbering; PARENTAL_LEVEL=103), r4 = OUT *value.
+                        0xb7a45caf => {
+                            let id = self.ppu.gpr[3] as i32;
+                            let value_ptr = self.ppu.gpr[4] as u32;
+                            match cell_game_get_param_int(&EmuGameConfig, id) {
+                                Ok(v) => {
+                                    self.mem.write(value_ptr, &v.to_be_bytes())?;
+                                    self.ppu.gpr[3] = 0; // CELL_OK
+                                }
+                                Err(e) => {
+                                    self.ppu.gpr[3] = u64::from(u32::from(e));
+                                }
+                            }
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
