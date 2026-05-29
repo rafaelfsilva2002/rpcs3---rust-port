@@ -69,6 +69,9 @@ use rpcs3_hle_cellvideoout::{
     cell_video_out_get_number_of_device, cell_video_out_get_resolution,
 };
 use rpcs3_hle_sys_net_user::inet_addr_stub;
+use rpcs3_hle_cellnetctl::{
+    cell_net_ctl_get_state, cell_net_ctl_init, NetCtlManager, StubConnectedBackend,
+};
 #[cfg(feature = "spu-recompiler")]
 use rpcs3_spu_differential::{ExecutionStopReason, SpuExecutor, SpuProgram};
 #[cfg(feature = "spu-recompiler")]
@@ -384,6 +387,10 @@ pub struct EmuCore {
     /// (load +1, unload -1, is_loaded != 0 iff outstanding refs). Stateful
     /// across guest calls; mirrors `lv2_sync_state`. Reset on `EmuCore::new`.
     pub sysmodule: SysmoduleManager,
+    /// HLE wave — cellNetCtl manager (gates `initialized`). Paired with a fixed
+    /// connected-network provider (`StubConnectedBackend`) so the emulated
+    /// console reports an established network.
+    pub netctl: NetCtlManager,
 }
 
 impl Default for EmuCore {
@@ -415,6 +422,7 @@ impl EmuCore {
             gcm_io_address: 0,
             gcm_io_size: 0,
             sysmodule: SysmoduleManager::default(),
+            netctl: NetCtlManager::default(),
         }
     }
 
@@ -1817,6 +1825,40 @@ impl EmuCore {
                             self.ppu.gpr[3] =
                                 match cell_video_out_get_number_of_device(port) {
                                     Ok(n) => u64::from(n as u32),
+                                    Err(e) => u64::from(u32::from(e)),
+                                };
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE wave — cellNetCtl::cellNetCtlInit (NID 0xbd5a59fc).
+                        // Stateful: flips the NetCtlManager's `initialized` gate.
+                        // No args.
+                        0xbd5a59fc => {
+                            self.ppu.gpr[3] = match cell_net_ctl_init(&mut self.netctl) {
+                                Ok(()) => 0, // CELL_OK
+                                Err(e) => u64::from(u32::from(e)),
+                            };
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE wave — cellNetCtl::cellNetCtlGetState (NID 0x8b3eba69).
+                        // r3 = OUT *s32 state. With a connected backend staged,
+                        // reports CELL_NET_CTL_STATE_IPOBTAINED (3).
+                        0x8b3eba69 => {
+                            let state_ptr = self.ppu.gpr[3] as u32;
+                            // Fixed connected-network provider (emulated console
+                            // reports an established link). ip/mac are arbitrary
+                            // but stable; only is_connected affects the state.
+                            let backend = StubConnectedBackend {
+                                ip: 0xC0A8_012A, // 192.168.1.42
+                                mac: [0x00, 0xAB, 0xCD, 0xEF, 0x12, 0x34],
+                            };
+                            self.ppu.gpr[3] =
+                                match cell_net_ctl_get_state(&self.netctl, &backend) {
+                                    Ok(state) => {
+                                        self.mem.write(state_ptr, &state.to_be_bytes())?;
+                                        0 // CELL_OK
+                                    }
                                     Err(e) => u64::from(u32::from(e)),
                                 };
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;

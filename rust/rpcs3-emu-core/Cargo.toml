@@ -37,6 +37,8 @@ rpcs3-hle-cellsysmodule = { path = "../rpcs3-hle-cellsysmodule" }
 rpcs3-hle-cellvideoout = { path = "../rpcs3-hle-cellvideoout" }
 # HLE wave — sys_net (inet_addr firmware stub).
 rpcs3-hle-sys-net-user = { path = "../rpcs3-hle-sys-net-user" }
+# HLE wave — cellNetCtl (stateful NetCtlManager + connected-backend provider).
+rpcs3-hle-cellnetctl   = { path = "../rpcs3-hle-cellnetctl" }
 # Optional: the Cranelift SPU JIT, gated behind the `spu-recompiler`
 # feature so default builds stay lean (no Cranelift) and the gate keeps
 # using the interpreter unless explicitly opted in.
