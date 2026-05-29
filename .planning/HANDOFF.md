@@ -103,11 +103,15 @@ validates `TextureDescriptor` against real libgcm (format_code=0xA5, TwoD,
 256×128, offset 0x200000, RSX). The texture method addresses already matched
 RPCS3 gcm_enums.h, so no bug — confirmed the decode. Gate 283/0/6018, pushed.
 
-Remaining candidates: R13.5a (multi-draw), R13.5b (indexed draw),
-R13.5d (viewport/depth state), R13.5f (cross-frame flip×2).
-Next recommended: **R13.5b (indexed draw)** — `rsxDrawIndexArray` exercises the
-`DrawKind::Indexed` path + the index-array descriptor against real bytes (the
-draw oracle so far only covers `DrawKind::Arrays`).
+**R13.5b (indexed draw) LANDED 2026-05-29** (commit `a4410dc90`) —
+`single_gcm_indexdraw_v1` validates `DrawKind::Indexed` + `IndexArray`
+{address 0x10000, U16, RSX} against real libgcm; no decode bug (index-array
+addresses matched RPCS3). Gate 284/0/6019, pushed.
+
+Remaining candidates: R13.5a (multi-draw), R13.5d (viewport/depth state),
+R13.5f (cross-frame flip×2).
+Next recommended: **R13.5a (multi-draw)** — emit 2+ draws in one frame so the
+`DrawTracker` produces multiple `DrawCall` records (only 1 ever asserted so far).
 
 Out of scope (still deferred): shader decompilation, texture pixel
 decode, Vulkan/GL backend, actual rendering. These need a GPU and
