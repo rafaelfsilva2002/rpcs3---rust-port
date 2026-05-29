@@ -70,7 +70,8 @@ use rpcs3_hle_cellvideoout::{
 };
 use rpcs3_hle_sys_net_user::inet_addr_stub;
 use rpcs3_hle_cellnetctl::{
-    cell_net_ctl_get_state, cell_net_ctl_init, NetCtlManager, StubConnectedBackend,
+    cell_net_ctl_get_info, cell_net_ctl_get_state, cell_net_ctl_init, NetCtlManager,
+    NetInfo, StubConnectedBackend,
 };
 #[cfg(feature = "spu-recompiler")]
 use rpcs3_spu_differential::{ExecutionStopReason, SpuExecutor, SpuProgram};
@@ -1857,6 +1858,50 @@ impl EmuCore {
                                 match cell_net_ctl_get_state(&self.netctl, &backend) {
                                     Ok(state) => {
                                         self.mem.write(state_ptr, &state.to_be_bytes())?;
+                                        0 // CELL_OK
+                                    }
+                                    Err(e) => u64::from(u32::from(e)),
+                                };
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE wave — cellNetCtl::cellNetCtlGetInfo (NID 0x1e585b5d).
+                        // r3 = info code, r4 = OUT *union net_ctl_info. Reuses the
+                        // shared netctl field + connected backend. Only the MTU
+                        // path is fixture-validated; the u32 codes (MTU/Link) map
+                        // cleanly to the union @offset 0; the IPv4/ether codes are
+                        // wired best-effort (raw bytes) pending dedicated fixtures.
+                        0x1e585b5d => {
+                            let code = self.ppu.gpr[3] as u32;
+                            let info_ptr = self.ppu.gpr[4] as u32;
+                            let backend = StubConnectedBackend {
+                                ip: 0xC0A8_012A,
+                                mac: [0x00, 0xAB, 0xCD, 0xEF, 0x12, 0x34],
+                            };
+                            self.ppu.gpr[3] =
+                                match cell_net_ctl_get_info(&self.netctl, &backend, code) {
+                                    Ok(info) => {
+                                        match info {
+                                            NetInfo::Mtu(v) => self
+                                                .mem
+                                                .write(info_ptr, &v.to_be_bytes())?,
+                                            NetInfo::LinkUp => self
+                                                .mem
+                                                .write(info_ptr, &1u32.to_be_bytes())?,
+                                            NetInfo::LinkDown => self
+                                                .mem
+                                                .write(info_ptr, &0u32.to_be_bytes())?,
+                                            NetInfo::IpAddress(b)
+                                            | NetInfo::Netmask(b)
+                                            | NetInfo::DefaultRoute(b)
+                                            | NetInfo::PrimaryDns(b)
+                                            | NetInfo::SecondaryDns(b) => {
+                                                self.mem.write(info_ptr, &b)?;
+                                            }
+                                            NetInfo::EtherAddr(b) => {
+                                                self.mem.write(info_ptr, &b)?;
+                                            }
+                                        }
                                         0 // CELL_OK
                                     }
                                     Err(e) => u64::from(u32::from(e)),
