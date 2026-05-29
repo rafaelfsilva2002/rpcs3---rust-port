@@ -38,9 +38,24 @@ for `e_entry`. emu-core applies no ELF relocations (PSL1GHT loads at a fixed bas
 
 **This unlocks the previously-STOP HLE families** (cellMsgDialog, cellSaveData,
 jpgDec/pngDec malloc callbacks) — they were blocked solely on this primitive.
-Next: wire one of those (e.g. cellMsgDialogOpen2's dismiss callback, or jpgDec's
-synchronous malloc callback) on top of `call_guest_function`. Gate after R14:
-see below.
+
+**R14.1 — cellMsgDialog (2nd call_guest_function consumer) LANDED 2026-05-29:**
+`cellMsgDialogOpen2` (NID `0x7603d3db`; r3=type, r4=msg, r5=cb FD, r6=userdata)
+routes to `rpcs3-hle-cellmsgdialog` (new `msgdialog: DialogManager` field). With
+no user, emu-core **headless-auto-confirms**: open → close (default button per
+type: OK-type → BTN_OK=1) → invoke the guest callback `cb(button, userdata)` via
+`call_guest_function`. New helper `read_guest_cstr` (bounded NUL-terminated read)
+for the message arg. Fixture `single_msgdialog_callback_v1` → **0x600D** (callback
+ran with OK) vs 0xBAD0 pre-wire. Proves the primitive generalises across a 2nd,
+different API. (Headless auto-confirm is a deliberate policy; async-on-dismiss
+can be refined later.)
+
+Next callback-family candidates each need MORE infra than msgDialog did:
+jpgDec/pngDec malloc callback (synchronous, but the decoder then needs a real
+image buffer + the multi-arm Create/Open/ReadHeader SEQ), cellSaveData
+(callback-driven AND needs a VFS layer). msgDialog was the clean one; the rest
+bleed into image-decode / VFS work. Strategic checkpoint: breadth (more callback
+families) vs a VFS layer vs the GPU backend.
 
 ## Audit snapshot (2026-05-28)
 
