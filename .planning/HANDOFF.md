@@ -124,9 +124,20 @@ the cmd buffer, so there's no new snapshot/register surface to assert (R13.4
 already proved the single-flip path; a "×2" adds no decode coverage). NEEDS A
 DECISION — skip it, or take a different validation angle.
 
-Next bigger waves (strategic — pick one WITH the user, do not start autonomously):
-GPU rendering backend (shaders/textures/Vulkan), commercial-game / SELF-decrypt
-boot, or HLE-crate integration. See docs/PORT_STATUS_AND_ROADMAP.md.
+**R13.6 (first HLE integration) LANDED 2026-05-29** (commit `ea6ee3988`) — wired
+the FIRST of the 137 unconsumed `rpcs3-hle-*` crates: `cellSysutil` (NID
+`0x40e895d3` → `rpcs3-hle-cellsysutil::cell_sysutil_get_system_param_int`, backed
+by an `EmuSysutilConfig` fixed-config provider) runs end-to-end via
+`single_sysutil_param_v1` (NEW `behavior-freeze/fixtures/hle/` category).
+Gate 287/0/6022. **HLE NID-dispatch pattern established** (Cargo dep + state
+provider impl + `match nid` arm; confirm the NID at runtime from the
+`[R9.1g.7] unimplemented import: cellModule::0xNNNN` log, r3..r10 = args, write
+OUT ptrs BE, r3 = return) — directly replicable for the other 136 crates.
+
+Next options: (a) continue the HLE wave — wire more `cellSysutil` params/functions,
+then other PSL1GHT-exposed modules (`cellSysModule`, `cellGame`, `cellMsgDialog`,
+audio/io), each a mechanical gated slice; (b) the other big waves — GPU rendering
+backend, or commercial-game / SELF-decrypt boot. See docs/PORT_STATUS_AND_ROADMAP.md.
 
 Out of scope (still deferred): shader decompilation, texture pixel
 decode, Vulkan/GL backend, actual rendering. These need a GPU and
