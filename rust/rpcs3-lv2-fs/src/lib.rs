@@ -192,6 +192,18 @@ impl FdTable {
             None => Err(CellError::EBADF),
         }
     }
+
+    /// The opaque `FileObject::handle` backing a file `fd`, or `None` if `fd`
+    /// is not an open file. Lets a caller resolve a fd back to its filesystem
+    /// handle — needed to implement `fstat` (the path lives in the FileSystem
+    /// impl, keyed by handle), which `sys_fs_fstat` cannot do generically.
+    #[must_use]
+    pub fn file_handle(&self, fd: u32) -> Option<u64> {
+        match self.entries.get(&fd) {
+            Some(FdEntry::File(f)) => Some(f.handle),
+            _ => None,
+        }
+    }
 }
 
 // =====================================================================

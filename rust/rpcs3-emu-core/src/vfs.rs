@@ -64,6 +64,18 @@ impl MemVfs {
         }
         Ok(())
     }
+
+    /// Stat an open file by its `FileObject` handle — the `fstat` path. The lv2
+    /// `sys_fs_fstat` is generic and has no path; resolve the handle to its
+    /// source path here (kept in the open-file table) and stat that.
+    pub fn stat_handle(&self, handle: u64) -> Result<CellFsStat, CellError> {
+        let path = self
+            .open_files
+            .get(&handle)
+            .map(|(p, _)| p.clone())
+            .ok_or(CellError::EBADF)?;
+        self.stat(&path)
+    }
 }
 
 impl FileSystem for MemVfs {

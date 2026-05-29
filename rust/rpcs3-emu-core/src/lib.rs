@@ -82,7 +82,9 @@ use rpcs3_hle_cellmsgdialog::{
     cell_msg_dialog_close, cell_msg_dialog_open, last_button as msg_last_button,
     DialogManager, TypeFlags as MsgTypeFlags,
 };
-use rpcs3_lv2_fs::{sys_fs_close, sys_fs_open, sys_fs_read, FdTable};
+use rpcs3_lv2_fs::{
+    sys_fs_close, sys_fs_lseek, sys_fs_open, sys_fs_read, sys_fs_stat, CellFsStat, FdTable,
+};
 
 mod vfs;
 use vfs::MemVfs;
@@ -302,6 +304,23 @@ struct PpuRegSnapshot {
     cia: u32,
     vrsave: u32,
     nj: bool,
+}
+
+/// Serialize a `CellFsStat` to its 52-byte big-endian on-the-wire layout
+/// (`sysFSStat`, `__attribute__((packed))`): mode@0(u32) uid@4(s32) gid@8(s32)
+/// atime@12(s64) mtime@20 ctime@28 size@36(u64) blksize@44. Hand-rolled — the
+/// host `CellFsStat` is natural-rep with no serialization helper.
+fn cellfsstat_to_be(st: &CellFsStat) -> [u8; 52] {
+    let mut b = [0u8; 52];
+    b[0..4].copy_from_slice(&st.mode.to_be_bytes());
+    b[4..8].copy_from_slice(&st.uid.to_be_bytes());
+    b[8..12].copy_from_slice(&st.gid.to_be_bytes());
+    b[12..20].copy_from_slice(&st.atime.to_be_bytes());
+    b[20..28].copy_from_slice(&st.mtime.to_be_bytes());
+    b[28..36].copy_from_slice(&st.ctime.to_be_bytes());
+    b[36..44].copy_from_slice(&st.size.to_be_bytes());
+    b[44..52].copy_from_slice(&st.blksize.to_be_bytes());
+    b
 }
 
 // =====================================================================
@@ -3170,6 +3189,40 @@ impl EmuCore {
                     Err(e) => self.ppu.gpr[3] = u64::from(u32::from(e)),
                 }
             }
+            // VFS wave — sys_fs_stat (#808): r3=path ptr, r4=*stat (52-byte BE
+            // CellFsStat). Path-based.
+            808 => {
+                let path_ptr = r3 as u32;
+                let stat_ptr = r4 as u32;
+                let path = self.read_guest_cstr(path_ptr, 1024);
+                match sys_fs_stat(&self.vfs, &path) {
+                    Ok(st) => {
+                        self.mem.write(stat_ptr, &cellfsstat_to_be(&st))?;
+                        self.ppu.gpr[3] = 0; // CELL_OK
+                    }
+                    Err(e) => {
+                        self.ppu.gpr[3] = u64::from(u32::from(e));
+                    }
+                }
+            }
+            // VFS wave — sys_fs_lseek (#818): r3=fd, r4=offset (u64 bits;
+            // PSL1GHT sysLv2FsLSeek64 passes u64 — reinterpret as i64 for
+            // signed seeks), r5=whence (s32), r6=*pos. New position -> *pos (BE).
+            818 => {
+                let fd = r3 as u32;
+                let offset = r4 as i64;
+                let whence = self.ppu.gpr[5] as i32;
+                let pos_ptr = self.ppu.gpr[6] as u32;
+                match sys_fs_lseek(&mut self.vfs, &mut self.fd_table, fd, offset, whence) {
+                    Ok(pos) => {
+                        self.mem.write(pos_ptr, &pos.to_be_bytes())?;
+                        self.ppu.gpr[3] = 0; // CELL_OK
+                    }
+                    Err(e) => {
+                        self.ppu.gpr[3] = u64::from(u32::from(e));
+                    }
+                }
+            }
             803 => {
                 // R9.1i — sys_fs_write(fd, *buf, size, *pwritten).
                 // PSL1GHT's stdio may route TTY writes via the
@@ -3201,30 +3254,31 @@ impl EmuCore {
                 self.ppu.gpr[3] = 0;
             }
             809 => {
-                // R9.1i — sys_fs_fstat(fd, *stat_out).
-                // PSL1GHT's stdio calls fstat(stdout) to detect
-                // whether the fd is a TTY (S_IFCHR) before
-                // routing print operations. Without a proper
-                // stat struct, stdio's "this isn't a tty" path
-                // skips the write to TTY entirely.
-                //
-                // CellFsStat layout (rpcs3 sys_fs.h struct
-                // CellFsStat, 52 bytes BE):
-                //   u32 mode, s32 uid, s32 gid, u64 atime,
-                //   u64 mtime, u64 ctime, u64 size, u64 blksize
-                let fd = r3 as i32;
+                // sys_fs_fstat(fd, *stat_out). VFS wave: a real file fd (>=4,
+                // resolvable in fd_table) gets a proper CellFsStat via
+                // fd -> handle -> path -> stat. stdio fds (0..3) and unknown
+                // fds keep the S_IFCHR char-device stat so PSL1GHT stdio still
+                // detects a TTY. CellFsStat is 52 bytes BE (see cellfsstat_to_be).
+                let fd = r3 as u32;
                 let stat_ptr = r4 as u32;
-                let s_ifchr: u32 = 0x2000;  // CELL_FS_S_IFCHR
-                let rw: u32 = 0o666;
-                let mode = s_ifchr | rw;
-                let mut buf = [0u8; 52];
-                buf[0..4].copy_from_slice(&mode.to_be_bytes());
-                self.mem.write(stat_ptr, &buf)?;
-                eprintln!(
-                    "[R9.1i] sys_fs_fstat(fd={fd}, *0x{stat_ptr:x}) \
-                     mode=S_IFCHR|0o666",
-                );
-                self.ppu.gpr[3] = 0;
+                if let Some(handle) = self.fd_table.file_handle(fd) {
+                    match self.vfs.stat_handle(handle) {
+                        Ok(st) => {
+                            self.mem.write(stat_ptr, &cellfsstat_to_be(&st))?;
+                            self.ppu.gpr[3] = 0; // CELL_OK
+                        }
+                        Err(e) => {
+                            self.ppu.gpr[3] = u64::from(u32::from(e));
+                        }
+                    }
+                } else {
+                    // stdio / unknown fd → char device (S_IFCHR | 0o666).
+                    let mode: u32 = 0x2000 | 0o666;
+                    let mut buf = [0u8; 52];
+                    buf[0..4].copy_from_slice(&mode.to_be_bytes());
+                    self.mem.write(stat_ptr, &buf)?;
+                    self.ppu.gpr[3] = 0;
+                }
             }
             324 | 325 | 326 | 327 | 328 | 329 | 331 | 332 | 333 |
             334 | 335 | 336 | 337 | 338 | 339 => {
