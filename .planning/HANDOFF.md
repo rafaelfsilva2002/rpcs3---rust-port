@@ -134,10 +134,26 @@ provider impl + `match nid` arm; confirm the NID at runtime from the
 `[R9.1g.7] unimplemented import: cellModule::0xNNNN` log, r3..r10 = args, write
 OUT ptrs BE, r3 = return) — directly replicable for the other 136 crates.
 
-Next options: (a) continue the HLE wave — wire more `cellSysutil` params/functions,
-then other PSL1GHT-exposed modules (`cellSysModule`, `cellGame`, `cellMsgDialog`,
-audio/io), each a mechanical gated slice; (b) the other big waves — GPU rendering
-backend, or commercial-game / SELF-decrypt boot. See docs/PORT_STATUS_AND_ROADMAP.md.
+**R13.7 (cellSysModule — 2nd HLE crate, STATEFUL pattern) LANDED 2026-05-29**
+(stage-1 commit on `main`) — wired `cellSysModule`: `cellSysmoduleLoadModule`
+(NID `0x32267a31`) + `cellSysmoduleIsLoaded` (NID `0x5a59e258`) →
+`rpcs3-hle-cellsysmodule` against a **persistent `SysmoduleManager` field on
+`EmuCore`** (init in `new()`, mirrors `lv2_sync_state`) — establishing the
+**stateful** HLE variant (state survives across guest calls, unlike the
+stateless `EmuSysutilConfig` provider). NIDs captured at runtime, not guessed.
+Fixture `single_sysmodule_v1` packs the lifecycle into the exit code
+(`bit0 not-loaded-before | bit1 load-ok | bit2 loaded-after`) → **0x7 post-wire
+vs 0x6 pre-wire** (the return-0 stub wrongly reads loaded before the load).
+Also fixed a latent R13.6 gap: the global `.gitignore` `Makefile` rule swallowed
+the `hle/` fixture Makefiles (negation existed for spu/lv2/rsx, not hle) — added
+the hle negation and committed both the cellSysModule and cellSysutil Makefiles.
+Gate **288/0/6023**.
+
+Next options: (a) continue the HLE wave — `cellSysutilGetSystemParamString` next
+(reuses the cellSysutil dep + `EmuSysutilConfig`, OUT string buffer), then other
+PSL1GHT-exposed modules (`cellGame`, `cellMsgDialog`, audio/io), each a mechanical
+gated slice; (b) the other big waves — GPU rendering backend, or commercial-game /
+SELF-decrypt boot. See docs/PORT_STATUS_AND_ROADMAP.md.
 
 Out of scope (still deferred): shader decompilation, texture pixel
 decode, Vulkan/GL backend, actual rendering. These need a GPU and
