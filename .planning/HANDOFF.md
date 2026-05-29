@@ -206,12 +206,21 @@ shapes**. GetState writes IPOBTAINED (3) BE-s32 to the OUT ptr (which is in **r3
 not r4 as the backlog guessed — runtime capture corrected it). Fixture
 `single_netctl_state_v1` → **3 post-wire vs 0x55 pre-wire**. Gate **293/0/6028**.
 
-HLE wave so far (9 functions / 5 crates / 6 modules this run): cellSysutil
+**R13.13 (cellNetCtlGetInfo MTU) LANDED 2026-05-29** — NID `0x1e585b5d` (r3=code,
+r4=&union) → `cell_net_ctl_get_info` against the SHARED netctl field+backend (one
+more arm, no new dep/field — the field-reuse path for stateful crates). INFO_MTU=3
+→ `NetInfo::Mtu(1500)` written BE-u32 to the union @0. Fixture
+`single_netctl_mtu_v1` → **1500 (0x5DC) post-wire vs 0 pre-wire**. Gate
+**294/0/6029**.
+
+HLE wave so far (10 functions / 5 crates / 7 modules this run): cellSysutil
 int+string, cellSysModule load+isloaded, cellVideoOut resolution+numdevices,
-sys_net inet_addr, cellNetCtl init+getstate. NID-dispatch + all 3 wiring shapes
-(provider/stateful/stateless, and combinations) proven; remaining crates are
-mechanical variations driven off `.planning/HLE_BACKLOG.md`. Next: cellNetCtl
-GetInfo MTU (reuses the field+backend, +1 arm), then jpgdec / font.
+sys_net inet_addr, cellNetCtl init+getstate+getinfo-MTU. All 3 wiring shapes
+(provider/stateful/stateless + combos) + the dep/field-reuse path proven.
+Remaining backlog (`.planning/HLE_BACKLOG.md`) thins out: jpgdec (multi-arm
+Create+Open, check for callbacks), font (verify NID-dispatch vs inlined), cellGame
+(verify exposure + lifecycle). If those need callbacks/inline/lifecycle, that's
+the natural STOP point for the wave.
 
 Next options: (a) continue the HLE wave — next PSL1GHT-exposed module with a
 NON-ZERO distinguishable return (`cellVideoOutGetState`, `cellGameGetParamInt`,
