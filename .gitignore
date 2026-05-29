@@ -150,6 +150,7 @@ Makefile
 !behavior-freeze/fixtures/spu/sources/*/Makefile
 !behavior-freeze/fixtures/lv2/sources/*/Makefile
 !behavior-freeze/fixtures/rsx/sources/*/Makefile
+!behavior-freeze/fixtures/hle/sources/*/Makefile
 *CMakeFiles*
 CMakeCache.txt
 *cmake_install.cmake*

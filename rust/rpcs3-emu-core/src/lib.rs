@@ -60,6 +60,9 @@ use rpcs3_lv2_spu_image::{deploy as deploy_image, build_image, SpuImage, SpuPhdr
 use rpcs3_spu_interpreter::{run_n as spu_run_n, StepOutcome as SpuStepOutcome, Error as SpuError};
 use rpcs3_spu_thread::SpuThread;
 use rpcs3_hle_cellsysutil::cell_sysutil_get_system_param_int;
+use rpcs3_hle_cellsysmodule::{
+    cell_sysmodule_is_loaded, cell_sysmodule_load_module, SysmoduleManager,
+};
 #[cfg(feature = "spu-recompiler")]
 use rpcs3_spu_differential::{ExecutionStopReason, SpuExecutor, SpuProgram};
 #[cfg(feature = "spu-recompiler")]
@@ -366,6 +369,10 @@ pub struct EmuCore {
     pub gcm_control_addr: u32,
     pub gcm_io_address: u32,
     pub gcm_io_size: u32,
+    /// HLE wave — cellSysModule dynamic-loader state. Refcount registry
+    /// (load +1, unload -1, is_loaded != 0 iff outstanding refs). Stateful
+    /// across guest calls; mirrors `lv2_sync_state`. Reset on `EmuCore::new`.
+    pub sysmodule: SysmoduleManager,
 }
 
 impl Default for EmuCore {
@@ -396,6 +403,7 @@ impl EmuCore {
             gcm_control_addr: 0,
             gcm_io_address: 0,
             gcm_io_size: 0,
+            sysmodule: SysmoduleManager::default(),
         }
     }
 
@@ -1737,6 +1745,34 @@ impl EmuCore {
                                     self.ppu.gpr[3] = u64::from(u32::from(e));
                                 }
                             }
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE wave — cellSysModule::cellSysmoduleLoadModule
+                        // (NID 0x32267a31). Stateful HLE crate: route to
+                        // rpcs3-hle-cellsysmodule against EmuCore's persistent
+                        // SysmoduleManager. r3 = module id.
+                        0x32267a31 => {
+                            let id = self.ppu.gpr[3] as u16;
+                            self.ppu.gpr[3] =
+                                match cell_sysmodule_load_module(&mut self.sysmodule, id) {
+                                    Ok(()) => 0, // CELL_OK
+                                    Err(e) => u64::from(u32::from(e)),
+                                };
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE wave — cellSysModule::cellSysmoduleIsLoaded
+                        // (NID 0x5a59e258). Returns CELL_SYSMODULE_LOADED (0) if
+                        // refs are outstanding, else CELL_SYSMODULE_ERROR_UNLOADED.
+                        // r3 = module id.
+                        0x5a59e258 => {
+                            let id = self.ppu.gpr[3] as u16;
+                            self.ppu.gpr[3] =
+                                match cell_sysmodule_is_loaded(&self.sysmodule, id) {
+                                    Ok(v) => u64::from(v as u32),
+                                    Err(e) => u64::from(u32::from(e)),
+                                };
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }

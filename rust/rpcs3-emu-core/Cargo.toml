@@ -31,6 +31,8 @@ rpcs3-lv2-event        = { path = "../rpcs3-lv2-event" }
 rpcs3-lv2-cond         = { path = "../rpcs3-lv2-cond" }
 # R13.6 — first HLE-crate integration: cellSysutil system-param lookups.
 rpcs3-hle-cellsysutil  = { path = "../rpcs3-hle-cellsysutil" }
+# HLE wave — cellSysModule dynamic loader (stateful: SysmoduleManager field).
+rpcs3-hle-cellsysmodule = { path = "../rpcs3-hle-cellsysmodule" }
 # Optional: the Cranelift SPU JIT, gated behind the `spu-recompiler`
 # feature so default builds stay lean (no Cranelift) and the gate keeps
 # using the interpreter unless explicitly opted in.
