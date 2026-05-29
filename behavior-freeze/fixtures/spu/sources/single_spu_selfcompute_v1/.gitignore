@@ -1,0 +1,9 @@
+# Built artifacts — produced locally by the PSL1GHT Docker toolchain
+# (see README.md). Sources (main.c, spu/*.c, Makefile, *.md) are tracked;
+# binaries are not, matching the rest of the behavior-freeze fixture corpus.
+*.self
+*.elf
+*.bin
+*.o
+*.s
+build/

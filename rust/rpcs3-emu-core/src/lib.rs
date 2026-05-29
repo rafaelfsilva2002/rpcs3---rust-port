@@ -1193,16 +1193,39 @@ impl EmuCore {
                                 "[R9.1h] sys_spu_image_import(*0x{image_ptr:x}, \
                                  src=0x{src_ptr:x})",
                             );
-                            // Read up to 256 KB of SPU ELF from
-                            // PPU memory.
-                            let mut blob = vec![0u8; 256 * 1024];
-                            let read_len =
-                                self.mem.read(src_ptr, &mut blob).map(|_| blob.len()).unwrap_or(0);
-                            if read_len > 0 {
-                                if let Ok(info) =
-                                    rpcs3_loader_elf_self::parse_elf(&blob[..read_len])
-                                {
-                                    if info.is_spu() {
+                            // Read the SPU ELF from PPU memory. The blob can
+                            // sit near the end of a mapped segment, so a fixed
+                            // 256 KB read may over-run into unmapped pages and
+                            // fail — try progressively smaller spans and use
+                            // the largest that maps. Every failure mode is now
+                            // logged (the previous `if let Ok` swallowed them,
+                            // which is why no homebrew SPU ever actually ran
+                            // through run_self — see spu_selfcompute_jit test).
+                            let mut blob: Vec<u8> = Vec::new();
+                            for sz in [0x4_0000usize, 0x1_0000, 0x4000, 0x1000, 0x400] {
+                                let mut b = vec![0u8; sz];
+                                if self.mem.read(src_ptr, &mut b).is_ok() {
+                                    blob = b;
+                                    break;
+                                }
+                            }
+                            if blob.is_empty() {
+                                eprintln!(
+                                    "[R9.1h] sys_spu_image_import: mem.read(0x{src_ptr:x}) \
+                                     failed at all sizes — src not mapped?",
+                                );
+                            } else {
+                                match rpcs3_loader_elf_self::parse_elf(&blob) {
+                                    Err(e) => eprintln!(
+                                        "[R9.1h] parse_elf(0x{src_ptr:x}) failed: {e:?} \
+                                         (first bytes: {:02x?})",
+                                        &blob[..blob.len().min(8)],
+                                    ),
+                                    Ok(info) if !info.is_spu() => eprintln!(
+                                        "[R9.1h] not an SPU ELF at 0x{src_ptr:x} \
+                                         (e_machine mismatch)",
+                                    ),
+                                    Ok(info) => {
                                         let phdrs: Vec<_> = info
                                             .program_headers
                                             .iter()
@@ -1214,48 +1237,43 @@ impl EmuCore {
                                                 p_memsz: p.p_memsz as u32,
                                             })
                                             .collect();
-                                        if let Ok(image) =
-                                            rpcs3_lv2_spu_image::build_image(
-                                                info.e_entry as u32,
-                                                &phdrs,
-                                                src_ptr,
-                                            )
-                                        {
-                                            eprintln!(
-                                                "[R9.1h] SPU image captured: \
-                                                 entry=0x{:x} segs={}",
-                                                image.entry_point,
-                                                image.segments.len(),
-                                            );
-                                            self.spu_image = Some(image.clone());
-                                            self.spu_image_src_vaddr = src_ptr;
-                                            // Write a stub sysSpuImage
-                                            // struct: type=0, entry,
-                                            // segs_ptr=0, nsegs=count.
-                                            let mut buf = [0u8; 16];
-                                            buf[0..4].copy_from_slice(
-                                                &0u32.to_be_bytes(),
-                                            );
-                                            buf[4..8].copy_from_slice(
-                                                &(image.entry_point).to_be_bytes(),
-                                            );
-                                            buf[8..12].copy_from_slice(
-                                                &0u32.to_be_bytes(),
-                                            );
-                                            buf[12..16].copy_from_slice(
-                                                &(image.segments.len() as u32)
-                                                    .to_be_bytes(),
-                                            );
-                                            self.mem.write(image_ptr, &buf).ok();
-                                            self.ppu.gpr[3] = 0;
-                                            self.ppu.cia =
-                                                (self.ppu.lr as u32) & !0x3;
-                                            return Ok(None);
+                                        match rpcs3_lv2_spu_image::build_image(
+                                            info.e_entry as u32,
+                                            &phdrs,
+                                            src_ptr,
+                                        ) {
+                                            Err(e) => eprintln!(
+                                                "[R9.1h] build_image failed: {e:?} \
+                                                 (entry=0x{:x} phdrs={})",
+                                                info.e_entry,
+                                                phdrs.len(),
+                                            ),
+                                            Ok(image) => {
+                                                eprintln!(
+                                                    "[R9.1h] SPU image captured: \
+                                                     entry=0x{:x} segs={}",
+                                                    image.entry_point,
+                                                    image.segments.len(),
+                                                );
+                                                self.spu_image = Some(image.clone());
+                                                self.spu_image_src_vaddr = src_ptr;
+                                                // Stub sysSpuImage struct:
+                                                // type=0, entry, segs_ptr=0,
+                                                // nsegs=count (16 BE bytes).
+                                                let mut buf = [0u8; 16];
+                                                buf[4..8].copy_from_slice(
+                                                    &image.entry_point.to_be_bytes(),
+                                                );
+                                                buf[12..16].copy_from_slice(
+                                                    &(image.segments.len() as u32)
+                                                        .to_be_bytes(),
+                                                );
+                                                self.mem.write(image_ptr, &buf).ok();
+                                            }
                                         }
                                     }
                                 }
                             }
-                            // Fallback: signal success but no image.
                             self.ppu.gpr[3] = 0;
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
