@@ -305,6 +305,35 @@ cfallin.org/blog/2026/04/09/aegraph · Wasmtime Winch RFC
 
 ---
 
+## 4.2 Measured baseline — interpreter vs Cranelift JIT (2026-05-28)
+
+First numbers from the new `cargo bench -p rpcs3-spu-recompiler`
+(`benches/spu_executors.rs`, lever #0). Time is per full `execute()`
+(fresh `SpuThread` + deploy + run-to-stop). Machine-relative — a baseline
+to track regressions against, not an absolute truth.
+
+| Workload | Interpreter | JIT cold | JIT warm | Warm verdict |
+|---|---|---|---|---|
+| `branch_loop` (Fibonacci, tiny) | 16.5 µs | 209 µs | 35 µs | JIT **2.1× slower** |
+| `mailbox` (channel/fallback) | 19.2 µs | 121 µs | 36 µs | JIT **1.9× slower** |
+| **`hot_loop_30k`** (30k-iter loop) | **252 µs** | — | **67 µs** | JIT **3.8× FASTER** |
+
+**Reading:** on the tiny correctness oracles the JIT *loses* — its
+compile + dispatch overhead isn't amortized, and per-`execute` cost is
+dominated by the 256 KB `SpuThread` setup (note the interpreter is ~the
+same ~17–19 µs regardless of program). On a real hot loop (30k
+iterations) the JIT is **3.8× faster** — empirical proof that the JIT
+pays off *only* for hot code.
+
+**Consequence for lever #1:** do NOT wire the JIT as "always-JIT" — that
+would slow down short-lived SPU tasks. The correct design is **tiered**
+(interpret cold/short, JIT hot), matching §4.1. Two sub-findings worth
+their own levers: (a) the 256 KB `SpuThread` setup dominates short runs
+(reuse / avoid re-zeroing), and (b) the JIT break-even sits in the
+low-thousands of executed instructions.
+
+---
+
 ## 5. Honest reality check
 
 Running a **real commercial game on low-end hardware is far off** —

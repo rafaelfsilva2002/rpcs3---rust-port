@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Scaffold for the SPU recompiler. Currently exposes a `RecompilerExecutor` that delegates to the interpreter; the Cranelift-backed JIT lands in Phase R2 of SPU_RECOMPILER_PLAN.md once a backend is approved."
+description = "SPU recompiler: a Cranelift-backed JIT (RecompilerExecutor) compiling SPU basic blocks to native host code, with per-function interpreter fallback for unsupported opcodes / channel stalls. Byte-identical to the interpreter across the SPU replay oracles."
 
 [lib]
 name = "rpcs3_spu_recompiler"
@@ -30,3 +30,12 @@ target-lexicon = "0.13"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# Lever #0 of the optimization roadmap (docs/PORT_STATUS_AND_ROADMAP.md §4):
+# a measurement harness so interpreter-vs-JIT speed can be tracked.
+criterion = "0.5"
+
+[[bench]]
+name = "spu_executors"
+harness = false

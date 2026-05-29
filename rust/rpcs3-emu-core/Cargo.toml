@@ -29,6 +29,18 @@ rpcs3-lv2-sync         = { path = "../rpcs3-lv2-sync" }
 rpcs3-lv2-lwmutex      = { path = "../rpcs3-lv2-lwmutex" }
 rpcs3-lv2-event        = { path = "../rpcs3-lv2-event" }
 rpcs3-lv2-cond         = { path = "../rpcs3-lv2-cond" }
+# Optional: the Cranelift SPU JIT, gated behind the `spu-recompiler`
+# feature so default builds stay lean (no Cranelift) and the gate keeps
+# using the interpreter unless explicitly opted in.
+rpcs3-spu-recompiler   = { path = "../rpcs3-spu-recompiler", optional = true }
+rpcs3-spu-differential = { path = "../rpcs3-spu-differential", optional = true }
+
+[features]
+# Opt-in: allow SPU execution to be routed through the Cranelift JIT
+# (RecompilerExecutor) instead of the interpreter, selected at runtime via
+# EmuCore::spu_backend. Default OFF — the JIT only wins on hot loops
+# (docs/PORT_STATUS_AND_ROADMAP.md §4.2), so always-JIT is NOT the default.
+spu-recompiler = ["dep:rpcs3-spu-recompiler", "dep:rpcs3-spu-differential"]
 
 [dev-dependencies]
 # R12.11b — decode the captured RSX command stream from the gcm

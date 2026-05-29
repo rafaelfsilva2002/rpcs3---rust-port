@@ -59,6 +59,22 @@ use rpcs3_lv2_spu_group::{
 use rpcs3_lv2_spu_image::{deploy as deploy_image, build_image, SpuImage, SpuPhdr};
 use rpcs3_spu_interpreter::{run_n as spu_run_n, StepOutcome as SpuStepOutcome, Error as SpuError};
 use rpcs3_spu_thread::SpuThread;
+#[cfg(feature = "spu-recompiler")]
+use rpcs3_spu_differential::{ExecutionStopReason, SpuExecutor, SpuProgram};
+#[cfg(feature = "spu-recompiler")]
+use rpcs3_spu_recompiler::RecompilerExecutor;
+
+/// Which backend executes SPU thread code. Default `Interpreter`. The
+/// `Recompiler` (Cranelift JIT) variant is honored only when built with the
+/// `spu-recompiler` feature; otherwise SPU code always runs on the
+/// interpreter. Per docs/PORT_STATUS_AND_ROADMAP.md §4.1–4.2 the JIT only
+/// wins on hot loops, so it is opt-in, not the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpuBackend {
+    #[default]
+    Interpreter,
+    Recompiler,
+}
 
 // =====================================================================
 // Types
@@ -300,6 +316,9 @@ pub struct EmuCore {
     /// to populate the caller's `*status` pointer with the
     /// canonical TTY status the binary expects.
     pub spu_exit_status: Option<u32>,
+    /// Which backend runs SPU thread code (default `Interpreter`).
+    /// `Recompiler` is honored only under the `spu-recompiler` feature.
+    pub spu_backend: SpuBackend,
     /// Maximum steps per `run` invocation. 0 = unbounded.
     pub step_budget: usize,
     /// R10.1.b — per-run LV2 sync primitive registry. Owns lwmutex
@@ -338,6 +357,7 @@ impl EmuCore {
             spu_image_src_vaddr: 0,
             spu_thread_args: [0; 4],
             spu_exit_status: None,
+            spu_backend: SpuBackend::Interpreter,
             step_budget: 100_000,
             lv2_sync_state: Lv2SyncState::new(),
             gcm_context_addr: 0,
@@ -2167,55 +2187,106 @@ impl EmuCore {
                     if let Err(e) = deploy_result {
                         return Err(Error::SpuGroup(e));
                     }
-                    // Build the SpuThread.
-                    let mut spu = SpuThread::new(0);
-                    for (i, chunk) in ls.chunks(65536).enumerate() {
-                        spu.ls_write((i as u32) * 65536, chunk);
-                    }
-                    spu.pc = image.entry_point;
-                    // Marshal arg0..arg3 into r3..r6 per PSL1GHT
-                    // SPU calling convention. The args are u64 in
-                    // the SPU's preferred slot (top 64 bits of
-                    // 128-bit GPR).
-                    for (slot, &arg) in self.spu_thread_args.iter().enumerate() {
-                        spu.gpr[3 + slot] = (arg as u128) << 64;
-                    }
-                    eprintln!(
-                        "[R9.1g.10] sys_spu_thread_group_start: launching SPU \
-                         entry=0x{:x} arg0=0x{:x} arg1=0x{:x}",
-                        spu.pc, self.spu_thread_args[0], self.spu_thread_args[1],
-                    );
-                    // Run the SPU interpreter until a stop
-                    // instruction halts it (or the step budget is
-                    // exhausted).
-                    let (steps, outcome) = spu_run_n(&mut spu, 10_000_000)?;
-                    match outcome {
-                        SpuStepOutcome::Stop(code) => {
-                            let out_mbox = spu.channels.out_mbox.unwrap_or(0);
+                    // R9.1g.10 — execute the SPU. Default: the interpreter.
+                    // Under the `spu-recompiler` feature with
+                    // `spu_backend == Recompiler`, route through the Cranelift
+                    // JIT instead (docs/PORT_STATUS_AND_ROADMAP.md §4) —
+                    // byte-identical by construction (the JIT falls back to
+                    // this same interpreter for unsupported ops). The default
+                    // path below is left exactly as-is so the behavior-freeze
+                    // gate is untouched.
+                    #[cfg(feature = "spu-recompiler")]
+                    let jit_selected = matches!(self.spu_backend, SpuBackend::Recompiler);
+                    #[cfg(not(feature = "spu-recompiler"))]
+                    let jit_selected = false;
+
+                    if jit_selected {
+                        #[cfg(feature = "spu-recompiler")]
+                        {
+                            let mut program = SpuProgram::new(image.entry_point, 10_000_000)
+                                .with_segment(0, ls.clone());
+                            for (slot, &arg) in self.spu_thread_args.iter().enumerate() {
+                                program = program
+                                    .with_initial_gpr((3 + slot) as u8, u128::from(arg) << 64);
+                            }
                             eprintln!(
-                                "[R9.1g.10] SPU halted: stop_code=0x{:x} \
-                                 out_mbox=0x{:08x} steps={}",
-                                code, out_mbox, steps,
+                                "[R9.1g.10] sys_spu_thread_group_start: launching SPU (JIT) \
+                                 entry=0x{:x} arg0=0x{:x} arg1=0x{:x}",
+                                image.entry_point,
+                                self.spu_thread_args[0],
+                                self.spu_thread_args[1],
                             );
-                            self.spu_exit_status = Some(out_mbox);
+                            let result = RecompilerExecutor::new().execute(&program);
+                            match result.stop_reason {
+                                ExecutionStopReason::Stop(code) => {
+                                    let out_mbox =
+                                        result.final_state.channels.out_mbox.unwrap_or(0);
+                                    eprintln!(
+                                        "[R9.1g.10] SPU halted (JIT): stop_code=0x{:x} \
+                                         out_mbox=0x{:08x} steps={}",
+                                        code, out_mbox, result.steps_executed,
+                                    );
+                                    self.spu_exit_status = Some(out_mbox);
+                                }
+                                ExecutionStopReason::MfcUnsupported { .. } => {
+                                    self.spu_exit_status = Some(
+                                        result.final_state.channels.out_mbox.unwrap_or(0),
+                                    );
+                                }
+                                _ => return Err(Error::StepsExhausted),
+                            }
                         }
-                        SpuStepOutcome::Continue => {
-                            return Err(Error::StepsExhausted);
+                    } else {
+                        // Build the SpuThread.
+                        let mut spu = SpuThread::new(0);
+                        for (i, chunk) in ls.chunks(65536).enumerate() {
+                            spu.ls_write((i as u32) * 65536, chunk);
                         }
-                        SpuStepOutcome::ChannelStall { .. } => {
-                            // Mailbox SPUs may stall on IN_MBOX
-                            // waiting for the PPU; for now treat
-                            // as an error (R9.1g.11+ would wire
-                            // bidirectional mailbox plumbing).
-                            return Err(Error::StepsExhausted);
+                        spu.pc = image.entry_point;
+                        // Marshal arg0..arg3 into r3..r6 per PSL1GHT
+                        // SPU calling convention. The args are u64 in
+                        // the SPU's preferred slot (top 64 bits of
+                        // 128-bit GPR).
+                        for (slot, &arg) in self.spu_thread_args.iter().enumerate() {
+                            spu.gpr[3 + slot] = (arg as u128) << 64;
                         }
-                        SpuStepOutcome::MfcUnsupported { .. } => {
-                            // The SPU hit an MFC variant not in
-                            // our interpreter — bridge-side path.
-                            // Treat as stop for R9.1g.10's MVP.
-                            self.spu_exit_status = Some(
-                                spu.channels.out_mbox.unwrap_or(0),
-                            );
+                        eprintln!(
+                            "[R9.1g.10] sys_spu_thread_group_start: launching SPU \
+                             entry=0x{:x} arg0=0x{:x} arg1=0x{:x}",
+                            spu.pc, self.spu_thread_args[0], self.spu_thread_args[1],
+                        );
+                        // Run the SPU interpreter until a stop
+                        // instruction halts it (or the step budget is
+                        // exhausted).
+                        let (steps, outcome) = spu_run_n(&mut spu, 10_000_000)?;
+                        match outcome {
+                            SpuStepOutcome::Stop(code) => {
+                                let out_mbox = spu.channels.out_mbox.unwrap_or(0);
+                                eprintln!(
+                                    "[R9.1g.10] SPU halted: stop_code=0x{:x} \
+                                     out_mbox=0x{:08x} steps={}",
+                                    code, out_mbox, steps,
+                                );
+                                self.spu_exit_status = Some(out_mbox);
+                            }
+                            SpuStepOutcome::Continue => {
+                                return Err(Error::StepsExhausted);
+                            }
+                            SpuStepOutcome::ChannelStall { .. } => {
+                                // Mailbox SPUs may stall on IN_MBOX
+                                // waiting for the PPU; for now treat
+                                // as an error (R9.1g.11+ would wire
+                                // bidirectional mailbox plumbing).
+                                return Err(Error::StepsExhausted);
+                            }
+                            SpuStepOutcome::MfcUnsupported { .. } => {
+                                // The SPU hit an MFC variant not in
+                                // our interpreter — bridge-side path.
+                                // Treat as stop for R9.1g.10's MVP.
+                                self.spu_exit_status = Some(
+                                    spu.channels.out_mbox.unwrap_or(0),
+                                );
+                            }
                         }
                     }
                 } else {
