@@ -177,9 +177,16 @@ trio of HLE wiring shapes: **provider** (cellSysutil fixed config), **stateful
 EmuCore field** (cellSysModule SysmoduleManager), **stateless lookup**
 (cellVideoOut).
 
-HLE wave so far (5 functions / 3 crates this run): cellSysutil int+string,
-cellSysModule load+isloaded, cellVideoOut resolution. NID-dispatch + 3 wiring
-shapes proven; the remaining 134 crates are mechanical variations.
+**R13.10 (cellVideoOutGetNumberOfDevice) LANDED 2026-05-29** — 2nd cellVideoOut
+fn (NID `0x75bbb672`), reuses the GetResolution dep; stateless count returned
+directly in r3. Fixture `single_videoout_numdevices_v1` → **1 post-wire vs 0
+pre-wire**. Shows the dep-reuse path (a 2nd fn from an already-wired crate = one
+more arm). Gate **291/0/6026**.
+
+HLE wave so far (6 functions / 3 crates this run): cellSysutil int+string,
+cellSysModule load+isloaded, cellVideoOut resolution+numdevices. NID-dispatch +
+3 wiring shapes (provider/stateful/stateless) proven; the remaining ~134 crates
+are mechanical variations.
 
 Next options: (a) continue the HLE wave — next PSL1GHT-exposed module with a
 NON-ZERO distinguishable return (`cellVideoOutGetState`, `cellGameGetParamInt`,
