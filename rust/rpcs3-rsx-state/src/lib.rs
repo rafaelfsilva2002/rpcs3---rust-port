@@ -87,12 +87,13 @@ pub const VIEWPORT_VERTICAL: u32 = 0x0A04 >> 2;
 // Surface / render-target registers (byte offsets from RPCS3
 // rsx_methods.h, cross-checked):
 //   NV4097_SET_SURFACE_FORMAT        0x0208
+//   NV4097_SET_SURFACE_PITCH_A       0x020C
 //   NV4097_SET_SURFACE_COLOR_AOFFSET 0x0210
-//   NV4097_SET_SURFACE_PITCH_A       0x0218 (interleaved with offsets)
-//   NV4097_SET_SURFACE_COLOR_TARGET  0x0220
 //   NV4097_SET_SURFACE_ZETA_OFFSET   0x0214
+//   NV4097_SET_SURFACE_COLOR_BOFFSET 0x0218
+//   NV4097_SET_SURFACE_PITCH_B       0x021C
+//   NV4097_SET_SURFACE_COLOR_TARGET  0x0220
 //   NV4097_SET_SURFACE_PITCH_Z       0x022C
-//   NV4097_SET_SURFACE_COLOR_BOFFSET 0x0230
 //   NV4097_SET_SURFACE_COLOR_C/DOFFSET 0x0280 / 0x0284
 /// `SET_SURFACE_FORMAT` (0x0208) — color/depth format + AA + type.
 pub const SURFACE_FORMAT: u32 = 0x0208 >> 2;
@@ -100,12 +101,14 @@ pub const SURFACE_FORMAT: u32 = 0x0208 >> 2;
 pub const SURFACE_COLOR_TARGET: u32 = 0x0220 >> 2;
 /// `SET_SURFACE_COLOR_AOFFSET` (0x0210).
 pub const SURFACE_COLOR_A_OFFSET: u32 = 0x0210 >> 2;
-/// `SET_SURFACE_PITCH_A` (0x0218).
-pub const SURFACE_PITCH_A: u32 = 0x0218 >> 2;
-/// `SET_SURFACE_COLOR_BOFFSET` (0x0230).
-pub const SURFACE_COLOR_B_OFFSET: u32 = 0x0230 >> 2;
-/// `SET_SURFACE_PITCH_B` (0x0234).
-pub const SURFACE_PITCH_B: u32 = 0x0234 >> 2;
+/// `SET_SURFACE_PITCH_A` (0x020C per RPCS3 gcm_enums.h). Was wrongly 0x0218
+/// (which is actually COLOR_BOFFSET) — caught by the real-libgcm capture
+/// `single_gcm_surface_v1` (R13.5c), which read pitch=0 at 0x0218.
+pub const SURFACE_PITCH_A: u32 = 0x020C >> 2;
+/// `SET_SURFACE_COLOR_BOFFSET` (0x0218 per RPCS3 gcm_enums.h). Was wrongly 0x0230.
+pub const SURFACE_COLOR_B_OFFSET: u32 = 0x0218 >> 2;
+/// `SET_SURFACE_PITCH_B` (0x021C per RPCS3 gcm_enums.h). Was wrongly 0x0234.
+pub const SURFACE_PITCH_B: u32 = 0x021C >> 2;
 /// `SET_SURFACE_COLOR_COFFSET` (0x0280).
 pub const SURFACE_COLOR_C_OFFSET: u32 = 0x0280 >> 2;
 /// `SET_SURFACE_PITCH_C` (0x0288).
