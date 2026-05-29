@@ -183,10 +183,25 @@ directly in r3. Fixture `single_videoout_numdevices_v1` → **1 post-wire vs 0
 pre-wire**. Shows the dep-reuse path (a 2nd fn from an already-wired crate = one
 more arm). Gate **291/0/6026**.
 
-HLE wave so far (6 functions / 3 crates this run): cellSysutil int+string,
-cellSysModule load+isloaded, cellVideoOut resolution+numdevices. NID-dispatch +
-3 wiring shapes (provider/stateful/stateless) proven; the remaining ~134 crates
-are mechanical variations.
+**R13.11 (sys_net inet_addr) + HLE backlog LANDED 2026-05-29** — an ULTRACODE
+discovery workflow (12 cluster agents + adversarial verify + synth) produced
+**`.planning/HLE_BACKLOG.md`**: a ranked, vetted list of next NID-dispatch
+targets. First item executed: `sys_net inet_addr` (NID `0xdabbc2c0`) →
+`rpcs3-hle-sys-net-user::inet_addr_stub` = `0xFFFFFFFF` (INET_ADDR_NONE, byte-exact
+firmware stub). Fixture `single_net_inet_addr_v1` → **1 post-wire vs 0 pre-wire**
+(confirmed inet_addr dispatches a real NID, not inlined). Gate **292/0/6027**.
+
+**CAUTION on the backlog:** its PSL1GHT-exposure claims are UNRELIABLE — always
+re-verify with `docker run ... grep /opt/ps3dev/psl1ght/ppu/include` before
+authoring. The cellAudioOut family it ranked #2/#3/#7/#8/#9 is NOT exposed
+(audio.h exposes only cellAudio *rendering*: audioInit/PortOpen/GetPortConfig).
+Confirmed-exposed viable next: netCtl (netctl.h: netCtlInit/GetState/GetInfo),
+jpgdec, font (fontGetStubRevisionFlags).
+
+HLE wave so far (7 functions / 4 crates this run): cellSysutil int+string,
+cellSysModule load+isloaded, cellVideoOut resolution+numdevices, sys_net
+inet_addr. NID-dispatch + 3 wiring shapes (provider/stateful/stateless) proven;
+the remaining crates are mechanical variations driven off the backlog.
 
 Next options: (a) continue the HLE wave — next PSL1GHT-exposed module with a
 NON-ZERO distinguishable return (`cellVideoOutGetState`, `cellGameGetParamInt`,
