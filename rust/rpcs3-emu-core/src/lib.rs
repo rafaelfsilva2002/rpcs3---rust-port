@@ -65,7 +65,9 @@ use rpcs3_hle_cellsysutil::{
 use rpcs3_hle_cellsysmodule::{
     cell_sysmodule_is_loaded, cell_sysmodule_load_module, SysmoduleManager,
 };
-use rpcs3_hle_cellvideoout::cell_video_out_get_resolution;
+use rpcs3_hle_cellvideoout::{
+    cell_video_out_get_number_of_device, cell_video_out_get_resolution,
+};
 #[cfg(feature = "spu-recompiler")]
 use rpcs3_spu_differential::{ExecutionStopReason, SpuExecutor, SpuProgram};
 #[cfg(feature = "spu-recompiler")]
@@ -1803,6 +1805,19 @@ impl EmuCore {
                                     self.ppu.gpr[3] = u64::from(u32::from(e));
                                 }
                             }
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE wave — cellVideoOut::cellVideoOutGetNumberOfDevice
+                        // (NID 0x75bbb672). STATELESS; r3 = videoOut port. The
+                        // count is returned directly in r3 (no OUT pointer).
+                        0x75bbb672 => {
+                            let port = self.ppu.gpr[3] as u32;
+                            self.ppu.gpr[3] =
+                                match cell_video_out_get_number_of_device(port) {
+                                    Ok(n) => u64::from(n as u32),
+                                    Err(e) => u64::from(u32::from(e)),
+                                };
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
