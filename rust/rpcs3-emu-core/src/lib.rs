@@ -68,7 +68,7 @@ use rpcs3_hle_cellsysmodule::{
 use rpcs3_hle_cellvideoout::{
     cell_video_out_get_configuration, cell_video_out_get_number_of_device,
     cell_video_out_get_resolution, cell_video_out_get_resolution_availability,
-    VideoOutManager,
+    cell_video_out_get_state, VideoOutManager, VideoOutState,
 };
 use rpcs3_hle_sys_net_user::inet_addr_stub;
 use rpcs3_hle_cellnetctl::{
@@ -1864,6 +1864,40 @@ impl EmuCore {
                                     self.ppu.gpr[3] = u64::from(u32::from(e));
                                 }
                             }
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE wave — cellVideoOut::cellVideoOutGetState
+                        // (NID 0x887572d5). Stateful (VideoOutManager). r3 = port,
+                        // r4 = deviceIndex, r5 = OUT *videoState {state@0,
+                        // colorSpace@1, padding[6], displayMode@8{resolution@8,
+                        // scanMode@9, conversion@10, aspect@11,...}}.
+                        0x887572d5 => {
+                            let port = self.ppu.gpr[3] as u32;
+                            let device_index = self.ppu.gpr[4] as u32;
+                            let state_ptr = self.ppu.gpr[5] as u32;
+                            self.ppu.gpr[3] = match cell_video_out_get_state(
+                                &self.videoout,
+                                port,
+                                device_index,
+                            ) {
+                                Ok(info) => {
+                                    let state_byte: u8 = match info.state {
+                                        VideoOutState::Enabled => 0,
+                                        VideoOutState::Disabled => 1,
+                                        VideoOutState::DeepSleep => 2,
+                                    };
+                                    self.mem
+                                        .write(state_ptr, &[state_byte, info.color_space])?;
+                                    self.mem.write(
+                                        state_ptr + 8,
+                                        &[info.resolution_id, info.scan_mode],
+                                    )?;
+                                    self.mem.write(state_ptr + 11, &[info.aspect])?;
+                                    0 // CELL_OK
+                                }
+                                Err(e) => u64::from(u32::from(e)),
+                            };
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
