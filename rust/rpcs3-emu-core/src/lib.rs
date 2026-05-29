@@ -82,6 +82,11 @@ use rpcs3_hle_cellmsgdialog::{
     cell_msg_dialog_close, cell_msg_dialog_open, last_button as msg_last_button,
     DialogManager, TypeFlags as MsgTypeFlags,
 };
+use rpcs3_lv2_fs::{sys_fs_close, sys_fs_open, sys_fs_read, FdTable};
+
+mod vfs;
+use vfs::MemVfs;
+
 #[cfg(feature = "spu-recompiler")]
 use rpcs3_spu_differential::{ExecutionStopReason, SpuExecutor, SpuProgram};
 #[cfg(feature = "spu-recompiler")]
@@ -492,6 +497,12 @@ pub struct EmuCore {
     /// (headless) auto-confirms, invoking the guest dialog callback via
     /// [`EmuCore::call_guest_function`] with the default button.
     pub msgdialog: DialogManager,
+    /// VFS wave — in-memory filesystem backing the lv2 `sys_fs_*` syscalls.
+    /// Tests pre-seed files via [`EmuCore::vfs_add_file`] before `run_self`.
+    pub vfs: MemVfs,
+    /// VFS wave — lv2 file-descriptor table (fds start at 4; 0..3 = stdio).
+    /// Persists across open/read/close within one run.
+    pub fd_table: FdTable,
 }
 
 impl Default for EmuCore {
@@ -528,6 +539,8 @@ impl EmuCore {
             sysutil_callbacks: CallbackTable::default(),
             sysutil_queue: CallbackQueue::default(),
             msgdialog: DialogManager::default(),
+            vfs: MemVfs::new(),
+            fd_table: FdTable::new(),
         }
     }
 
@@ -1178,6 +1191,13 @@ impl EmuCore {
             bytes.push(b[0]);
         }
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Seed an in-memory VFS file BEFORE `run_self` (deterministic stand-in for
+    /// on-disk content). The path key must be byte-identical to the path the
+    /// guest passes to `sysFsOpen`.
+    pub fn vfs_add_file(&mut self, path: &str, data: Vec<u8>) {
+        self.vfs.add_file(path, data);
     }
 
     /// Dispatch the syscall that just triggered. The syscall number
@@ -3100,6 +3120,55 @@ impl EmuCore {
                     self.mem.write(out_ptr, &STUB_IMAGE_ID.to_be_bytes())?;
                 }
                 self.ppu.gpr[3] = 0;
+            }
+            // VFS wave — sys_fs_open (#801): r3=path ptr, r4=flags, r5=*fd_out,
+            // r6=mode, r7=*arg, r8=size. fd is written to *fd_out (BE u32); r3
+            // carries only the error code. Numbered syscall: set r3, do NOT
+            // touch cia (the `sc` handler already advanced it).
+            801 => {
+                let path_ptr = r3 as u32;
+                let flags = r4 as u32;
+                let fd_out = self.ppu.gpr[5] as u32;
+                let path = self.read_guest_cstr(path_ptr, 1024);
+                match sys_fs_open(&mut self.vfs, &mut self.fd_table, &path, flags) {
+                    Ok(fd) => {
+                        self.mem.write(fd_out, &fd.to_be_bytes())?;
+                        self.ppu.gpr[3] = 0; // CELL_OK
+                    }
+                    Err(e) => {
+                        self.ppu.gpr[3] = u64::from(u32::from(e));
+                    }
+                }
+            }
+            // VFS wave — sys_fs_read (#802): r3=fd, r4=*buf, r5=nbytes,
+            // r6=*nread. lv2 fills a host buffer; copy the bytes read into the
+            // guest buffer + write the count (BE u64) to *nread.
+            802 => {
+                let fd = r3 as u32;
+                let buf_ptr = r4 as u32;
+                let nbytes = self.ppu.gpr[5] as usize;
+                let nread_ptr = self.ppu.gpr[6] as u32;
+                let mut tmp = vec![0u8; nbytes];
+                match sys_fs_read(&mut self.vfs, &mut self.fd_table, fd, &mut tmp) {
+                    Ok(n) => {
+                        let n_usize = n as usize;
+                        if n_usize > 0 {
+                            self.mem.write(buf_ptr, &tmp[..n_usize])?;
+                        }
+                        self.mem.write(nread_ptr, &n.to_be_bytes())?;
+                        self.ppu.gpr[3] = 0; // CELL_OK
+                    }
+                    Err(e) => {
+                        self.ppu.gpr[3] = u64::from(u32::from(e));
+                    }
+                }
+            }
+            // VFS wave — sys_fs_close (#804): r3=fd.
+            804 => {
+                match sys_fs_close(&mut self.vfs, &mut self.fd_table, r3 as u32) {
+                    Ok(()) => self.ppu.gpr[3] = 0, // CELL_OK
+                    Err(e) => self.ppu.gpr[3] = u64::from(u32::from(e)),
+                }
             }
             803 => {
                 // R9.1i — sys_fs_write(fd, *buf, size, *pwritten).

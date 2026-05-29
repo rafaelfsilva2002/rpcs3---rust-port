@@ -29,6 +29,9 @@ rpcs3-lv2-sync         = { path = "../rpcs3-lv2-sync" }
 rpcs3-lv2-lwmutex      = { path = "../rpcs3-lv2-lwmutex" }
 rpcs3-lv2-event        = { path = "../rpcs3-lv2-event" }
 rpcs3-lv2-cond         = { path = "../rpcs3-lv2-cond" }
+# VFS layer — lv2 filesystem engine (FileSystem trait + sys_fs_* + FdTable),
+# backed by an in-memory MemVfs (src/vfs.rs). Unlocks cellFs/savedata/font.
+rpcs3-lv2-fs           = { path = "../rpcs3-lv2-fs" }
 # R13.6 — first HLE-crate integration: cellSysutil system-param lookups.
 rpcs3-hle-cellsysutil  = { path = "../rpcs3-hle-cellsysutil" }
 # HLE wave — cellSysModule dynamic loader (stateful: SysmoduleManager field).
