@@ -92,11 +92,16 @@ offsets verified) + `FdTable::file_handle` (rpcs3-lv2-fs, fd→handle) +
 ENOSYS). Fixture `single_fs_stat_v1` → 0xC0DE (stat=16, fstat=16, lseek SET 8,
 read sum 0x64) vs 0xBAD0 negative. Gate green.
 
-Next VFS slices (loop active): slice 3 dir enum (#805 opendir / #806 readdir /
-#807 closedir — GOTCHA: lv2-fs FS_TYPE_* d_type is INVERTED vs real ABI, map
-crate→real when marshalling; sysFSDirent=258 bytes); slice 4 write (#803 edit
-fd>=4 + REAL OCTAL O_CREAT/O_TRUNC flags, not the lv2-fs POSIX-bit constants);
-slice 5 savedata + cellFont (may need a strategic checkpoint).
+**VFS slice 3 LANDED 2026-05-29:** #805 opendir / #806 readdir / #807 closedir.
+readdir writes the 258-byte CellFsDirent + *nread=258 (0 at EOF); maps the
+crate's inverted FS_TYPE_* d_type to the real ABI (regular→2, directory→1).
+Fixture `single_fs_readdir_v1` → 0xC0DE (3 entries) vs 0xBAD3/0xBAD0. Gate green.
+
+Next VFS slices (loop active): slice 4 write (EDIT #803 fd>=4 → sys_fs_write +
+translate guest oflags from REAL OCTAL O_CREAT=0o100/O_TRUNC=0o1000/O_WRONLY=0o1
+to the lv2-fs flag space, since the crate's POSIX-bit O_CREAT=0x4 etc. are wrong;
+CREATE needs the parent dir to exist); slice 5 savedata + cellFont OpenFontFile
+(fstat done) — may need a strategic checkpoint (savedata callback protocol).
 
 ## Audit snapshot (2026-05-28)
 
