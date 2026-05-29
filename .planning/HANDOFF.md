@@ -234,15 +234,49 @@ Fixture `single_game_paramint_v1` → **1 post-wire vs 0x55 pre-wire**. Gate
 **297/0/6032**. (Caught + fixed an accidental .self commit via amend + per-dir
 .gitignore — binary kept out of history.)
 
-HLE wave so far (13 functions / 6 crates / 8 modules this run): cellSysutil
-int+string; cellSysModule load+isloaded; cellVideoOut resolution+numdevices
-+resavail+getconfig; sys_net inet_addr; cellNetCtl init+getstate+getinfo-MTU;
-cellGame getparamint. All 3 wiring shapes + dep/field-reuse proven. **Easy-target
-backlog essentially exhausted.** STOP-class confirmed: jpgDec/pngDec=callback
-(jpgCbCtrlMalloc), cellAudioOut=not-exposed, dialogs=callbacks, savedata=callbacks,
-font-open/fs=real-TTF/FS. Last candidate to probe: font `fontGetStubRevisionFlags`
-(may be inlined). When it runs out → wave done; give consolidated summary +
-what a future session needs (guest-PPU-callback support or a VFS layer).
+**R13.17 (cellVideoOutGetState) LANDED 2026-05-29 — HLE GETTER WAVE CLOSED** — NID
+`0x887572d5` → `cell_video_out_get_state`, sixth cellVideoOut fn off the shared
+field; serialises the nested `videoState` struct (state@0/colorSpace@1,
+displayMode resolution@8/scanMode@9/aspect@11; VideoOutState→u8
+Enabled0/Disabled1/DeepSleep2). Fixture `single_videoout_state_v1` → **0x102
+post-wire vs 0 pre-wire**. Gate **298/0/6033**.
+
+## HLE getter wave — COMPLETE (2026-05-29 overnight run)
+
+**14 HLE functions / 6 crates / 8 modules wired**, gate 291→298 (0 regressions),
+all pushed to origin/main. Full NID table:
+
+| Module | functions (NID) | shape |
+|---|---|---|
+| cellSysutil | GetSystemParamInt `0x40e895d3`, GetSystemParamString `0x938013a0` | provider |
+| cellSysModule | LoadModule `0x32267a31`, IsLoaded `0x5a59e258` | stateful (SysmoduleManager) |
+| cellVideoOut | GetResolution `0xe558748d`, GetNumberOfDevice `0x75bbb672` (stateless); GetResolutionAvailability `0xa322db75`, GetConfiguration `0x15b0b0cd`, GetState `0x887572d5` (stateful, VideoOutManager) | mixed |
+| sys_net | inet_addr `0xdabbc2c0` | stateless |
+| cellNetCtl | Init `0xbd5a59fc`, GetState `0x8b3eba69`, GetInfo-MTU `0x1e585b5d` | stateful (NetCtlManager) + provider (StubConnectedBackend) |
+| cellGame | GetParamInt `0xb7a45caf` | provider (EmuGameConfig) |
+
+3 wiring shapes proven (provider / stateful EmuCore field / stateless) + the
+dep+field reuse path. The ULTRACODE discovery workflow produced
+`.planning/HLE_BACKLOG.md` (committed).
+
+**Why the wave stops here — remaining HLE families are BLOCKED on infrastructure,
+not mechanical:**
+- **Guest-PPU callbacks** (need the emulator to call back into guest code): jpgDec
+  + pngDec (`jpgCbCtrlMalloc`/`cbCtrlMalloc`), cellMsgDialog/cellOskDialog,
+  cellSaveData, cellNetCtlAddHandler.
+- **Real VFS / files**: cellFs, cellFont OpenFontset/OpenFontFile (need a real TTF
+  on a virtual filesystem).
+- **Not PSL1GHT-exposed**: cellAudioOut (audio.h exposes only cellAudio rendering),
+  cellNetAoi.
+- **Inlined (no NID)**: font `fontGetStubRevisionFlags` (libfont computes locally).
+- **Crate gap**: cellVideoOutGetDeviceInfo (crate validates but doesn't fill the
+  struct), cellNetCtlGetNatInfo (no crate fn).
+
+**Next session = a STRATEGIC decision, not more getters:** (a) build guest-PPU
+callback-invocation support (unlocks the dialog/decoder/savedata families); (b)
+add a VFS layer (unlocks cellFs/font); (c) pivot to the GPU rendering backend or
+commercial-game / SELF-decrypt boot (the other big waves in
+docs/PORT_STATUS_AND_ROADMAP.md).
 
 Next options: (a) continue the HLE wave — next PSL1GHT-exposed module with a
 NON-ZERO distinguishable return (`cellVideoOutGetState`, `cellGameGetParamInt`,
