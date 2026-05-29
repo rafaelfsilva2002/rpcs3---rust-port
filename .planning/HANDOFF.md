@@ -219,15 +219,21 @@ Introduces a stateful `videoout: VideoOutManager` field (the prior cellVideoOut
 fns were stateless); default supported set includes 720p → returns 1. Fixture
 `single_videoout_resavail_v1` → **1 post-wire vs 0 pre-wire**. Gate **295/0/6030**.
 
-HLE wave so far (11 functions / 5 crates / 7 modules this run): cellSysutil
-int+string, cellSysModule load+isloaded, cellVideoOut resolution+numdevices
-+resavail, sys_net inet_addr, cellNetCtl init+getstate+getinfo-MTU. All 3 wiring
-shapes + dep/field-reuse proven. **Backlog nearly exhausted of easy targets:**
-jpgDec is CALLBACK-driven (jpgDecCreate takes jpgCbCtrlMalloc) → STOP like
-pngDec; cellAudioOut NOT PSL1GHT-exposed → STOP. Remaining maybe-viable:
-cellVideoOut GetConfiguration/GetState (reuse videoout field), cellGame
-(lifecycle?), font (verify NID-dispatch vs inlined). When those run out, the wave
-is done — give the consolidated summary.
+**R13.15 (cellVideoOutGetConfiguration) LANDED 2026-05-29** — NID `0x15b0b0cd` →
+`cell_video_out_get_configuration`, fifth cellVideoOut fn off the shared
+VideoOutManager field. Serialises resolution@0/format@1/aspect@2/pitch@12(BE) into
+the guest `videoConfiguration`. Fixture `single_videoout_config_v1` → **2 (720p)
+post-wire vs 0 pre-wire**. Gate **296/0/6031**.
+
+HLE wave so far (12 functions / 5 crates / 7 modules this run): cellSysutil
+int+string; cellSysModule load+isloaded; cellVideoOut resolution+numdevices
++resavail+getconfig; sys_net inet_addr; cellNetCtl init+getstate+getinfo-MTU. All
+3 wiring shapes + dep/field-reuse proven. **Backlog of easy targets nearly empty.**
+STOP-class confirmed: jpgDec/pngDec=callback (jpgCbCtrlMalloc), cellAudioOut=not
+exposed, dialogs=callbacks. Remaining maybe-viable: cellGame (verify lifecycle),
+font (verify NID-dispatch vs inlined), cellVideoOut GetState (redundant w/ config)
+/ GetDeviceInfo (crate doesn't fill struct). When these run out → wave done,
+give consolidated summary.
 
 Next options: (a) continue the HLE wave — next PSL1GHT-exposed module with a
 NON-ZERO distinguishable return (`cellVideoOutGetState`, `cellGameGetParamInt`,
