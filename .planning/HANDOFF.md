@@ -5,6 +5,43 @@ port from a fresh session (e.g., new terminal session, new model).
 Read this top-to-bottom — it's the minimum context to start the
 next slice without re-discovering things.
 
+## LATEST — R14: guest-PPU callback support LANDED (2026-05-29)
+
+**The port can now call back into guest PPU code from an HLE arm.** New primitive
+`EmuCore::call_guest_function(fd_ptr, args) -> Result<u64>` (lib.rs, next to
+`run`): resolves a PSL1GHT function-pointer **OPD descriptor** `{code@0, toc@4,
+env@8}`, snapshots the full PPU arch register frame, seeds `r2 = descriptor.toc`
+(CRITICAL — the import-trampoline path leaves r2=0; the callback faults on its
+first TOC-relative global load without it) + args into `r3..=r10`, sets
+`lr = GUEST_CALLBACK_SENTINEL (0xD0FF_0000)` + `cia = code`, runs a nested loop
+mirroring `run` (making `dispatch_syscall` RE-ENTRANT) until the callback's `blr`
+lands on the sentinel, captures `r3`, and restores the frame (even on error).
+
+First consumer: **cellSysutil callback dispatch** — `cellSysutilRegisterCallback`
+(NID `0x9d98afa0`), `cellSysutilUnregisterCallback` (`0x02ff3c1b`),
+`cellSysutilCheckCallback` (`0x189a74da`, drives `call_guest_function` per pending
+event). EmuCore gains `sysutil_callbacks: CallbackTable` + `sysutil_queue:
+CallbackQueue` (the slot model already existed in `rpcs3-hle-cellsysutil`).
+
+Validated by 3 in-crate unit tests (primitive: single + multi-arg + the full
+register→enqueue→dispatch→guest-cb chain) AND the first **re-entrant CC0 oracle**
+`single_sysutil_callback_v1`: a PSL1GHT homebrew registers a callback, the test
+pre-seeds one event (deterministic stand-in for the system event source — NO
+auto-injection, so real-game behaviour is unaffected), CheckCallback invokes the
+guest callback which writes the status to a global, main returns **0x600D** (vs
+**0xBAD0** negative control with no event). Design doc:
+`.planning/GUEST_CALLBACK_DESIGN.md`.
+
+**Key correction to the design doc:** PSL1GHT function POINTERS are full
+`{code,toc,env}` OPD entries (toc REQUIRED), not the compact 4-byte FD used only
+for `e_entry`. emu-core applies no ELF relocations (PSL1GHT loads at a fixed base).
+
+**This unlocks the previously-STOP HLE families** (cellMsgDialog, cellSaveData,
+jpgDec/pngDec malloc callbacks) — they were blocked solely on this primitive.
+Next: wire one of those (e.g. cellMsgDialogOpen2's dismiss callback, or jpgDec's
+synchronous malloc callback) on top of `call_guest_function`. Gate after R14:
+see below.
+
 ## Audit snapshot (2026-05-28)
 
 A full 6-agent code audit (verified against a green gate) produced
