@@ -97,11 +97,23 @@ readdir writes the 258-byte CellFsDirent + *nread=258 (0 at EOF); maps the
 crate's inverted FS_TYPE_* d_type to the real ABI (regular→2, directory→1).
 Fixture `single_fs_readdir_v1` → 0xC0DE (3 entries) vs 0xBAD3/0xBAD0. Gate green.
 
-Next VFS slices (loop active): slice 4 write (EDIT #803 fd>=4 → sys_fs_write +
-translate guest oflags from REAL OCTAL O_CREAT=0o100/O_TRUNC=0o1000/O_WRONLY=0o1
-to the lv2-fs flag space, since the crate's POSIX-bit O_CREAT=0x4 etc. are wrong;
-CREATE needs the parent dir to exist); slice 5 savedata + cellFont OpenFontFile
-(fstat done) — may need a strategic checkpoint (savedata callback protocol).
+**VFS slice 4 LANDED 2026-05-29:** write round-trip + O_CREAT. `translate_fs_oflags`
+maps the guest's REAL octal oflags (O_CREAT=0o100, O_TRUNC=0o1000, O_APPEND=0o2000)
+into the lv2-fs flag space (used in #801; RDONLY=0 unchanged). #803 write edited:
+fd>=4 → sys_fs_write, fd 1/2 → TTY. Added MemVfs::add_dir + EmuCore::vfs_add_dir.
+Fixture `single_fs_write_v1` → 0xC0DE (O_CREAT|O_WRONLY write 8 → reopen RDONLY →
+read-back match) vs 0xBAD0. Gate green.
+
+**THE CORE lv2-fs VFS IS COMPLETE** (open/read/write/close + stat/fstat/lseek +
+opendir/readdir/closedir + O_CREAT/O_TRUNC/octal-flags). 5 fixtures. Remaining
+items are STRATEGIC, not mechanical:
+- **cellFs HLE NID dispatch** (rpcs3-hle-cellfs cellFsOpen/etc.) — only if a title
+  calls cellFs via PRX import instead of the raw lv2 syscalls PSL1GHT uses.
+- **savedata** — callback-driven (status/list/stat/file callbacks via
+  call_guest_function) + PARAM.SFO; a multi-callback protocol = a design call.
+- **cellFont OpenFontFile** — needs real stb_truetype + a guest CellFont struct
+  (the open-then-fstat is just fs, already supported, but the font HLE is more).
+These each need a design decision; do not dive in silently.
 
 ## Audit snapshot (2026-05-28)
 
