@@ -1,4 +1,21 @@
-# Project Status — R12 RSX pure-pipeline CLOSED + R13.1..R13.4 cellGcm HLE (full PSL1GHT clear+draw+FLIP frame runs end-to-end through EmuCore: rsxInit → clear → draw → setDisplayBuffer → setFlip → flushBuffer → getFlipStatus spin → resetFlipStatus → 0xC0DE; 3 RSX crates; 280 release blocks; 0 regression)
+# Project Status — R12 RSX pure-pipeline CLOSED + R13.1..R13.4 cellGcm HLE (full PSL1GHT clear+draw+FLIP frame runs end-to-end through EmuCore: rsxInit → clear → draw → setDisplayBuffer → setFlip → flushBuffer → getFlipStatus spin → resetFlipStatus → 0xC0DE; 12 RSX/GCM crates; 280 release blocks; 0 regression)
+
+> **🔍 AUDIT 2026-05-28 — full done/not-done + optimization roadmap in
+> [`PORT_STATUS_AND_ROADMAP.md`](./PORT_STATUS_AND_ROADMAP.md).**
+> Gate re-verified GREEN (`cargo test --workspace --tests --release` =
+> 280 blocks / 0 fail / 6015 tests) — the §4 note that `--release`
+> breaks on HLE crates is now STALE. Code-verified corrections:
+> (a) **12** RSX/GCM crates exist, not 3 (`rsx-gl-decompiler` /
+> `rsx-vk-decompiler` port only varying-name tables, NOT shader
+> decompilers); (b) **137 `rpcs3-hle-*` crates** (~89k LOC, 3723 tests)
+> exist but are **NOT wired into emu-core** — unconsumed islands;
+> (c) OE-arith overflow IS implemented (R11.4b), contradicting the
+> "deferred" note below; (d) the SPU Cranelift JIT is real but **not
+> wired into the live path** (emu-core/FFI call the interpreter);
+> (e) `main` is **120 commits ahead of `origin` (unpushed)**. Scope
+> reminder: boots CC0 PSL1GHT homebrew to 0xC0DE + 20 SPU oracles; does
+> NOT boot commercial games (no SELF decrypt, no GPU render, no live
+> JIT, single-thread).
 
 > **R13.1 cellGcm init HLE landed 2026-05-28** (commit `f0ef80774`).
 > Two `cellGcmSys` PRX NIDs are now handled in `EmuCore`, mirroring

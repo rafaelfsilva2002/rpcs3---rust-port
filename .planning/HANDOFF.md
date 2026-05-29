@@ -5,6 +5,28 @@ port from a fresh session (e.g., new terminal session, new model).
 Read this top-to-bottom — it's the minimum context to start the
 next slice without re-discovering things.
 
+## Audit snapshot (2026-05-28)
+
+A full 6-agent code audit (verified against a green gate) produced
+**[`docs/PORT_STATUS_AND_ROADMAP.md`](../docs/PORT_STATUS_AND_ROADMAP.md)** —
+the consolidated done/not-done matrix + the "run on a toaster"
+optimization roadmap. Key code-verified facts:
+
+- Gate GREEN: `cargo test --workspace --tests --release` = 280 blocks /
+  0 fail / 6015 tests. (The PROJECT_STATUS §4 "`--release` breaks on
+  HLE crates" note is STALE.)
+- 242 workspace crates; **137 `rpcs3-hle-*` are real ABI ports but NOT
+  wired into emu-core** (unconsumed islands).
+- 12 RSX/GCM crates (docs said 3); `gl/vk-decompiler` are name-tables,
+  not shader decompilers.
+- PPU is interpreter-only; the SPU Cranelift JIT is real but **dead on
+  the live path** (emu-core/FFI use the interpreter).
+- OE-arith overflow IS implemented (R11.4b) despite "deferred" notes.
+- **`main` is 120 commits ahead of `origin` (UNPUSHED)** — back up
+  before further work.
+- Top-3 cheapest perf wins: wire the SPU JIT in, flat-mmap memory
+  backend, aggressive release profile (`panic="abort"`/`strip`).
+
 ## Where the port stands
 
 **HEAD:** `6e7639ad1 docs: PROJECT_STATUS mirrors R13.4 full
