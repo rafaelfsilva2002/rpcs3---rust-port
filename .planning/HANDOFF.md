@@ -198,10 +198,20 @@ authoring. The cellAudioOut family it ranked #2/#3/#7/#8/#9 is NOT exposed
 Confirmed-exposed viable next: netCtl (netctl.h: netCtlInit/GetState/GetInfo),
 jpgdec, font (fontGetStubRevisionFlags).
 
-HLE wave so far (7 functions / 4 crates this run): cellSysutil int+string,
-cellSysModule load+isloaded, cellVideoOut resolution+numdevices, sys_net
-inet_addr. NID-dispatch + 3 wiring shapes (provider/stateful/stateless) proven;
-the remaining crates are mechanical variations driven off the backlog.
+**R13.12 (cellNetCtl init + get-state) LANDED 2026-05-29** — NIDs `0xbd5a59fc`
+(Init) + `0x8b3eba69` (GetState) → `rpcs3-hle-cellnetctl`. Adds a `netctl:
+NetCtlManager` field (stateful gate) + a fixed `StubConnectedBackend` provider
+(emulated console reports a connected link) — **combines the stateful + provider
+shapes**. GetState writes IPOBTAINED (3) BE-s32 to the OUT ptr (which is in **r3**,
+not r4 as the backlog guessed — runtime capture corrected it). Fixture
+`single_netctl_state_v1` → **3 post-wire vs 0x55 pre-wire**. Gate **293/0/6028**.
+
+HLE wave so far (9 functions / 5 crates / 6 modules this run): cellSysutil
+int+string, cellSysModule load+isloaded, cellVideoOut resolution+numdevices,
+sys_net inet_addr, cellNetCtl init+getstate. NID-dispatch + all 3 wiring shapes
+(provider/stateful/stateless, and combinations) proven; remaining crates are
+mechanical variations driven off `.planning/HLE_BACKLOG.md`. Next: cellNetCtl
+GetInfo MTU (reuses the field+backend, +1 arm), then jpgdec / font.
 
 Next options: (a) continue the HLE wave — next PSL1GHT-exposed module with a
 NON-ZERO distinguishable return (`cellVideoOutGetState`, `cellGameGetParamInt`,
