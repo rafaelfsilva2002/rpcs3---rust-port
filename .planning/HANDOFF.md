@@ -108,10 +108,25 @@ RPCS3 gcm_enums.h, so no bug — confirmed the decode. Gate 283/0/6018, pushed.
 {address 0x10000, U16, RSX} against real libgcm; no decode bug (index-array
 addresses matched RPCS3). Gate 284/0/6019, pushed.
 
-Remaining candidates: R13.5a (multi-draw), R13.5d (viewport/depth state),
-R13.5f (cross-frame flip×2).
-Next recommended: **R13.5a (multi-draw)** — emit 2+ draws in one frame so the
-`DrawTracker` produces multiple `DrawCall` records (only 1 ever asserted so far).
+**R13.5a (multi-draw) LANDED 2026-05-29** (commit `76d55f24f`) —
+`single_gcm_multidraw_v1` (two rsxDrawVertexArray) → 2 DrawCalls [(0,3)] +
+[(10,6)]. Gate 285/0/6020, pushed.
+
+**R13.5d (viewport) LANDED 2026-05-29** (commit `48cd326e5`) —
+`single_gcm_viewport_v1` validates `SET_VIEWPORT_HORIZONTAL`=0x02800000 (640) +
+`VERTICAL`=0x01e00000 (480) by decoding the stream into an `RsxState`
+(test-only; needed a `rpcs3-rsx-fifo` dev-dep on emu-core). Gate 286/0/6021, pushed.
+
+**R13.5 descriptor wave COMPLETE: c/e/b/a/d DONE (5 slices + the PITCH_A decode
+bug fix). Gate 282 → 286.** Only **R13.5f (cross-frame flip×2)** remains, and it
+is NOT cleanly mechanical: the flip updates the control-memory PUT pointer, not
+the cmd buffer, so there's no new snapshot/register surface to assert (R13.4
+already proved the single-flip path; a "×2" adds no decode coverage). NEEDS A
+DECISION — skip it, or take a different validation angle.
+
+Next bigger waves (strategic — pick one WITH the user, do not start autonomously):
+GPU rendering backend (shaders/textures/Vulkan), commercial-game / SELF-decrypt
+boot, or HLE-crate integration. See docs/PORT_STATUS_AND_ROADMAP.md.
 
 Out of scope (still deferred): shader decompilation, texture pixel
 decode, Vulkan/GL backend, actual rendering. These need a GPU and
