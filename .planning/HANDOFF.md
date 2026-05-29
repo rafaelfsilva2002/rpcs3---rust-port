@@ -98,11 +98,16 @@ NV4097 PITCH_A wrong-address decode bug (0x0218→0x020C) in BOTH `rpcs3-rsx-sta
 and `rpcs3-rsx-gcm` (self-referential unit tests missed it; the real capture +
 round-trip oracle caught it). Gate 282/0/6017, pushed.
 
+**R13.5e (texture) LANDED 2026-05-29** (commit `c25cf3c59`) — `single_gcm_texture_v1`
+validates `TextureDescriptor` against real libgcm (format_code=0xA5, TwoD,
+256×128, offset 0x200000, RSX). The texture method addresses already matched
+RPCS3 gcm_enums.h, so no bug — confirmed the decode. Gate 283/0/6018, pushed.
+
 Remaining candidates: R13.5a (multi-draw), R13.5b (indexed draw),
-R13.5d (viewport/depth), R13.5e (texture binding), R13.5f (cross-frame).
-Next recommended: **R13.5e (texture)** — same high descriptor-coverage value
-(validates `TextureDescriptor` against real bytes), and may surface the
-analogous wrong-address question for the NV4097 texture method block.
+R13.5d (viewport/depth state), R13.5f (cross-frame flip×2).
+Next recommended: **R13.5b (indexed draw)** — `rsxDrawIndexArray` exercises the
+`DrawKind::Indexed` path + the index-array descriptor against real bytes (the
+draw oracle so far only covers `DrawKind::Arrays`).
 
 Out of scope (still deferred): shader decompilation, texture pixel
 decode, Vulkan/GL backend, actual rendering. These need a GPU and
