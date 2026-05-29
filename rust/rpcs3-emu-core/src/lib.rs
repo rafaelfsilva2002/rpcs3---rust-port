@@ -67,6 +67,7 @@ use rpcs3_hle_cellsysmodule::{
 };
 use rpcs3_hle_cellvideoout::{
     cell_video_out_get_number_of_device, cell_video_out_get_resolution,
+    cell_video_out_get_resolution_availability, VideoOutManager,
 };
 use rpcs3_hle_sys_net_user::inet_addr_stub;
 use rpcs3_hle_cellnetctl::{
@@ -392,6 +393,10 @@ pub struct EmuCore {
     /// connected-network provider (`StubConnectedBackend`) so the emulated
     /// console reports an established network.
     pub netctl: NetCtlManager,
+    /// HLE wave — cellVideoOut manager (supported-resolution table + per-port
+    /// config/state). Backs GetResolutionAvailability (and future GetState /
+    /// GetConfiguration / GetDeviceInfo arms).
+    pub videoout: VideoOutManager,
 }
 
 impl Default for EmuCore {
@@ -424,6 +429,7 @@ impl EmuCore {
             gcm_io_size: 0,
             sysmodule: SysmoduleManager::default(),
             netctl: NetCtlManager::default(),
+            videoout: VideoOutManager::default(),
         }
     }
 
@@ -1815,6 +1821,26 @@ impl EmuCore {
                                     self.ppu.gpr[3] = u64::from(u32::from(e));
                                 }
                             }
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE wave — cellVideoOut::cellVideoOutGetResolutionAvailability
+                        // (NID 0xa322db75). Stateful (VideoOutManager). r3 = port,
+                        // r4 = resolution id, r5 = aspect, r6 = option. Returns 1
+                        // if the resolution is in the supported set, else 0.
+                        0xa322db75 => {
+                            let port = self.ppu.gpr[3] as u32;
+                            let res_id = self.ppu.gpr[4] as u8;
+                            let aspect = self.ppu.gpr[5] as u8;
+                            self.ppu.gpr[3] = match cell_video_out_get_resolution_availability(
+                                &self.videoout,
+                                port,
+                                res_id,
+                                aspect,
+                            ) {
+                                Ok(n) => u64::from(n as u32),
+                                Err(e) => u64::from(u32::from(e)),
+                            };
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
