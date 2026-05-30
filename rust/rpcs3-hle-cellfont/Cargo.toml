@@ -17,5 +17,14 @@ rpcs3-emu-types = { path = "../rpcs3-emu-types" }
 # (cellFont.cpp includes stb_truetype.h), so glyph metrics are byte-exact.
 stb_truetype = "0.3"
 
+[features]
+# Opt-in glyph RASTERIZATION via the vendored C stb_truetype.h (cbits/), the one
+# cellFont path that needs the actual stb rasterizer for byte-exact parity with
+# RPCS3. Default OFF so the standard build stays pure-Rust (no C toolchain).
+cellfont-raster = ["dep:cc"]
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
 [lints]
 workspace = true

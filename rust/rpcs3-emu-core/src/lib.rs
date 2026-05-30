@@ -2851,6 +2851,113 @@ impl EmuCore {
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
+                        // R20 — cellFont::cellFontCreateRenderer (0x042e74e3).
+                        // r3=library, r4=config, r5=renderer ptr. Validates the
+                        // three non-null (cellFont.cpp:357) and seeds
+                        // renderer->systemReserved[0x10] (offset 0x40) non-null so
+                        // cellFontBindRenderer's guard (cellFont.cpp:567) passes.
+                        0x042e74e3 => {
+                            let library = self.ppu.gpr[3] as u32;
+                            let config = self.ppu.gpr[4] as u32;
+                            let renderer = self.ppu.gpr[5] as u32;
+                            if library == 0 || config == 0 || renderer == 0 {
+                                self.ppu.gpr[3] = u64::from(0x8054_0002u32);
+                            } else {
+                                self.write_be_u32(renderer + 0x40, renderer)?; // non-null
+                                self.ppu.gpr[3] = 0; // CELL_OK
+                            }
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // R20 — cellFont::cellFontBindRenderer (0x66a23100).
+                        // r3=font, r4=renderer. Requires renderer->systemReserved
+                        // [0x10] != 0 and font->renderer_addr == 0, then binds
+                        // font->renderer_addr = renderer (cellFont.cpp:563).
+                        0x66a23100 => {
+                            let font_ptr = self.ppu.gpr[3] as u32;
+                            let renderer = self.ppu.gpr[4] as u32;
+                            if font_ptr == 0
+                                || renderer == 0
+                                || self.read_be_u32(renderer + 0x40)? == 0
+                            {
+                                self.ppu.gpr[3] = u64::from(0x8054_0002u32);
+                            } else if self.read_be_u32(font_ptr + 12)? != 0 {
+                                self.ppu.gpr[3] = u64::from(0x8054_0020u32); // ALREADY_BIND
+                            } else {
+                                self.write_be_u32(font_ptr + 12, renderer)?;
+                                self.ppu.gpr[3] = 0; // CELL_OK
+                            }
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // R20 — cellFont::cellFontRenderSurfaceInit (0x90b9465e).
+                        // r3=surface, r4=buffer, r5=bufWidthByte, r6=pixelSizeByte,
+                        // r7=w, r8=h. Fills the CellFontRenderSurface struct
+                        // (cellFont.cpp:370): width/height clamped to >=0, scissor
+                        // set to the full surface. Returns void (gpr[3]=0).
+                        0x90b9465e => {
+                            let surface = self.ppu.gpr[3] as u32;
+                            if surface != 0 {
+                                let buffer = self.ppu.gpr[4] as u32;
+                                let buf_width_byte = self.ppu.gpr[5] as u32;
+                                let pixel_size_byte = self.ppu.gpr[6] as u32;
+                                let w = (self.ppu.gpr[7] as i32).max(0) as u32;
+                                let h = (self.ppu.gpr[8] as i32).max(0) as u32;
+                                self.write_be_u32(surface, buffer)?;
+                                self.write_be_u32(surface + 4, buf_width_byte)?;
+                                self.write_be_u32(surface + 8, pixel_size_byte)?;
+                                self.write_be_u32(surface + 12, w)?;
+                                self.write_be_u32(surface + 16, h)?;
+                                self.write_be_u32(surface + 20, 0)?;
+                                self.write_be_u32(surface + 24, 0)?;
+                                self.write_be_u32(surface + 28, w)?;
+                                self.write_be_u32(surface + 32, h)?;
+                            }
+                            self.ppu.gpr[3] = 0;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // R20 — cellFont::cellFontRenderCharGlyphImage (0x88be4799).
+                        // r3=font, r4=code, r5=surface, r6=metrics, r7=transInfo;
+                        // x,y in FPRs f1,f2. Requires a bound renderer
+                        // (cellFont.cpp:705). Reads the surface buffer, blits the
+                        // rasterized glyph via the shared byte-exact `render_into`
+                        // (needs the `cellfont-raster` feature; without it the
+                        // rasterizer is absent → no-op, CELL_OK, cellFont.cpp:717).
+                        0x88be4799 => {
+                            let font_ptr = self.ppu.gpr[3] as u32;
+                            let code = self.ppu.gpr[4] as u32;
+                            let surface_ptr = self.ppu.gpr[5] as u32;
+                            let x = self.ppu.fpr[1] as f32;
+                            let y = self.ppu.fpr[2] as f32;
+                            if self.read_be_u32(font_ptr + 12)? == 0 {
+                                self.ppu.gpr[3] = u64::from(0x8054_0021u32); // RENDERER_UNBIND
+                                self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                return Ok(None);
+                            }
+                            let scale_y = f32::from_bits(self.read_be_u32(font_ptr + 4)?);
+                            let buf_ptr = self.read_be_u32(surface_ptr)?;
+                            let surf_w = self.read_be_u32(surface_ptr + 12)?;
+                            let surf_h = self.read_be_u32(surface_ptr + 16)?;
+                            let n = (surf_w as usize)
+                                .saturating_mul(surf_h as usize)
+                                .min(64 * 1024 * 1024);
+                            let mut surf = vec![0u8; n];
+                            if buf_ptr != 0 && n > 0 {
+                                self.mem.read(buf_ptr, &mut surf)?;
+                            }
+                            let drew = if let Some(font) = self.cellfont_fonts.get(&font_ptr) {
+                                font.render_into(code, scale_y, &mut surf, surf_w, surf_h, x, y)
+                            } else {
+                                false
+                            };
+                            if drew && buf_ptr != 0 {
+                                self.mem.write(buf_ptr, &surf)?;
+                            }
+                            self.ppu.gpr[3] = 0; // CELL_OK
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
                         _ => {}
                     }
 

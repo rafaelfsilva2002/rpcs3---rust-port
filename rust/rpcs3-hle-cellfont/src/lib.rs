@@ -144,6 +144,10 @@ pub struct CellGlyphMetrics {
 /// RPCS3's in-guest `stbtt_fontinfo` hack (cellFont.cpp:138).
 pub struct StbttFont {
     info: stb_truetype::FontInfo<Vec<u8>>,
+    /// Raw font bytes — kept only for the rasterizer (the C shim re-inits the
+    /// font from these). Pure-metrics builds don't carry them.
+    #[cfg(feature = "cellfont-raster")]
+    data: Vec<u8>,
 }
 
 impl core::fmt::Debug for StbttFont {
@@ -158,7 +162,15 @@ impl StbttFont {
     /// (cellFont.cpp:140-143).
     #[must_use]
     pub fn open(data: Vec<u8>) -> Option<Self> {
-        stb_truetype::FontInfo::new(data, 0).map(|info| Self { info })
+        #[cfg(feature = "cellfont-raster")]
+        {
+            let info = stb_truetype::FontInfo::new(data.clone(), 0)?;
+            Some(Self { info, data })
+        }
+        #[cfg(not(feature = "cellfont-raster"))]
+        {
+            stb_truetype::FontInfo::new(data, 0).map(|info| Self { info })
+        }
     }
 
     /// Byte-exact port of `cellFontGetHorizontalLayout` (cellFont.cpp:552-558):
@@ -202,6 +214,129 @@ impl StbttFont {
             v_bearing_y: 0.0,
             v_advance: 0.0,
         }
+    }
+
+    /// Rasterize `code` to an 8-bit coverage bitmap via the vendored C
+    /// stb_truetype (feature `cellfont-raster`) — the SAME `stbtt_GetCodepointBitmap`
+    /// RPCS3 calls (cellFont.cpp:713). Returns `None` when the feature is off or
+    /// the glyph has no bitmap (stbtt returns null, cellFont.cpp:715).
+    #[cfg(feature = "cellfont-raster")]
+    #[must_use]
+    pub fn render_glyph_coverage(&self, code: u32, scale_y: f32) -> Option<GlyphCoverage> {
+        let (mut width, mut height, mut xoff, mut yoff, mut base_line_y) = (0, 0, 0, 0, 0);
+        // SAFETY: `data` is a valid font buffer; the shim writes only the out
+        // params and returns an stbtt-owned bitmap we copy then free.
+        let cov = unsafe {
+            let ptr = raster_ffi::stbtt_shim_render(
+                self.data.as_ptr(),
+                0,
+                code,
+                scale_y,
+                &mut width,
+                &mut height,
+                &mut xoff,
+                &mut yoff,
+                &mut base_line_y,
+            );
+            if ptr.is_null() {
+                return None;
+            }
+            let len = (width.max(0) as usize) * (height.max(0) as usize);
+            let pixels = core::slice::from_raw_parts(ptr, len).to_vec();
+            raster_ffi::stbtt_shim_free(ptr);
+            pixels
+        };
+        Some(GlyphCoverage {
+            width,
+            height,
+            xoff,
+            yoff,
+            base_line_y,
+            pixels: cov,
+        })
+    }
+
+    /// Pure-Rust build: no rasterizer (the `stb_truetype` crate has none), so
+    /// rendering is unavailable. Mirrors stbtt returning a null bitmap.
+    #[cfg(not(feature = "cellfont-raster"))]
+    #[must_use]
+    pub fn render_glyph_coverage(&self, _code: u32, _scale_y: f32) -> Option<GlyphCoverage> {
+        None
+    }
+
+    /// Render `code` into an 8-bit grayscale surface, byte-exact to RPCS3's
+    /// `cellFontRenderCharGlyphImage` blit (cellFont.cpp:726-740): the surface is
+    /// `surface_w`-strided, `surface_h` rows; the coverage lands at row
+    /// `y + ypos + yoff + baseLineY`, col `x + xpos`, with the same u32-cast
+    /// bounds checks. No-op (returns false) when there is no bitmap (or the
+    /// `cellfont-raster` feature is off). Shared by the emu-core arm and the
+    /// calibration test so they cannot drift.
+    pub fn render_into(
+        &self,
+        code: u32,
+        scale_y: f32,
+        surface: &mut [u8],
+        surface_w: u32,
+        surface_h: u32,
+        x: f32,
+        y: f32,
+    ) -> bool {
+        let Some(cov) = self.render_glyph_coverage(code, scale_y) else {
+            return false;
+        };
+        let (w, h) = (cov.width.max(0) as u32, cov.height.max(0) as u32);
+        for ypos in 0..h {
+            // (u32)y + ypos + yoff + baseLineY >= (u32)surface_h  (cellFont.cpp:729)
+            let row = (y as u32)
+                .wrapping_add(ypos)
+                .wrapping_add(cov.yoff as u32)
+                .wrapping_add(cov.base_line_y as u32);
+            if row >= surface_h {
+                break;
+            }
+            for xpos in 0..w {
+                let col = (x as u32).wrapping_add(xpos);
+                if col >= surface_w {
+                    break;
+                }
+                let idx = (row as usize) * (surface_w as usize) + (col as usize);
+                let src = (ypos as usize) * (w as usize) + (xpos as usize);
+                if idx < surface.len() && src < cov.pixels.len() {
+                    surface[idx] = cov.pixels[src];
+                }
+            }
+        }
+        true
+    }
+}
+
+/// A rasterized glyph: stbtt's 8-bit coverage bitmap + placement offsets and the
+/// `baseLineY` cellFont uses (`(int)(ascent*scale)`, cellFont.cpp:723).
+#[derive(Debug, Clone)]
+pub struct GlyphCoverage {
+    pub width: i32,
+    pub height: i32,
+    pub xoff: i32,
+    pub yoff: i32,
+    pub base_line_y: i32,
+    pub pixels: Vec<u8>,
+}
+
+#[cfg(feature = "cellfont-raster")]
+mod raster_ffi {
+    extern "C" {
+        pub fn stbtt_shim_render(
+            font: *const u8,
+            fontoffset: i32,
+            code: u32,
+            scale_y: f32,
+            width: *mut i32,
+            height: *mut i32,
+            xoff: *mut i32,
+            yoff: *mut i32,
+            base_line_y: *mut i32,
+        ) -> *mut u8;
+        pub fn stbtt_shim_free(p: *mut u8);
     }
 }
 
