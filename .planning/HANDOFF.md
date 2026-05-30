@@ -5,7 +5,23 @@ port from a fresh session (e.g., new terminal session, new model).
 Read this top-to-bottom — it's the minimum context to start the
 next slice without re-discovering things.
 
-## LATEST — GPU backend: clear render wired to REAL libgcm capture (2026-05-30)
+## LATEST — GPU backend: deterministic triangle rasterizer (2026-05-30)
+
+Commit `4291e0022`. `rpcs3_rsx_render::rasterize_triangle_flat(verts, color, fb,
+w, h, pitch)` — the rasterization heart: edge-function coverage, pixel centers
+(x+.5,y+.5), bbox-clamped, winding-agnostic, flat color into A8R8G8B8. Takes
+`ScreenVertex{x,y}` (already in screen space). Deterministic software reference
+(golden = the coverage rule; the right triangle (1,1)-(7,1)-(1,7) covers exactly
+21 px, hand-verified). 3 unit tests. Gate **6070/0**.
+
+Next GPU slice: the **vertex pipeline** to wire the rasterizer to REAL RSX draws —
+vertex fetch (rpcs3-rsx-vertex-data) → viewport/vertex-program transform →
+screen-space ScreenVertex → rasterize. This needs the screen-space positions a
+real draw computes (RPCS3 runs the vertex program; a minimal slice can use the
+viewport transform on pre-transformed vertices). Then per-vertex color
+interpolation, texture sampling, fragment shaders.
+
+## GPU backend: clear render wired to REAL libgcm capture (2026-05-30)
 
 Commit `2eb4d3a23`. The clear path is now a full behavior-freeze oracle: fixture
 single_gcm_clearsurf_v1 (real librsx surface+clear) → captured NV4097 stream →
