@@ -13,13 +13,17 @@ via libpng; the values are the PNG IHDR fields, parsed byte-exact by the new
 `PngDec::parse_header`. Fixture embeds a minimal RGB PNG (gen_png.py, 320×240) →
 checks 320/240/3/RGB/8. Decode (SetParameter/DecodeData, libpng in RPCS3) deferred.
 
-**Infra gap discovered:** cellPngDec is callback-driven (Create/Open invoke the
-guest cbCtrlMalloc). Faithfully invoking it FAILED — a guest fn-ptr STORED IN A
-STRUCT reads back an OPD with **code field = 0** (the .opd code-field relocation
-isn't applied for struct-stored fn-ptrs; register-passed callbacks like savedata's
-work). Worked around with the cellJpgDec id model (observation-equivalent; header
-info byte-exact). Fixing the .opd relocation would make pngDec's callback faithful
-+ harden guest-callback families generally — a worthwhile separate infra slice.
+**Infra fix LANDED** (`f2a4eeea0`, gate 6063): the cellPngDec callback failure was
+NOT a relocation gap — it was an OPD **field-offset** bug in
+`call_guest_function`. A guest fn-ptr STORED IN A STRUCT materialises as a full
+24-byte ELFv1 OPD {code dw@0, toc dw@8, env dw@16}; on the 32-bit PS3 the code/toc
+sit in the LOW word of each doubleword (high word 0), so the real code is @+4 (not
+@+0). call_guest_function only handled the compact {code@0, toc@4} descriptor
+(register-passed callbacks). Fix: branch on word0 — `!=0` → compact; `==0` →
+24-byte OPD (code@+4, toc@+12). This unblocked the FAITHFUL cellPngDec callback —
+Create/Open now invoke the guest cbCtrlMalloc via call_guest_function (address-keyed
+handle/stream maps). Unit test `call_guest_function_resolves_24byte_opd`; all
+callback oracles unchanged. **Hardens every struct-stored-callback HLE family.**
 
 ## HLE backlog wave-2: jpgDec + input (pad/kb/mouse) (2026-05-30)
 
