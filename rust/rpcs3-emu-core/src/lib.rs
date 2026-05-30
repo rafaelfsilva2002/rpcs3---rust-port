@@ -2823,6 +2823,34 @@ impl EmuCore {
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
+                        // R19 — cellFont::cellFontGetHorizontalLayout (0x1387c45c).
+                        // r3=font ptr, r4=layout ptr. Byte-exact port of
+                        // cellFont.cpp:536 via the stb_truetype-backed StbttFont:
+                        // baseLineY/lineHeight/effectHeight from the font v-metrics
+                        // (ascent/descent/lineGap) scaled by scale_y.
+                        0x1387c45c => {
+                            let font_ptr = self.ppu.gpr[3] as u32;
+                            let layout_ptr = self.ppu.gpr[4] as u32;
+                            if font_ptr == 0 || layout_ptr == 0 {
+                                self.ppu.gpr[3] = u64::from(0x8054_0002u32);
+                                self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                return Ok(None);
+                            }
+                            let scale_y = f32::from_bits(self.read_be_u32(font_ptr + 4)?);
+                            let l = if let Some(font) = self.cellfont_fonts.get(&font_ptr) {
+                                font.horizontal_layout(scale_y)
+                            } else {
+                                self.ppu.gpr[3] = u64::from(0x8054_0002u32);
+                                self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                return Ok(None);
+                            };
+                            self.write_be_u32(layout_ptr, l.base_line_y.to_bits())?;
+                            self.write_be_u32(layout_ptr + 4, l.line_height.to_bits())?;
+                            self.write_be_u32(layout_ptr + 8, l.effect_height.to_bits())?;
+                            self.ppu.gpr[3] = 0; // CELL_OK
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
                         _ => {}
                     }
 

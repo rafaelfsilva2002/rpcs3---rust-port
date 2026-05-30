@@ -49,6 +49,20 @@ fn metrics_match_golden_scale_one() {
 }
 
 #[test]
+fn horizontal_layout_print_and_check() {
+    let Some(bytes) = font_bytes() else {
+        eprintln!("[font-calib] skip: testfont.ttf absent");
+        return;
+    };
+    let font = StbttFont::open(bytes).expect("stbtt parse");
+    // scale_y = 1000 -> scale 1.0. ascent=800, descent=-200, lineGap=0 (design).
+    let l = font.horizontal_layout(1000.0);
+    assert_eq!(l.base_line_y, 800.0); // ascent
+    assert_eq!(l.line_height, 1000.0); // ascent - descent + lineGap
+    assert_eq!(l.effect_height, 0.0); // lineGap
+}
+
+#[test]
 fn metrics_match_golden_scale_32_bit_exact() {
     let Some(bytes) = font_bytes() else {
         eprintln!("[font-calib] skip: testfont.ttf absent");

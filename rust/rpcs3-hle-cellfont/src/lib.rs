@@ -116,6 +116,15 @@ pub struct GlyphImage {
 // Byte-exact glyph metrics (stb_truetype — the engine RPCS3 cellFont uses)
 // =====================================================================
 
+/// Horizontal layout matching `CellFontHorizontalLayout` (cellFont.cpp:536):
+/// three f32 fields (BE in guest memory).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CellHorizontalLayout {
+    pub base_line_y: f32,
+    pub line_height: f32,
+    pub effect_height: f32,
+}
+
 /// Glyph metrics matching `CellFontGlyphMetrics` (cellFont.cpp:894-901): eight
 /// f32 fields (BE in guest memory). Produced bit-for-bit by [`StbttFont`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -150,6 +159,20 @@ impl StbttFont {
     #[must_use]
     pub fn open(data: Vec<u8>) -> Option<Self> {
         stb_truetype::FontInfo::new(data, 0).map(|info| Self { info })
+    }
+
+    /// Byte-exact port of `cellFontGetHorizontalLayout` (cellFont.cpp:552-558):
+    /// `baseLineY = ascent*scale`, `lineHeight = (ascent-descent+lineGap)*scale`,
+    /// `effectHeight = lineGap*scale`, with `scale = scale_for_pixel_height(scale_y)`.
+    #[must_use]
+    pub fn horizontal_layout(&self, scale_y: f32) -> CellHorizontalLayout {
+        let scale = self.info.scale_for_pixel_height(scale_y);
+        let v = self.info.get_v_metrics();
+        CellHorizontalLayout {
+            base_line_y: v.ascent as f32 * scale,
+            line_height: (v.ascent - v.descent + v.line_gap) as f32 * scale,
+            effect_height: v.line_gap as f32 * scale,
+        }
     }
 
     /// Byte-exact port of `cellFontGetCharGlyphMetrics` (cellFont.cpp:887-901).

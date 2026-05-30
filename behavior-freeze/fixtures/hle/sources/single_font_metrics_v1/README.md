@@ -20,6 +20,8 @@ fontGetCharGlyphMetrics(&f, 'A', &m)     // cellFontGetCharGlyphMetrics
 fontSetScalePixel(&f, 32, 32)            // scale = 32/1000
 fontGetCharGlyphMetrics(&f, 'A', &m)
   // bit-exact: width=0x414ccccd, height=0x41b33334, bearingX=0x404ccccd, advance=0x4199999a
+fontGetHorizontalLayout(&f, &hl)         // cellFontGetHorizontalLayout (scale 1.0)
+  // baseLineY=800 (ascent), lineHeight=1000 (ascent-descent+lineGap), effectHeight=0 (lineGap)
 return 0xC0DE;                            // iff every bit pattern matches
 ```
 
@@ -39,6 +41,8 @@ single arithmetic, so it reproduces RPCS3 stb_truetype bit-for-bit.
 - `cellFontGetCharGlyphMetrics` → looks up the parsed font, reads scale_y,
   computes the eight `CellFontGlyphMetrics` f32 fields, writes them BE
   (cellFont.cpp:868).
+- `cellFontGetHorizontalLayout` → baseLineY/lineHeight/effectHeight from the font
+  v-metrics (ascent/descent/lineGap) scaled by scale_y, written BE (cellFont.cpp:536).
 
 ## Result
 

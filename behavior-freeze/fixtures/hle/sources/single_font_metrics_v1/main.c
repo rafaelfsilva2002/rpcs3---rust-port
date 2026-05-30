@@ -102,5 +102,24 @@ int main(void)
         return 0xBADE; // 19.20000076
     }
 
+    // Horizontal layout (cellFont.cpp:536) at scale_y=1000 (scale 1.0):
+    // baseLineY=ascent=800, lineHeight=ascent-descent+lineGap=1000, effectHeight=lineGap=0.
+    if (fontSetScalePixel(&f, 1000.0f, 1000.0f) != 0) {
+        return 0xBADF;
+    }
+    fontHorizontalLayout hl;
+    if (fontGetHorizontalLayout(&f, &hl) != 0) {
+        return 0xBAE0;
+    }
+    if (!feq_bits(hl.baseLineY, 0x44480000)) {
+        return 0xBAE1; // 800.0
+    }
+    if (!feq_bits(hl.lineHeight, 0x447a0000)) {
+        return 0xBAE2; // 1000.0
+    }
+    if (!feq_bits(hl.effectHeight, 0x00000000)) {
+        return 0xBAE3; // 0.0
+    }
+
     return 0xC0DE;
 }
