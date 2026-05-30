@@ -1,0 +1,23 @@
+[package]
+name = "rpcs3-stb-image"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Vendored stb_image.h decoder (JPEG/PNG -> RGBA) behind the `decode` feature — the same engine RPCS3 cellJpgDec links, for byte-exact image decode."
+
+[lib]
+name = "rpcs3_stb_image"
+crate-type = ["staticlib", "rlib"]
+
+[features]
+# Opt-in image decode via the vendored C stb_image.h (cbits/). Default OFF so the
+# standard build stays pure-Rust (no C toolchain).
+decode = ["dep:cc"]
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
+[lints]
+workspace = true

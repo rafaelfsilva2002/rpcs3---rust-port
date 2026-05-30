@@ -59,6 +59,8 @@ rpcs3-hle-cellkb       = { path = "../rpcs3-hle-cellkb" }
 rpcs3-hle-cellmouse    = { path = "../rpcs3-hle-cellmouse" }
 # HLE backlog — cellPngDec (callback-driven header parse; IHDR byte-exact).
 rpcs3-hle-cellpngdec   = { path = "../rpcs3-hle-cellpngdec" }
+# HLE backlog — vendored stb_image decode (jpg/png), behind the image-decode feature.
+rpcs3-stb-image        = { path = "../rpcs3-stb-image" }
 # Optional: the Cranelift SPU JIT, gated behind the `spu-recompiler`
 # feature so default builds stay lean (no Cranelift) and the gate keeps
 # using the interpreter unless explicitly opted in.
@@ -75,6 +77,9 @@ spu-recompiler = ["dep:rpcs3-spu-recompiler", "dep:rpcs3-spu-differential"]
 # the standard build stays pure-Rust (no C toolchain); enables the render path +
 # its byte-exact oracle (single_font_render_v1).
 cellfont-raster = ["rpcs3-hle-cellfont/cellfont-raster"]
+# R-backlog — cellJpgDec/cellPngDec pixel decode via vendored C stb_image.
+# Default OFF (pure-Rust); enables the decode path + its byte-exact oracles.
+image-decode = ["rpcs3-stb-image/decode"]
 
 [dev-dependencies]
 # R12.11b — decode the captured RSX command stream from the gcm

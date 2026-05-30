@@ -3092,6 +3092,116 @@ impl EmuCore {
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
+                        // HLE backlog — cellJpgDec::cellJpgDecSetParameter (0xe08f3910).
+                        // r3=handle, r4=subHandle, r5=*jpgDecInParam, r6=*jpgDecOutParam.
+                        // Computes the output layout (cellJpgDec.cpp:330) via the
+                        // crate, writes the 36-byte OutParam BE.
+                        0xe08f3910 => {
+                            let sub = self.ppu.gpr[4] as u32;
+                            let in_ptr = self.ppu.gpr[5] as u32;
+                            let out_ptr = self.ppu.gpr[6] as u32;
+                            let in_param = rpcs3_hle_celljpgdec::InParam {
+                                command_ptr: self.read_be_u32(in_ptr)?,
+                                down_scale: self.read_be_u32(in_ptr + 4)?,
+                                method: self.read_be_u32(in_ptr + 8)?,
+                                output_mode: self.read_be_u32(in_ptr + 12)?,
+                                output_color_space: self.read_be_u32(in_ptr + 16)?,
+                                output_color_alpha: {
+                                    let mut b = [0u8; 1];
+                                    self.mem.read(in_ptr + 20, &mut b)?;
+                                    b[0]
+                                },
+                            };
+                            match self.jpgdec.set_parameter(sub, in_param) {
+                                Ok(out) => {
+                                    // jpgDecOutParam: width_bytes u64@0, width@8,
+                                    // height@12, num_comp@16, mode@20, cs@24,
+                                    // down_scale@28, use_memory_space@32.
+                                    self.write_be_u32(out_ptr, (out.output_width_byte >> 32) as u32)?;
+                                    self.write_be_u32(out_ptr + 4, out.output_width_byte as u32)?;
+                                    self.write_be_u32(out_ptr + 8, out.output_width)?;
+                                    self.write_be_u32(out_ptr + 12, out.output_height)?;
+                                    self.write_be_u32(out_ptr + 16, out.output_components)?;
+                                    self.write_be_u32(out_ptr + 20, out.output_mode)?;
+                                    self.write_be_u32(out_ptr + 24, out.output_color_space)?;
+                                    self.write_be_u32(out_ptr + 28, out.down_scale)?;
+                                    self.write_be_u32(out_ptr + 32, out.use_memory_space)?;
+                                    self.ppu.gpr[3] = 0;
+                                }
+                                Err(e) => {
+                                    self.ppu.gpr[3] = u64::from(u32::from(e));
+                                }
+                            }
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE backlog — cellJpgDec::cellJpgDecDecodeData (0xaf8bb012).
+                        // r3=handle, r4=subHandle, r5=data (OUT), r6=*dataCtrlParam,
+                        // r7=*dataOutInfo. Decode the JPEG via stb_image (same as
+                        // RPCS3, cellJpgDec.cpp:191) into forced RGBA, then the
+                        // RGB/RGBA output copy (cellJpgDec.cpp:244-263) with the
+                        // bytes-per-line padding + flip. Needs `image-decode`.
+                        0xaf8bb012 => {
+                            let sub = self.ppu.gpr[4] as u32;
+                            let data_ptr = self.ppu.gpr[5] as u32;
+                            let dcp_ptr = self.ppu.gpr[6] as u32;
+                            let dout_ptr = self.ppu.gpr[7] as u32;
+                            self.write_be_u32(dout_ptr + 8, 1)?; // status = DEC_STATUS_STOP
+                            let (Some((sp, ss)), Some(out)) =
+                                (self.jpgdec.stream_window(sub), self.jpgdec.out_param_for(sub))
+                            else {
+                                self.ppu.gpr[3] = u64::from(0x8061_1106u32); // FATAL
+                                self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                return Ok(None);
+                            };
+                            let n = (ss as usize).min(64 * 1024 * 1024);
+                            let mut jpg = vec![0u8; n];
+                            if sp != 0 && n > 0 {
+                                self.mem.read(sp, &mut jpg)?;
+                            }
+                            let Some((w, h, rgba)) = rpcs3_stb_image::decode_rgba(&jpg) else {
+                                self.ppu.gpr[3] = u64::from(0x8061_1102u32); // STREAM_FORMAT
+                                self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                return Ok(None);
+                            };
+                            let (w, h) = (w as usize, h as usize);
+                            let bpl = ((u64::from(self.read_be_u32(dcp_ptr)?) << 32)
+                                | u64::from(self.read_be_u32(dcp_ptr + 4)?))
+                                as usize;
+                            let flip = out.output_mode == 1; // BOTTOM_TO_TOP
+                            let cs = out.output_color_space;
+                            let mut image_size = w * h;
+                            // RGB / RGBA copy (cellJpgDec.cpp:244-263). The stb buffer is
+                            // RGBA(4); RGB output mirrors RPCS3 (reads w*nComp-strided).
+                            if cs == rpcs3_hle_celljpgdec::CS_RGB
+                                || cs == rpcs3_hle_celljpgdec::CS_RGBA
+                            {
+                                let ncomp = if cs == rpcs3_hle_celljpgdec::CS_RGBA { 4 } else { 3 };
+                                image_size *= ncomp;
+                                if bpl > w * ncomp || flip {
+                                    let linesize = bpl.min(w * ncomp);
+                                    for i in 0..h {
+                                        let dst = i * bpl;
+                                        let src = w * ncomp * (if flip { h - i - 1 } else { i });
+                                        if src + linesize <= rgba.len() {
+                                            self.mem.write(
+                                                data_ptr + dst as u32,
+                                                &rgba[src..src + linesize],
+                                            )?;
+                                        }
+                                    }
+                                } else if image_size <= rgba.len() {
+                                    self.mem.write(data_ptr, &rgba[..image_size])?;
+                                }
+                            }
+                            self.write_be_u32(dout_ptr + 8, 0)?; // status = DEC_STATUS_FINISH
+                            if bpl != 0 {
+                                self.write_be_u32(dout_ptr + 4, (image_size / bpl) as u32)?;
+                            }
+                            self.ppu.gpr[3] = 0;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
                         // HLE backlog — sys_io::cellPadInit (0x1cf98800). r3 =
                         // max_connect. Flips the crate init gate (cellPad.cpp:257).
                         0x1cf98800 => {

@@ -376,6 +376,13 @@ impl JpgDec {
         Some((h.src.stream_ptr, h.src.stream_size))
     }
 
+    /// The `OutParam` set by `set_parameter` for a handle — the emu-core
+    /// DecodeData arm reads the output color space / mode from it.
+    #[must_use]
+    pub fn out_param_for(&self, id: u32) -> Option<OutParam> {
+        self.handles.iter().find(|h| h.id == id)?.out_param
+    }
+
     /// `cellJpgDecSetParameter(sub, inParam, outParam)`.
     pub fn set_parameter(&mut self, id: u32, in_param: InParam) -> Result<OutParam, CellError> {
         let idx = self.handle_idx(id)?;
