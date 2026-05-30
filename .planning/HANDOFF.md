@@ -5,7 +5,33 @@ port from a fresh session (e.g., new terminal session, new model).
 Read this top-to-bottom — it's the minimum context to start the
 next slice without re-discovering things.
 
-## LATEST — R20: cellFont rasterization LANDED — cellFont COMPLETE (2026-05-30)
+## LATEST — HLE backlog wave-2: jpgDec + input (pad/kb/mouse) (2026-05-30)
+
+4 HLE families wired after the original backlog (callback/FS-free scope) was
+exhausted — R14 (callbacks) + R15 (VFS) re-opened excluded families. Commits:
+`83d15e8ff` (cellJpgDec header), `38a30a4f4` (cellPad), `842396500` (cellKb +
+cellMouse). Gate 6053→**6059**, 0 regression, all pushed.
+
+- **cellJpgDec** (Create/Open/ReadHeader, module cellJpgDec): callback-FREE in
+  RPCS3 — ReadHeader parses the JPEG header bytes manually. New
+  `JpgDec::parse_header` (byte-exact incl. RPCS3's `*0xFF` segment-length quirk)
+  + `stream_window`. Fixture embeds a minimal JFIF (SOF0 320x240). Pixel decode
+  (uses stb_image in RPCS3) deferred.
+- **Input pad/kb/mouse GetInfo** (module sys_io): deterministic headless (no host
+  handler → 0 connected, max=127). Crates already existed; EmuCore gains
+  pad/kb/mouse fields + NoPads / Null backends. **Init with 127** so the crate's
+  MAX_* matches RPCS3's returned-init-value max_connect.
+
+**Original backlog EXHAUSTED:** cellAudioOut (ranks 2/3/7/8/9) + cellFont revision
+getters (4/5) are DEAD (not PSL1GHT-exposed); everything else done.
+
+**Clean/cheap HLE veins are now exhausted.** Remaining exposed families are the
+HEAVY tier, each needing a decision (cf. the cellFont rasterizer fork): cellPngDec
+(callback-driven guest-malloc + real libpng / manual IHDR), jpgDec full decode
+(vendor stb_image like stb_truetype), input GetData (marginal determinism), and
+net/http/ssl/usb/audio-mixer/spurs/mars/rsx(GPU) = heavy or non-deterministic.
+
+## R20: cellFont rasterization LANDED — cellFont COMPLETE (2026-05-30)
 
 The cellFont rendering path is closed. Commits: R19 horizontal layout
 (`28d451a4c`) + R20 rasterization (`7ac7282be`), both pushed.
