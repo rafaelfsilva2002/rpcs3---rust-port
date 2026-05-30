@@ -2679,6 +2679,31 @@ impl EmuCore {
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
+                        // R17 — cellFont::cellFontInitializeWithRevision
+                        // (0xf03dcc29). r3 = revisionFlags (u64), r4 = config
+                        // ptr. Validates the file-cache size (cellFont.cpp:54):
+                        // config->fc_size (offset 4, BE) < 24 →
+                        // CELL_FONT_ERROR_INVALID_PARAMETER (0x80540002). No
+                        // glyph rendering — that FreeType tail is deferred.
+                        0xf03dcc29 => {
+                            let config_ptr = self.ppu.gpr[4] as u32;
+                            let fc_size = self.read_be_u32(config_ptr + 4)?;
+                            self.ppu.gpr[3] = if fc_size < 24 {
+                                u64::from(0x8054_0002u32)
+                            } else {
+                                0 // CELL_OK
+                            };
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // R17 — cellFont::cellFontEnd (0x7ab47f7e). No args;
+                        // tears down the (state-free) library → CELL_OK
+                        // (cellFont.cpp:79).
+                        0x7ab47f7e => {
+                            self.ppu.gpr[3] = 0; // CELL_OK
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
                         _ => {}
                     }
 
