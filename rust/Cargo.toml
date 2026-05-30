@@ -97,6 +97,7 @@ members = [
     "rpcs3-hle-celljpgdec",
     "rpcs3-hle-cellpngdec",
     "rpcs3-stb-image",
+    "rpcs3-rsx-render",
     "rpcs3-hle-celljpgenc",
     "rpcs3-hle-cellpngenc",
     "rpcs3-hle-celldmux",

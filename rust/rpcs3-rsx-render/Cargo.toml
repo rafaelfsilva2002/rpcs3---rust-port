@@ -1,0 +1,18 @@
+[package]
+name = "rpcs3-rsx-render"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic software RSX renderer — executes decoded NV4097 methods (ClearSurface first) into a render-target buffer. The software reference for the RSX pixel pipeline (vs RPCS3's GPU-backend Vulkan/GL output)."
+
+[lib]
+name = "rpcs3_rsx_render"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rpcs3-rsx-state = { path = "../rpcs3-rsx-state" }
+
+[lints]
+workspace = true
