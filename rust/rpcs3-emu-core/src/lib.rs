@@ -583,13 +583,26 @@ pub struct EmuCore {
     /// HLE backlog — cellKb / cellMouse input state (headless = 0 connected).
     pub kb: rpcs3_hle_cellkb::KbManager,
     pub mouse: rpcs3_hle_cellmouse::MouseManager,
-    /// HLE backlog — cellPngDec decoder state (Create/Open/ReadHeader). Like
-    /// cellJpgDec: a subHandle id maps to the source window so ReadHeader can
-    /// fetch the PNG bytes. (cellPngDec is callback-driven in RPCS3 — Create/Open
-    /// invoke the guest cbCtrlMalloc; faithfully invoking it is DEFERRED, blocked
-    /// on .opd code-field relocation for struct-stored guest function pointers.
-    /// The header info — the behavior-freeze observable — is byte-exact regardless.)
-    pub pngdec: rpcs3_hle_cellpngdec::PngDec,
+    /// HLE backlog — cellPngDec callback-driven handles, keyed by the guest
+    /// addresses the guest `cbCtrlMalloc` callback returns (Create/Open allocate
+    /// the handle/stream in guest memory via that callback — the
+    /// `call_guest_function` OPD heuristic resolves the struct-stored fn-ptr).
+    /// `pngdec_handles`: handle addr → the malloc/free callbacks. `pngdec_streams`:
+    /// stream addr → (src buffer ptr, size) for ReadHeader to fetch the PNG.
+    pngdec_handles: std::collections::BTreeMap<u32, PngHandleCbs>,
+    pngdec_streams: std::collections::BTreeMap<u32, (u32, u32)>,
+}
+
+/// The guest allocator callbacks captured by `cellPngDecCreate` (OPD pointers +
+/// their userdata args), reused by Open to allocate the per-stream handle.
+#[derive(Clone, Copy)]
+struct PngHandleCbs {
+    malloc_fd: u32,
+    malloc_arg: u32,
+    #[allow(dead_code)] // captured for fidelity; Destroy/Close are not wired yet
+    free_fd: u32,
+    #[allow(dead_code)]
+    free_arg: u32,
 }
 
 /// Headless pad backend — no host controller, so every port is disconnected.
@@ -645,7 +658,8 @@ impl EmuCore {
             pad: rpcs3_hle_cellpad::PadManager::default(),
             kb: rpcs3_hle_cellkb::KbManager::default(),
             mouse: rpcs3_hle_cellmouse::MouseManager::default(),
-            pngdec: rpcs3_hle_cellpngdec::PngDec::new(),
+            pngdec_handles: std::collections::BTreeMap::new(),
+            pngdec_streams: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1179,21 +1193,29 @@ impl EmuCore {
     /// import resolves through the same dispatcher. The first re-entrant
     /// control flow in the port — see `.planning/GUEST_CALLBACK_DESIGN.md`.
     pub fn call_guest_function(&mut self, fd_ptr: u32, args: &[u64]) -> Result<u64, Error> {
-        // Resolve the compact 4-byte function descriptor -> code address.
-        // Guest memory is BIG-endian: raw read + from_be_bytes (never _le).
-        // PSL1GHT function-pointer descriptors are full PPC64 OPD entries:
-        // {code @0, toc @4, env @8} (4-byte BE fields on PS3's 32-bit address
-        // space). Calling through a descriptor sets r2 = descriptor.toc so the
-        // callee can reach its TOC-relative globals/literals. The import-stub
-        // trampoline path leaves r2 = 0, so we MUST install the callback's own
-        // toc here — without it the callback faults on its first TOC load.
-        // (The compact 4-byte e_entry FD at boot is a separate special case.)
-        let mut fd_bytes = [0u8; 4];
-        self.mem.read(fd_ptr, &mut fd_bytes)?;
-        let code_addr = u32::from_be_bytes(fd_bytes);
-        let mut toc_bytes = [0u8; 4];
-        self.mem.read(fd_ptr + 4, &mut toc_bytes)?;
-        let toc = u32::from_be_bytes(toc_bytes);
+        // Resolve the guest function descriptor -> code address + TOC. Guest
+        // memory is BIG-endian (from_be_bytes, never _le). Calling through a
+        // descriptor sets r2 = descriptor.toc so the callee reaches its
+        // TOC-relative globals; the import-stub trampoline path leaves r2 = 0, so
+        // we MUST install the callback's own toc — else it faults on its first
+        // TOC load.
+        //
+        // Two descriptor formats occur, distinguished by the first word. PS3 is a
+        // 32-bit address space, so the HIGH word of any 8-byte field is always 0:
+        //   * word0 != 0 → a COMPACT descriptor {code @0, toc @4} (4-byte fields).
+        //     This is what PSL1GHT passes for most function pointers (and the
+        //     e_entry FD), and what savedata/sysutil/msgdialog callbacks use.
+        //   * word0 == 0 → a 24-byte ELFv1 OPD {code dw @0, toc dw @8, env dw @16}
+        //     with the 32-bit address in the LOW word of each doubleword, so the
+        //     real code is @4 and the TOC @12. A function pointer STORED IN A
+        //     STRUCT (e.g. cellPngDec's `tin.malloc_func = my_malloc`) materialises
+        //     as this OPD address; reading @0 would wrongly yield 0.
+        let word0 = self.read_be_u32(fd_ptr)?;
+        let (code_addr, toc) = if word0 == 0 {
+            (self.read_be_u32(fd_ptr + 4)?, self.read_be_u32(fd_ptr + 12)?)
+        } else {
+            (word0, self.read_be_u32(fd_ptr + 4)?)
+        };
 
         // Snapshot the full arch register frame (PpuThread is not Clone).
         // Memory is intentionally NOT saved — callback writes must persist.
@@ -3172,47 +3194,63 @@ impl EmuCore {
                         }
                         // HLE backlog — cellPngDec::cellPngDecCreate (0x157d30c5).
                         // r3=*handle (OUT), r4=threadInParam, r5=threadOutParam.
-                        // cellPngDec is callback-driven (RPCS3 invokes the guest
-                        // cbCtrlMalloc to allocate the handle in guest memory);
-                        // faithfully invoking it is DEFERRED (blocked on .opd
-                        // code-field relocation for struct-stored guest fn-ptrs —
-                        // the OPD reads back code=0). We use the cellJpgDec-style id
-                        // model instead: flip the crate gate, return a fixed handle
-                        // id + the codec version. The header info is byte-exact.
+                        // CALLBACK-DRIVEN (cellPngDec.cpp:344): invoke the guest
+                        // cbCtrlMalloc (threadInParam.malloc_func@12, arg@16) via
+                        // call_guest_function to allocate the handle in guest memory;
+                        // write *handle = that addr + the codec version. The malloc
+                        // fn-ptr is a struct-stored OPD — handled by the
+                        // call_guest_function OPD heuristic.
                         0x157d30c5 => {
                             let handle_pp = self.ppu.gpr[3] as u32;
+                            let in_ptr = self.ppu.gpr[4] as u32;
                             let out_ptr = self.ppu.gpr[5] as u32;
-                            let _ = self.pngdec.create(0x0010_0000);
-                            self.write_be_u32(handle_pp, 1)?; // opaque main handle
-                            self.write_be_u32(out_ptr, 0x0042_0000)?; // pngCodecVersion
-                            self.ppu.gpr[3] = 0;
+                            let malloc_fd = self.read_be_u32(in_ptr + 12)?;
+                            let malloc_arg = self.read_be_u32(in_ptr + 16)?;
+                            let free_fd = self.read_be_u32(in_ptr + 20)?;
+                            let free_arg = self.read_be_u32(in_ptr + 24)?;
+                            // 256: opaque handle size (the guest allocator just bumps).
+                            let addr = self
+                                .call_guest_function(malloc_fd, &[256, u64::from(malloc_arg)])?
+                                as u32;
+                            if addr == 0 {
+                                self.ppu.gpr[3] = u64::from(0x8061_1206u32); // FATAL
+                            } else {
+                                self.pngdec_handles.insert(
+                                    addr,
+                                    PngHandleCbs { malloc_fd, malloc_arg, free_fd, free_arg },
+                                );
+                                self.write_be_u32(handle_pp, addr)?;
+                                self.write_be_u32(out_ptr, 0x0042_0000)?; // pngCodecVersion
+                                self.ppu.gpr[3] = 0;
+                            }
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
                         // HLE backlog — cellPngDec::cellPngDecOpen (0xd2bc5bfd).
-                        // r3=handle(ignored), r4=*subHandle (OUT), r5=*pngDecSource,
-                        // r6=openInfo. Records the BUFFER source window via the crate
-                        // (id from 1), writes *subHandle = id (cellPngDec.cpp:390).
+                        // r3=handle, r4=*subHandle (OUT), r5=*pngDecSource, r6=openInfo.
+                        // Invoke the handle's malloc cb for the stream
+                        // (cellPngDec.cpp:390), record the BUFFER source window, write
+                        // *subHandle = the stream addr.
                         0xd2bc5bfd => {
+                            let handle = self.ppu.gpr[3] as u32;
                             let sub_pp = self.ppu.gpr[4] as u32;
                             let src_ptr = self.ppu.gpr[5] as u32;
-                            let src = rpcs3_hle_cellpngdec::Src {
-                                src_select: self.read_be_u32(src_ptr)? as i32,
-                                file_name: String::new(),
-                                file_offset: 0,
-                                file_size: self.read_be_u32(src_ptr + 16)?,
-                                stream_ptr: self.read_be_u32(src_ptr + 20)?,
-                                stream_size: self.read_be_u32(src_ptr + 24)?,
-                                spu_thread_enable: self.read_be_u32(src_ptr + 28)? as i32,
+                            let Some(cbs) = self.pngdec_handles.get(&handle).copied() else {
+                                self.ppu.gpr[3] = u64::from(0x8061_1206u32);
+                                self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                return Ok(None);
                             };
-                            match self.pngdec.open(src) {
-                                Ok(id) => {
-                                    self.write_be_u32(sub_pp, id)?;
-                                    self.ppu.gpr[3] = 0;
-                                }
-                                Err(e) => {
-                                    self.ppu.gpr[3] = u64::from(u32::from(e));
-                                }
+                            let stream_ptr = self.read_be_u32(src_ptr + 20)?;
+                            let stream_size = self.read_be_u32(src_ptr + 24)?;
+                            let addr = self
+                                .call_guest_function(cbs.malloc_fd, &[256, u64::from(cbs.malloc_arg)])?
+                                as u32;
+                            if addr == 0 {
+                                self.ppu.gpr[3] = u64::from(0x8061_1206u32);
+                            } else {
+                                self.pngdec_streams.insert(addr, (stream_ptr, stream_size));
+                                self.write_be_u32(sub_pp, addr)?;
+                                self.ppu.gpr[3] = 0;
                             }
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
@@ -3224,7 +3262,7 @@ impl EmuCore {
                         0x9ccdcc95 => {
                             let sub = self.ppu.gpr[4] as u32;
                             let info_ptr = self.ppu.gpr[5] as u32;
-                            let Some((sp, ss)) = self.pngdec.stream_window(sub) else {
+                            let Some((sp, ss)) = self.pngdec_streams.get(&sub).copied() else {
                                 self.ppu.gpr[3] = u64::from(0x8061_1206u32);
                                 self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                                 return Ok(None);
@@ -4767,6 +4805,46 @@ mod tests {
         assert_eq!(core.ppu.gpr[5], 0x5555_5555, "r5 restored");
         assert_eq!(core.ppu.lr, 0x0000_CAFE, "lr restored");
         assert_eq!(core.ppu.cia, 0x0000_1234, "cia restored");
+    }
+
+    #[test]
+    fn call_guest_function_resolves_24byte_opd() {
+        // A function pointer stored in a struct materialises as a full 24-byte
+        // ELFv1 OPD {code dw @0, toc dw @8, env dw @16}; the 32-bit code/toc sit in
+        // the LOW word of each doubleword (high word 0). call_guest_function must
+        // read code @+4 and toc @+12 here (not @+0/@+4 as for a compact FD).
+        let mut core = EmuCore::new();
+        let code_addr: u32 = 0x0001_0000;
+        let opd_addr: u32 = 0x0002_0000;
+        let toc_val: u32 = 0x0003_a6a8;
+        core.mem.alloc_at(code_addr, 0x1000, RWX).unwrap();
+        core.mem.alloc_at(opd_addr, 0x1000, RWX).unwrap();
+        // fn(x) -> x + 1
+        core.mem
+            .write(code_addr, &assemble(&[0x3863_0001, 0x4E80_0020]))
+            .unwrap();
+        // 24-byte OPD: code dw (hi=0, lo=code), toc dw (hi=0, lo=toc), env dw.
+        core.mem.write(opd_addr, &0u32.to_be_bytes()).unwrap();
+        core.mem.write(opd_addr + 4, &code_addr.to_be_bytes()).unwrap();
+        core.mem.write(opd_addr + 8, &0u32.to_be_bytes()).unwrap();
+        core.mem.write(opd_addr + 12, &toc_val.to_be_bytes()).unwrap();
+
+        let ret = core
+            .call_guest_function(opd_addr, &[41])
+            .expect("call_guest_function (24-byte OPD)");
+        assert_eq!(ret, 42, "code resolved from OPD low word @+4");
+        // The OPD's toc (low word @+12) must have been installed into r2 during
+        // the call — restored afterwards, so we re-check via a toc-reading stub.
+        let toc_probe: u32 = 0x0001_0100;
+        core.mem
+            // mr r3, r2 ; blr  -> returns the TOC the descriptor installed
+            .write(toc_probe, &assemble(&[0x7C43_1378, 0x4E80_0020]))
+            .unwrap();
+        core.mem.write(opd_addr + 4, &toc_probe.to_be_bytes()).unwrap();
+        let toc_ret = core
+            .call_guest_function(opd_addr, &[0])
+            .expect("call_guest_function (toc probe)");
+        assert_eq!(toc_ret as u32, toc_val, "toc resolved from OPD low word @+12");
     }
 
     #[test]
