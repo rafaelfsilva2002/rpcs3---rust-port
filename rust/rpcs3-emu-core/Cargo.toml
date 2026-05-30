@@ -88,6 +88,8 @@ rpcs3-rsx-state = { path = "../rpcs3-rsx-state" }
 # R13.5d — decode a captured RSX stream into an RsxState to assert SetState
 # registers (viewport) that aren't exposed in RsxSnapshot.
 rpcs3-rsx-fifo  = { path = "../rpcs3-rsx-fifo" }
+# GPU backend — execute decoded RSX methods (ClearSurface) into a framebuffer.
+rpcs3-rsx-render = { path = "../rpcs3-rsx-render" }
 
 [lints]
 workspace = true

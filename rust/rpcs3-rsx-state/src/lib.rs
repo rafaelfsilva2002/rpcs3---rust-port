@@ -193,7 +193,7 @@ pub enum MethodEffect {
 
 /// The RSX method register file: a flat `u32` array indexed by method
 /// register index, plus typed accessors.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RsxState {
     methods: Box<[u32; METHOD_COUNT]>,
 }
@@ -834,6 +834,20 @@ pub fn replay_gcm(buf: &[u8], put: u32) -> Result<RsxSnapshot, FifoError> {
         textures,
         surface: state.surface(),
     })
+}
+
+/// Replay a GCM command stream into the final [`RsxState`] register file (vs
+/// [`replay_gcm`], which returns the digested [`RsxSnapshot`]). A software
+/// renderer (`rpcs3-rsx-render`) reads any method off the returned state — e.g.
+/// the surface descriptor + clear value/mask to execute `NV4097_CLEAR_SURFACE`.
+pub fn replay_gcm_state(buf: &[u8], put: u32) -> Result<RsxState, FifoError> {
+    let mut engine = FifoEngine::new(0, put);
+    let writes = engine.run(buf)?;
+    let mut state = RsxState::new();
+    for &(reg, arg) in &writes {
+        state.write(reg, arg);
+    }
+    Ok(state)
 }
 
 #[cfg(test)]
