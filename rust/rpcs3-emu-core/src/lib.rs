@@ -577,6 +577,21 @@ pub struct EmuCore {
     /// HLE backlog — cellJpgDec decoder state (Create/Open/ReadHeader). Stores
     /// per-subhandle source windows so ReadHeader can fetch the JPEG bytes.
     pub jpgdec: rpcs3_hle_celljpgdec::JpgDec,
+    /// HLE backlog — cellPad input state. Headless emu-core reports 0 connected
+    /// pads (no host controller handler), so GetInfo2 is deterministic.
+    pub pad: rpcs3_hle_cellpad::PadManager,
+}
+
+/// Headless pad backend — no host controller, so every port is disconnected.
+/// Makes `cellPadGetInfo2` deterministic (now_connect = 0).
+struct NoPads;
+impl rpcs3_hle_cellpad::PadBackend for NoPads {
+    fn is_connected(&self, _port_no: usize) -> bool {
+        false
+    }
+    fn read(&self, _port_no: usize) -> Option<rpcs3_hle_cellpad::ButtonState> {
+        None
+    }
 }
 
 impl Default for EmuCore {
@@ -617,6 +632,7 @@ impl EmuCore {
             fd_table: FdTable::new(),
             cellfont_fonts: std::collections::BTreeMap::new(),
             jpgdec: rpcs3_hle_celljpgdec::JpgDec::new(),
+            pad: rpcs3_hle_cellpad::PadManager::default(),
         }
     }
 
@@ -3038,6 +3054,39 @@ impl EmuCore {
                             self.write_be_u32(info_ptr + 8, info.num_components)?;
                             self.write_be_u32(info_ptr + 12, info.color_space)?;
                             self.ppu.gpr[3] = 0; // CELL_OK
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE backlog — sys_io::cellPadInit (0x1cf98800). r3 =
+                        // max_connect. Flips the crate init gate (cellPad.cpp:257).
+                        0x1cf98800 => {
+                            let max_connect = self.ppu.gpr[3] as u32;
+                            self.ppu.gpr[3] =
+                                match rpcs3_hle_cellpad::cell_pad_init(&mut self.pad, max_connect) {
+                                    Ok(()) => 0,
+                                    Err(e) => u64::from(u32::from(e)),
+                                };
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE backlog — sys_io::cellPadGetInfo2 (0xa703a51d). r3 =
+                        // *CellPadInfo2 (124 B). Headless = 0 pads (NoPads backend):
+                        // max_connect@0=Init value, now_connect@4=0, the rest 0
+                        // (cellPad.cpp:911 / GetInfo2). Manually BE-serialized.
+                        0xa703a51d => {
+                            let info_ptr = self.ppu.gpr[3] as u32;
+                            match rpcs3_hle_cellpad::cell_pad_get_info2(&self.pad, &NoPads) {
+                                Ok(info) => {
+                                    self.mem.write(info_ptr, &[0u8; 124])?;
+                                    self.write_be_u32(info_ptr, info.max_connect)?;
+                                    self.write_be_u32(info_ptr + 4, info.now_connect)?;
+                                    self.write_be_u32(info_ptr + 8, info.system_info)?;
+                                    self.ppu.gpr[3] = 0; // CELL_OK
+                                }
+                                Err(e) => {
+                                    self.ppu.gpr[3] = u64::from(u32::from(e));
+                                }
+                            }
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
