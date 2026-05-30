@@ -50,6 +50,8 @@ rpcs3-hle-cellmsgdialog = { path = "../rpcs3-hle-cellmsgdialog" }
 # R18 — cellFont byte-exact glyph metrics (StbttFont via stb_truetype, the same
 # engine RPCS3 cellFont links).
 rpcs3-hle-cellfont     = { path = "../rpcs3-hle-cellfont" }
+# HLE backlog — cellJpgDec (stateful JpgDec; header parse byte-exact).
+rpcs3-hle-celljpgdec   = { path = "../rpcs3-hle-celljpgdec" }
 # Optional: the Cranelift SPU JIT, gated behind the `spu-recompiler`
 # feature so default builds stay lean (no Cranelift) and the gate keeps
 # using the interpreter unless explicitly opted in.

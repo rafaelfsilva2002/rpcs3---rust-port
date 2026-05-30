@@ -574,6 +574,9 @@ pub struct EmuCore {
     /// address (the `font` ptr passed to OpenFontMemory / GetCharGlyphMetrics).
     /// Host-side analogue of RPCS3's in-guest `stbtt_fontinfo` hack.
     pub cellfont_fonts: std::collections::BTreeMap<u32, rpcs3_hle_cellfont::StbttFont>,
+    /// HLE backlog — cellJpgDec decoder state (Create/Open/ReadHeader). Stores
+    /// per-subhandle source windows so ReadHeader can fetch the JPEG bytes.
+    pub jpgdec: rpcs3_hle_celljpgdec::JpgDec,
 }
 
 impl Default for EmuCore {
@@ -613,6 +616,7 @@ impl EmuCore {
             vfs: MemVfs::new(),
             fd_table: FdTable::new(),
             cellfont_fonts: std::collections::BTreeMap::new(),
+            jpgdec: rpcs3_hle_celljpgdec::JpgDec::new(),
         }
     }
 
@@ -2954,6 +2958,85 @@ impl EmuCore {
                             if drew && buf_ptr != 0 {
                                 self.mem.write(buf_ptr, &surf)?;
                             }
+                            self.ppu.gpr[3] = 0; // CELL_OK
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE backlog — cellJpgDec::cellJpgDecCreate (0xa7978f59).
+                        // r3=&mainHandle, r4=threadInParam, r5=threadOutParam.
+                        // RPCS3 ignores all args + returns CELL_OK (cellJpgDec.cpp:36),
+                        // never writing *mainHandle; we only flip the crate's
+                        // create gate so Open's SEQ check passes.
+                        0xa7978f59 => {
+                            let _ = self.jpgdec.create(0x0010_0000);
+                            self.ppu.gpr[3] = 0; // CELL_OK
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE backlog — cellJpgDec::cellJpgDecOpen (0x976ca5c2).
+                        // r3=mainHandle(ignored), r4=*subHandle (OUT), r5=*jpgDecSource,
+                        // r6=*jpgDecOpnInfo. Reads the source, allocates a subHandle
+                        // (id from 1), writes it BE (cellJpgDec.cpp:54). RPCS3's Open
+                        // does NOT write openInfo, so neither do we.
+                        0x976ca5c2 => {
+                            let sub_out = self.ppu.gpr[4] as u32;
+                            let src_ptr = self.ppu.gpr[5] as u32;
+                            let src = rpcs3_hle_celljpgdec::Src {
+                                src_select: self.read_be_u32(src_ptr)?,
+                                file_name: String::new(),
+                                file_offset: 0,
+                                file_size: self.read_be_u32(src_ptr + 16)?,
+                                stream_ptr: self.read_be_u32(src_ptr + 20)?,
+                                stream_size: self.read_be_u32(src_ptr + 24)?,
+                                spu_thread_enable: self.read_be_u32(src_ptr + 28)?,
+                            };
+                            match self.jpgdec.open(src) {
+                                Ok(id) => {
+                                    self.write_be_u32(sub_out, id)?;
+                                    self.ppu.gpr[3] = 0; // CELL_OK
+                                }
+                                Err(e) => {
+                                    self.ppu.gpr[3] = u64::from(u32::from(e));
+                                }
+                            }
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE backlog — cellJpgDec::cellJpgDecReadHeader (0x6d9ebccf).
+                        // r3=mainHandle(ignored), r4=subHandle, r5=*jpgDecInfo. Fetches
+                        // the JPEG bytes from the opened buffer window, parses the
+                        // header byte-exact (JpgDec::parse_header), writes
+                        // {width, height, numComp, colorSpace} BE (cellJpgDec.cpp:112).
+                        0x6d9ebccf => {
+                            let sub = self.ppu.gpr[4] as u32;
+                            let info_ptr = self.ppu.gpr[5] as u32;
+                            let Some((sp, ss)) = self.jpgdec.stream_window(sub) else {
+                                self.ppu.gpr[3] = u64::from(0x8061_1106u32); // FATAL
+                                self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                return Ok(None);
+                            };
+                            let n = (ss as usize).min(64 * 1024 * 1024);
+                            let mut buf = vec![0u8; n];
+                            if sp != 0 && n > 0 {
+                                self.mem.read(sp, &mut buf)?;
+                            }
+                            let info = match rpcs3_hle_celljpgdec::JpgDec::parse_header(&buf) {
+                                Ok(i) => i,
+                                Err(e) => {
+                                    self.ppu.gpr[3] = u64::from(u32::from(e));
+                                    self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                    return Ok(None);
+                                }
+                            };
+                            if let Err(e) = self.jpgdec.read_header(sub, &buf, info) {
+                                self.ppu.gpr[3] = u64::from(u32::from(e));
+                                self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                return Ok(None);
+                            }
+                            self.write_be_u32(info_ptr, info.image_width)?;
+                            self.write_be_u32(info_ptr + 4, info.image_height)?;
+                            self.write_be_u32(info_ptr + 8, info.num_components)?;
+                            self.write_be_u32(info_ptr + 12, info.color_space)?;
                             self.ppu.gpr[3] = 0; // CELL_OK
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);

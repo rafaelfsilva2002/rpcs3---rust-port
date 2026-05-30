@@ -322,6 +322,60 @@ impl JpgDec {
         Ok(info)
     }
 
+    /// Byte-exact port of RPCS3 `cellJpgDecReadHeader`'s manual header parse
+    /// (cellJpgDec.cpp:146-178): validate the SOI+APP0 (`FF D8 FF E0`) and the
+    /// "JFIF" tag, walk the segment chain to the `FF C0` SOF0 marker, then read
+    /// width/height from it. NOTE the faithful quirks: the segment length uses
+    /// `buffer[i]*0xFF + buffer[i+1]` (RPCS3's `*0xFF`, not `*0x100`), while the
+    /// SOF0 width/height use `*0x100`; numComponents is hardcoded 3 and
+    /// colorSpace `CELL_JPG_RGB`. Out-of-range reads return `HEADER` (RPCS3 would
+    /// over-read; same result for valid input).
+    pub fn parse_header(bytes: &[u8]) -> Result<Info, CellError> {
+        let n = bytes.len();
+        if n < 10
+            || bytes[0] != 0xFF
+            || bytes[1] != 0xD8
+            || bytes[2] != 0xFF
+            || bytes[3] != 0xE0
+            || &bytes[6..10] != b"JFIF"
+        {
+            return Err(errors::HEADER);
+        }
+        let mut i: usize = 4;
+        let mut block_length = bytes[i] as usize * 0xFF + bytes[i + 1] as usize;
+        loop {
+            i = i.wrapping_add(block_length);
+            if i + 1 >= n || bytes[i] != 0xFF {
+                return Err(errors::HEADER);
+            }
+            if bytes[i + 1] == 0xC0 {
+                break; // SOF0 — start of frame
+            }
+            i += 2;
+            if i + 1 >= n {
+                return Err(errors::HEADER);
+            }
+            block_length = bytes[i] as usize * 0xFF + bytes[i + 1] as usize;
+        }
+        if i + 8 >= n {
+            return Err(errors::HEADER);
+        }
+        Ok(Info {
+            image_width: u32::from(bytes[i + 7]) * 0x100 + u32::from(bytes[i + 8]),
+            image_height: u32::from(bytes[i + 5]) * 0x100 + u32::from(bytes[i + 6]),
+            num_components: 3,
+            color_space: CS_RGB,
+        })
+    }
+
+    /// The (stream_ptr, stream_size) of an opened BUFFER-source handle — lets the
+    /// emu-core ReadHeader arm fetch the JPEG bytes from guest memory.
+    #[must_use]
+    pub fn stream_window(&self, id: u32) -> Option<(u32, u32)> {
+        let h = self.handles.iter().find(|h| h.id == id)?;
+        Some((h.src.stream_ptr, h.src.stream_size))
+    }
+
     /// `cellJpgDecSetParameter(sub, inParam, outParam)`.
     pub fn set_parameter(&mut self, id: u32, in_param: InParam) -> Result<OutParam, CellError> {
         let idx = self.handle_idx(id)?;
@@ -773,5 +827,29 @@ mod tests {
         d.close(h).unwrap();
         assert_eq!(d.handle_count(), 0);
         d.destroy().unwrap();
+    }
+
+    /// Minimal JFIF: SOI + APP0(len 16) + SOF0(h=240, w=320) — exercises the
+    /// byte-exact `parse_header` (segment walk + SOF0 extraction).
+    const MINI_JPG: &[u8] = &[
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
+        0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, // APP0 (16-byte segment)
+        0xFF, 0xC0, 0x00, 0x11, 0x08, 0x00, 0xF0, 0x01, 0x40, 0x03, // SOF0 h=240 w=320
+        0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01, 0xFF, 0xD9,
+    ];
+
+    #[test]
+    fn parse_header_extracts_sof0_dimensions() {
+        let info = JpgDec::parse_header(MINI_JPG).unwrap();
+        assert_eq!(info.image_width, 320);
+        assert_eq!(info.image_height, 240);
+        assert_eq!(info.num_components, 3);
+        assert_eq!(info.color_space, CS_RGB);
+    }
+
+    #[test]
+    fn parse_header_rejects_non_jfif() {
+        assert_eq!(JpgDec::parse_header(&[0xFF, 0xD8, 0x00]), Err(errors::HEADER));
+        assert_eq!(JpgDec::parse_header(MAGIC_SOI), Err(errors::HEADER));
     }
 }
