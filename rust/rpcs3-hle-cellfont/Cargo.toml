@@ -13,6 +13,9 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 rpcs3-emu-types = { path = "../rpcs3-emu-types" }
+# Faithful Rust port of stb_truetype.h — the SAME engine RPCS3 cellFont uses
+# (cellFont.cpp includes stb_truetype.h), so glyph metrics are byte-exact.
+stb_truetype = "0.3"
 
 [lints]
 workspace = true

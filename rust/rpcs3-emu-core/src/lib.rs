@@ -395,6 +395,9 @@ pub const USER_IMPORT_STUB_SIZE: u32 = 0x0001_0000;
 /// through this one 4 KiB page (just past the import-stub window). Sub-offsets
 /// pack each struct so they never overlap (statGet is the large one, kept last).
 const SAVEDATA_SCRATCH_VADDR: u32 = 0xD002_0000;
+/// R18 — scratch page backing the opaque cellFont library handle (never
+/// dereferenced in the metrics path; only needs to be non-null + mapped).
+const FONT_LIBRARY_VADDR: u32 = 0xD003_0000;
 const SD_RESULT_OFF: u32 = 0x000; // sysSaveCallbackResult (20 B)
 const SD_STATSET_OFF: u32 = 0x020; // sysSaveStatusOut (12 B)
 const SD_FILEGET_OFF: u32 = 0x040; // sysSaveFileIn (68 B)
@@ -567,6 +570,10 @@ pub struct EmuCore {
     /// VFS wave — lv2 file-descriptor table (fds start at 4; 0..3 = stdio).
     /// Persists across open/read/close within one run.
     pub fd_table: FdTable,
+    /// R18 — cellFont parsed fonts, keyed by the guest `CellFont` struct
+    /// address (the `font` ptr passed to OpenFontMemory / GetCharGlyphMetrics).
+    /// Host-side analogue of RPCS3's in-guest `stbtt_fontinfo` hack.
+    pub cellfont_fonts: std::collections::BTreeMap<u32, rpcs3_hle_cellfont::StbttFont>,
 }
 
 impl Default for EmuCore {
@@ -605,6 +612,7 @@ impl EmuCore {
             msgdialog: DialogManager::default(),
             vfs: MemVfs::new(),
             fd_table: FdTable::new(),
+            cellfont_fonts: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2700,6 +2708,117 @@ impl EmuCore {
                         // tears down the (state-free) library → CELL_OK
                         // (cellFont.cpp:79).
                         0x7ab47f7e => {
+                            self.ppu.gpr[3] = 0; // CELL_OK
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // R18 — cellFontFT::cellFontInitLibraryFreeTypeWithRevision
+                        // (0x7a0a83c4). r4=config ptr, r5=lib (pptr<CellFontLibrary>).
+                        // Validates config+lib non-null, writes a non-null library
+                        // handle to *lib → CELL_OK (cellFontFT.cpp:8). The library
+                        // is opaque and never dereferenced in the metrics path.
+                        0x7a0a83c4 => {
+                            let config_ptr = self.ppu.gpr[4] as u32;
+                            let lib_pp = self.ppu.gpr[5] as u32;
+                            if config_ptr == 0 || lib_pp == 0 {
+                                self.ppu.gpr[3] = u64::from(0x8054_0002u32);
+                            } else {
+                                let _ = self.mem.alloc_at(
+                                    FONT_LIBRARY_VADDR,
+                                    0x1000,
+                                    PageFlags::READABLE | PageFlags::WRITABLE,
+                                );
+                                self.write_be_u32(lib_pp, FONT_LIBRARY_VADDR)?;
+                                self.ppu.gpr[3] = 0; // CELL_OK
+                            }
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // R18 — cellFont::cellFontOpenFontMemory (0x9e19072b).
+                        // r3=library, r4=fontAddr, r5=fontSize, r6=subNum,
+                        // r7=uniqueId, r8=font ptr (cellFont.cpp:110). Reads the
+                        // font bytes from guest memory, parses with stb_truetype
+                        // (StbttFont::open, == RPCS3 stbtt_InitFont), and stores
+                        // it host-side keyed by the CellFont guest address.
+                        0x9e19072b => {
+                            let library = self.ppu.gpr[3] as u32;
+                            let font_addr = self.ppu.gpr[4] as u32;
+                            let font_size = self.ppu.gpr[5] as u32;
+                            let font_ptr = self.ppu.gpr[8] as u32;
+                            // cellFont.cpp:114-134 parameter checks.
+                            if font_ptr == 0 || library == 0 || font_addr == 0 {
+                                self.ppu.gpr[3] = u64::from(0x8054_0002u32);
+                                self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                return Ok(None);
+                            }
+                            // Read the font bytes (cap to a sane size).
+                            let n = (font_size as usize).min(16 * 1024 * 1024);
+                            let mut buf = vec![0u8; n];
+                            self.mem.read(font_addr, &mut buf)?;
+                            match rpcs3_hle_cellfont::StbttFont::open(buf) {
+                                Some(font) => {
+                                    self.cellfont_fonts.insert(font_ptr, font);
+                                    // Mirror cellFont.cpp:146 (fontdata_addr); the
+                                    // metrics path reads neither this nor origin.
+                                    self.write_be_u32(font_ptr + 16, font_addr)?;
+                                    self.ppu.gpr[3] = 0; // CELL_OK
+                                }
+                                None => {
+                                    // stbtt_InitFont == 0 (cellFont.cpp:142).
+                                    self.ppu.gpr[3] = u64::from(0x8054_000Bu32);
+                                }
+                            }
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // R18 — cellFont::cellFontSetScalePixel (0x297f0e93).
+                        // r3=font ptr; w,h are f32 in FPRs f1,f2. Writes
+                        // scale_x@0 / scale_y@4 into the guest CellFont struct
+                        // (cellFont.cpp:517); GetCharGlyphMetrics reads scale_y.
+                        0x297f0e93 => {
+                            let font_ptr = self.ppu.gpr[3] as u32;
+                            if font_ptr == 0 {
+                                self.ppu.gpr[3] = u64::from(0x8054_0002u32);
+                            } else {
+                                let w = self.ppu.fpr[1] as f32;
+                                let h = self.ppu.fpr[2] as f32;
+                                self.write_be_u32(font_ptr, w.to_bits())?;
+                                self.write_be_u32(font_ptr + 4, h.to_bits())?;
+                                self.ppu.gpr[3] = 0; // CELL_OK
+                            }
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // R18 — cellFont::cellFontGetCharGlyphMetrics (0xd8eaee9f).
+                        // r3=font ptr, r4=code, r5=metrics ptr. Byte-exact port of
+                        // cellFont.cpp:868 via the stb_truetype-backed StbttFont:
+                        // reads scale_y from the guest struct, computes the eight
+                        // CellFontGlyphMetrics f32 fields, writes them BE.
+                        0xd8eaee9f => {
+                            let font_ptr = self.ppu.gpr[3] as u32;
+                            let code = self.ppu.gpr[4] as u32;
+                            let metrics_ptr = self.ppu.gpr[5] as u32;
+                            if font_ptr == 0 || metrics_ptr == 0 {
+                                self.ppu.gpr[3] = u64::from(0x8054_0002u32);
+                                self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                return Ok(None);
+                            }
+                            let scale_y = f32::from_bits(self.read_be_u32(font_ptr + 4)?);
+                            let m = if let Some(font) = self.cellfont_fonts.get(&font_ptr) {
+                                font.char_glyph_metrics(code, scale_y)
+                            } else {
+                                self.ppu.gpr[3] = u64::from(0x8054_0002u32);
+                                self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                return Ok(None);
+                            };
+                            self.write_be_u32(metrics_ptr, m.width.to_bits())?;
+                            self.write_be_u32(metrics_ptr + 4, m.height.to_bits())?;
+                            self.write_be_u32(metrics_ptr + 8, m.h_bearing_x.to_bits())?;
+                            self.write_be_u32(metrics_ptr + 12, m.h_bearing_y.to_bits())?;
+                            self.write_be_u32(metrics_ptr + 16, m.h_advance.to_bits())?;
+                            self.write_be_u32(metrics_ptr + 20, m.v_bearing_x.to_bits())?;
+                            self.write_be_u32(metrics_ptr + 24, m.v_bearing_y.to_bits())?;
+                            self.write_be_u32(metrics_ptr + 28, m.v_advance.to_bits())?;
                             self.ppu.gpr[3] = 0; // CELL_OK
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);

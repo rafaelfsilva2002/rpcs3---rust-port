@@ -1,0 +1,9 @@
+# Built artifacts — produced locally by the PSL1GHT Docker toolchain.
+# Sources (main.c, Makefile, gen_font.py, font_data.h, testfont.ttf, *.md) are
+# tracked — testfont.ttf + font_data.h are the canonical CC0 font inputs
+# (regenerable via gen_font.py); only the compiled binaries are ignored.
+*.self
+*.elf
+*.o
+*.s
+build/

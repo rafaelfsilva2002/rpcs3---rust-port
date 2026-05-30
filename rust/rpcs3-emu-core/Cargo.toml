@@ -47,6 +47,9 @@ rpcs3-hle-cellgame     = { path = "../rpcs3-hle-cellgame" }
 # Callback wave — cellMsgDialog (DialogManager; first call_guest_function consumer
 # beyond cellSysutil).
 rpcs3-hle-cellmsgdialog = { path = "../rpcs3-hle-cellmsgdialog" }
+# R18 — cellFont byte-exact glyph metrics (StbttFont via stb_truetype, the same
+# engine RPCS3 cellFont links).
+rpcs3-hle-cellfont     = { path = "../rpcs3-hle-cellfont" }
 # Optional: the Cranelift SPU JIT, gated behind the `spu-recompiler`
 # feature so default builds stay lean (no Cranelift) and the gate keeps
 # using the interpreter unless explicitly opted in.

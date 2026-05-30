@@ -113,6 +113,76 @@ pub struct GlyphImage {
 }
 
 // =====================================================================
+// Byte-exact glyph metrics (stb_truetype — the engine RPCS3 cellFont uses)
+// =====================================================================
+
+/// Glyph metrics matching `CellFontGlyphMetrics` (cellFont.cpp:894-901): eight
+/// f32 fields (BE in guest memory). Produced bit-for-bit by [`StbttFont`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CellGlyphMetrics {
+    pub width: f32,
+    pub height: f32,
+    pub h_bearing_x: f32,
+    pub h_bearing_y: f32,
+    pub h_advance: f32,
+    pub v_bearing_x: f32,
+    pub v_bearing_y: f32,
+    pub v_advance: f32,
+}
+
+/// A parsed TrueType font via `stb_truetype` — the byte-exact engine RPCS3's
+/// cellFont links (`#include <stb_truetype.h>`). The host-side analogue of
+/// RPCS3's in-guest `stbtt_fontinfo` hack (cellFont.cpp:138).
+pub struct StbttFont {
+    info: stb_truetype::FontInfo<Vec<u8>>,
+}
+
+impl core::fmt::Debug for StbttFont {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("StbttFont(..)")
+    }
+}
+
+impl StbttFont {
+    /// Parse a font from memory (mirrors `stbtt_InitFont`). `None` on failure —
+    /// the caller maps that to `CELL_FONT_ERROR_FONT_OPEN_FAILED`
+    /// (cellFont.cpp:140-143).
+    #[must_use]
+    pub fn open(data: Vec<u8>) -> Option<Self> {
+        stb_truetype::FontInfo::new(data, 0).map(|info| Self { info })
+    }
+
+    /// Byte-exact port of `cellFontGetCharGlyphMetrics` (cellFont.cpp:887-901).
+    /// `scale_y` is `CellFont.scale_y` (set by `cellFontSetScalePixel`); the
+    /// computation is `(int table value) * scale` in IEEE-754 single, identical
+    /// to RPCS3's host-side stb_truetype.
+    #[must_use]
+    pub fn char_glyph_metrics(&self, code: u32, scale_y: f32) -> CellGlyphMetrics {
+        let scale = self.info.scale_for_pixel_height(scale_y);
+        let (x0, y0, x1, y1) = match self.info.get_codepoint_box(code) {
+            Some(r) => (
+                i32::from(r.x0),
+                i32::from(r.y0),
+                i32::from(r.x1),
+                i32::from(r.y1),
+            ),
+            None => (0, 0, 0, 0),
+        };
+        let hm = self.info.get_codepoint_h_metrics(code);
+        CellGlyphMetrics {
+            width: (x1 - x0) as f32 * scale,
+            height: (y1 - y0) as f32 * scale,
+            h_bearing_x: hm.left_side_bearing as f32 * scale,
+            h_bearing_y: 0.0,
+            h_advance: hm.advance_width as f32 * scale,
+            v_bearing_x: 0.0,
+            v_bearing_y: 0.0,
+            v_advance: 0.0,
+        }
+    }
+}
+
+// =====================================================================
 // Backend trait
 // =====================================================================
 
