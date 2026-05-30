@@ -5,7 +5,45 @@ port from a fresh session (e.g., new terminal session, new model).
 Read this top-to-bottom — it's the minimum context to start the
 next slice without re-discovering things.
 
-## LATEST — R14: guest-PPU callback support LANDED (2026-05-29)
+## LATEST — R16: cellSaveData callback bridge LANDED (2026-05-29)
+
+**The first callback-DRIVEN HLE family** — where the *system* calls back INTO
+guest code (vs prior HLE where the syscall just returns a value). Commit
+`0778929b7` (pushed). Built on R14 (`call_guest_function`) + R15 (VFS).
+
+`cellSaveDataAutoSave2` (NID `0x8b7ed64b`) and `cellSaveDataAutoLoad2`
+(`0xfbd5c856`) — captured at runtime under the **cellSysutil** module group
+(PSL1GHT bundles cellSaveData there). They share an IDENTICAL signature, so a
+single `run_savedata_op` serves both; the file callback's **`fileOperation`
+field** (not the API name) decides WRITE (guest→VFS) vs READ (VFS→guest). One
+shared NID arm `0x8b7ed64b | 0xfbd5c856`.
+
+Protocol mirrors RPCS3 `savedata_op` (cellSaveData.cpp:1622/1837): `funcStat`
+once (`OK_NEXT`=0 proceeds, `OK_LAST`=1 finishes empty), then the `funcFile`
+loop. **CRITICAL semantics: a callback returning `OK_LAST` breaks WITHOUT
+performing its op — only `OK_NEXT` performs the file op then loops.** So writing
+one file needs TWO callback calls (setup+CONTINUE, then DONE); the homebrew uses
+a per-callback counter. Callbacks run via `call_guest_function`; the `sysSave*`
+structs are marshalled through a 4 KiB scratch page `SAVEDATA_SCRATCH_VADDR =
+0xD0020000` (alloc_at idempotent). I/O lands in the VFS at
+`/dev_hdd0/home/00000001/savedata/<dir>/<file>`.
+
+Struct offsets + enum values locked against PSL1GHT `sysutil/save.h` (the
+homebrew `#include`s it, so its layout IS authoritative): FileSet(48B)
+{op@0,type@8,protectedID[16]@12,name@28,off@32,size@36,bufSize@40,buf@44},
+FileGet(68B){prevOpSize@0}, StatSet(12B){setParam@0}, CBResult(20B){result@0};
+FileType STANDARD=1/PROTECTED=0/CONTENT_*=2..5, FileOp READ=0/WRITE=1/DELETE=2,
+CBResult CONTINUE=0/DONE=1/NOCONFIRM=2/errs<0, Return DONE=0/ERROR=0x8002b400.
+
+New: `read_be_u32`/`write_be_u32` helpers; `MemVfs::read_file`/`remove_file`.
+Fixture `single_savedata_autosave_v1` (save 8B → wipe → load → compare) →
+**0xC0DE**; test also asserts the WRITE landed in the VFS. NID hash calc note:
+the SHA1(name+suffix)[..4] LE suffix from R13.1 cellGcm did NOT reproduce these
+NIDs — runtime capture remains the canonical method. Gate **6048/0**.
+
+**Next: cellFont** (user directive "savedata e em seguida o cellfont").
+
+## R14: guest-PPU callback support LANDED (2026-05-29)
 
 **The port can now call back into guest PPU code from an HLE arm.** New primitive
 `EmuCore::call_guest_function(fd_ptr, args) -> Result<u64>` (lib.rs, next to
