@@ -5,7 +5,23 @@ port from a fresh session (e.g., new terminal session, new model).
 Read this top-to-bottom — it's the minimum context to start the
 next slice without re-discovering things.
 
-## LATEST — HLE backlog wave-2: jpgDec + input (pad/kb/mouse) (2026-05-30)
+## LATEST — HLE backlog: cellPngDec header (IHDR byte-exact) (2026-05-30)
+
+cellPngDec Create/Open/ReadHeader (commit `ce16d3fb1`, gate **6062**). NIDs
+Create=0x157d30c5/Open=0xd2bc5bfd/ReadHeader=0x9ccdcc95. RPCS3 reads the header
+via libpng; the values are the PNG IHDR fields, parsed byte-exact by the new
+`PngDec::parse_header`. Fixture embeds a minimal RGB PNG (gen_png.py, 320×240) →
+checks 320/240/3/RGB/8. Decode (SetParameter/DecodeData, libpng in RPCS3) deferred.
+
+**Infra gap discovered:** cellPngDec is callback-driven (Create/Open invoke the
+guest cbCtrlMalloc). Faithfully invoking it FAILED — a guest fn-ptr STORED IN A
+STRUCT reads back an OPD with **code field = 0** (the .opd code-field relocation
+isn't applied for struct-stored fn-ptrs; register-passed callbacks like savedata's
+work). Worked around with the cellJpgDec id model (observation-equivalent; header
+info byte-exact). Fixing the .opd relocation would make pngDec's callback faithful
++ harden guest-callback families generally — a worthwhile separate infra slice.
+
+## HLE backlog wave-2: jpgDec + input (pad/kb/mouse) (2026-05-30)
 
 4 HLE families wired after the original backlog (callback/FS-free scope) was
 exhausted — R14 (callbacks) + R15 (VFS) re-opened excluded families. Commits:
