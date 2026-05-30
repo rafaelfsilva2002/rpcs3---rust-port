@@ -5,7 +5,39 @@ port from a fresh session (e.g., new terminal session, new model).
 Read this top-to-bottom — it's the minimum context to start the
 next slice without re-discovering things.
 
-## LATEST — R17: cellFont init lifecycle LANDED (2026-05-29)
+## LATEST — R18: cellFont byte-exact glyph metrics LANDED (2026-05-30)
+
+The first cellFont **rendering** slice — glyph METRICS, byte-exact. Commit
+`9e1dc187f` (pushed). RPCS3 cellFont links `stb_truetype.h`; the Rust port uses
+the **`stb_truetype` crate v0.3.1** (a faithful port), so
+`cellFontGetCharGlyphMetrics` reproduces RPCS3's output bit-for-bit.
+
+NIDs (runtime-captured): `cellFontInitLibraryFreeTypeWithRevision` (`0x7a0a83c4`,
+module cellFontFT — writes a non-null opaque lib handle), `cellFontOpenFontMemory`
+(`0x9e19072b`), `cellFontSetScalePixel` (`0x297f0e93` — **w,h arrive in FPRs
+f1/f2**, read `fpr[1] as f32`), `cellFontGetCharGlyphMetrics` (`0xd8eaee9f`).
+
+emu-core keeps parsed fonts host-side in `cellfont_fonts: BTreeMap<u32, StbttFont>`
+keyed by the guest CellFont address (cleaner than RPCS3's in-guest stbtt_fontinfo
+hack); the scale lives in the guest struct (SetScalePixel writes scale_x@0/scale_y@4,
+GetCharGlyphMetrics reads scale_y@4). Metric math byte-exact-ports cellFont.cpp:887
+(`scale=scale_for_pixel_height(scale_y); width=(x1-x0)*scale; ...`).
+
+**Byte-exactness is test-enforced, not assumed:** the fixture uses a SYNTHETIC
+CC0 font (`gen_font.py` → `testfont.ttf` + `font_data.h`, both committed — note
+PSL1GHT font.h has a typo `fontontSetScalePixel`, so the fixture declares the real
+`fontSetScalePixel` extern). `single_font_metrics_v1` checks 'A' at scale 1000
+(exact integers) AND scale 32 (fractional, bit-exact 0x414ccccd…) → **0xC0DE**.
+A calibration test (`rpcs3-hle-cellfont/tests/font_calibration.rs`) independently
+asserts the crate reproduces the golden (font-design ints + IEEE-754 single
+reference) bit-for-bit — first time the project pins byte-exactness against a
+third-party algorithm via a dedicated test. Gate **6052/0**.
+
+Design doc: `.planning/CELLFONT_RENDER_DESIGN.md`. **DEFERRED:** rasterization
+(`cellFontRenderCharGlyphImage` → glyph bitmaps via stbtt GetCodepointBitmap) —
+same byte-exact story, more surface (render surface + bitmap output).
+
+## R17: cellFont init lifecycle LANDED (2026-05-29)
 
 The cellFont **entry path**, behavior-frozen WITHOUT glyph rendering. Commit
 `8f39037ee` (pushed). Two NIDs captured at runtime under module `cellFont`:
