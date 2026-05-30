@@ -1,0 +1,6 @@
+*.self
+*.elf
+*.bin
+*.o
+*.s
+build/

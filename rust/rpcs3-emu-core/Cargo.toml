@@ -54,6 +54,9 @@ rpcs3-hle-cellfont     = { path = "../rpcs3-hle-cellfont" }
 rpcs3-hle-celljpgdec   = { path = "../rpcs3-hle-celljpgdec" }
 # HLE backlog — cellPad (input GetInfo2; deterministic headless = 0 pads).
 rpcs3-hle-cellpad      = { path = "../rpcs3-hle-cellpad" }
+# HLE backlog — cellKb / cellMouse (input GetInfo; deterministic headless).
+rpcs3-hle-cellkb       = { path = "../rpcs3-hle-cellkb" }
+rpcs3-hle-cellmouse    = { path = "../rpcs3-hle-cellmouse" }
 # Optional: the Cranelift SPU JIT, gated behind the `spu-recompiler`
 # feature so default builds stay lean (no Cranelift) and the gate keeps
 # using the interpreter unless explicitly opted in.

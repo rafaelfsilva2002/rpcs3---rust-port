@@ -580,6 +580,9 @@ pub struct EmuCore {
     /// HLE backlog — cellPad input state. Headless emu-core reports 0 connected
     /// pads (no host controller handler), so GetInfo2 is deterministic.
     pub pad: rpcs3_hle_cellpad::PadManager,
+    /// HLE backlog — cellKb / cellMouse input state (headless = 0 connected).
+    pub kb: rpcs3_hle_cellkb::KbManager,
+    pub mouse: rpcs3_hle_cellmouse::MouseManager,
 }
 
 /// Headless pad backend — no host controller, so every port is disconnected.
@@ -633,6 +636,8 @@ impl EmuCore {
             cellfont_fonts: std::collections::BTreeMap::new(),
             jpgdec: rpcs3_hle_celljpgdec::JpgDec::new(),
             pad: rpcs3_hle_cellpad::PadManager::default(),
+            kb: rpcs3_hle_cellkb::KbManager::default(),
+            mouse: rpcs3_hle_cellmouse::MouseManager::default(),
         }
     }
 
@@ -3082,6 +3087,73 @@ impl EmuCore {
                                     self.write_be_u32(info_ptr + 4, info.now_connect)?;
                                     self.write_be_u32(info_ptr + 8, info.system_info)?;
                                     self.ppu.gpr[3] = 0; // CELL_OK
+                                }
+                                Err(e) => {
+                                    self.ppu.gpr[3] = u64::from(u32::from(e));
+                                }
+                            }
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE backlog — sys_io::cellKbInit (0x433f6ec0). r3=max.
+                        0x433f6ec0 => {
+                            let max = self.ppu.gpr[3] as u32;
+                            self.ppu.gpr[3] =
+                                match rpcs3_hle_cellkb::cell_kb_init(&mut self.kb, max) {
+                                    Ok(()) => 0,
+                                    Err(e) => u64::from(u32::from(e)),
+                                };
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE backlog — sys_io::cellKbGetInfo (0x2f1774d5). r3 =
+                        // *CellKbInfo (139 B): max@0, now@4, info@8, status[127]@12.
+                        // Headless (NullKbBackend) = max 127, now 0, rest zero.
+                        0x2f1774d5 => {
+                            let info_ptr = self.ppu.gpr[3] as u32;
+                            match rpcs3_hle_cellkb::cell_kb_get_info(
+                                &self.kb,
+                                &rpcs3_hle_cellkb::NullKbBackend,
+                            ) {
+                                Ok(info) => {
+                                    self.mem.write(info_ptr, &[0u8; 139])?;
+                                    self.write_be_u32(info_ptr, info.max_connect)?;
+                                    self.write_be_u32(info_ptr + 4, info.now_connect)?;
+                                    self.ppu.gpr[3] = 0;
+                                }
+                                Err(e) => {
+                                    self.ppu.gpr[3] = u64::from(u32::from(e));
+                                }
+                            }
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE backlog — sys_io::cellMouseInit (0xc9030138). r3=max.
+                        0xc9030138 => {
+                            let max = self.ppu.gpr[3] as u32;
+                            self.ppu.gpr[3] =
+                                match rpcs3_hle_cellmouse::cell_mouse_init(&mut self.mouse, max) {
+                                    Ok(()) => 0,
+                                    Err(e) => u64::from(u32::from(e)),
+                                };
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE backlog — sys_io::cellMouseGetInfo (0x5baf30fb). r3 =
+                        // *CellMouseInfo (647 B): max@0, now@4, info@8,
+                        // vendor_id[127]@12, product_id[127]@266, status[127]@520.
+                        // Headless (NullMouseBackend) = max 127, now 0, rest zero.
+                        0x5baf30fb => {
+                            let info_ptr = self.ppu.gpr[3] as u32;
+                            match rpcs3_hle_cellmouse::cell_mouse_get_info(
+                                &self.mouse,
+                                &rpcs3_hle_cellmouse::NullMouseBackend,
+                            ) {
+                                Ok(info) => {
+                                    self.mem.write(info_ptr, &[0u8; 647])?;
+                                    self.write_be_u32(info_ptr, info.max_connect)?;
+                                    self.write_be_u32(info_ptr + 4, info.now_connect)?;
+                                    self.ppu.gpr[3] = 0;
                                 }
                                 Err(e) => {
                                     self.ppu.gpr[3] = u64::from(u32::from(e));
