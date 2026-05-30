@@ -390,6 +390,28 @@ pub struct TlsRegion {
 pub const USER_IMPORT_STUB_VADDR: u32 = 0xD001_0000;
 pub const USER_IMPORT_STUB_SIZE: u32 = 0x0001_0000;
 
+/// R16 — savedata callback bridge scratch page. The cellSaveData status/file
+/// callbacks take pointers to `sysSave*` structs; the bridge marshals them
+/// through this one 4 KiB page (just past the import-stub window). Sub-offsets
+/// pack each struct so they never overlap (statGet is the large one, kept last).
+const SAVEDATA_SCRATCH_VADDR: u32 = 0xD002_0000;
+const SD_RESULT_OFF: u32 = 0x000; // sysSaveCallbackResult (20 B)
+const SD_STATSET_OFF: u32 = 0x020; // sysSaveStatusOut (12 B)
+const SD_FILEGET_OFF: u32 = 0x040; // sysSaveFileIn (68 B)
+const SD_FILESET_OFF: u32 = 0x0c0; // sysSaveFileOut (48 B)
+const SD_STATGET_OFF: u32 = 0x100; // sysSaveStatusIn (~1704 B)
+/// Generous zero-fill span for sysSaveStatusIn (covers its ~1704-byte layout
+/// regardless of nested-struct padding; stays within the 4 KiB page).
+const SD_STATGET_LEN: usize = 0x700;
+/// sysSaveCallbackResult result codes (save.h).
+const SD_CBRESULT_OK_NEXT: i32 = 0; // CONTINUE — perform op (file) / proceed (stat)
+const SD_CBRESULT_OK_LAST: i32 = 1; // DONE — stop loop WITHOUT performing op
+const SD_CBRESULT_OK_LAST_NOCONFIRM: i32 = 2;
+/// sysSave API return values (save.h): 0 = DONE (success); error facility.
+const SD_RETURN_DONE: u32 = 0;
+const SD_RETURN_ERROR_CALLBACK: u32 = 0x8002_b401;
+const SD_RETURN_ERROR_INVALID_ARG: u32 = 0x8002_b404;
+
 /// R9.1g.6 — read a null-terminated UTF-8 string from guest
 /// memory, up to `max_len` bytes. Returns the string without
 /// the trailing nul. Errors if memory access fails or if no nul
@@ -1246,6 +1268,196 @@ impl EmuCore {
     /// `O_CREAT` open will create a file into.
     pub fn vfs_add_dir(&mut self, path: &str) {
         self.vfs.add_dir(path);
+    }
+
+    /// Read a big-endian `u32` from guest memory (`?`-propagating).
+    fn read_be_u32(&self, addr: u32) -> Result<u32, Error> {
+        let mut b = [0u8; 4];
+        self.mem.read(addr, &mut b)?;
+        Ok(u32::from_be_bytes(b))
+    }
+
+    /// Write a big-endian `u32` to guest memory (`?`-propagating).
+    fn write_be_u32(&mut self, addr: u32, v: u32) -> Result<(), Error> {
+        self.mem.write(addr, &v.to_be_bytes())?;
+        Ok(())
+    }
+
+    /// R16 — drive the cellSaveData callback protocol. `cellSaveDataAutoSave2`
+    /// and `cellSaveDataAutoLoad2` share an identical signature; the
+    /// `fileOperation` the file callback sets is what decides whether bytes
+    /// flow guest→VFS (WRITE) or VFS→guest (READ), so one routine serves both.
+    ///
+    /// Mirrors RPCS3 `savedata_op` (cellSaveData.cpp): call `funcStat` once
+    /// (:1622) — `OK_NEXT` proceeds, `OK_LAST` finishes empty; then loop
+    /// `funcFile` (:1837) — the callback returning `OK_LAST` breaks WITHOUT
+    /// performing an op, only `OK_NEXT` performs the file op then loops. The
+    /// callbacks run via [`call_guest_function`] (R14 guest re-entry), with the
+    /// `sysSave*` structs marshalled through [`SAVEDATA_SCRATCH_VADDR`].
+    ///
+    /// Returns the `sysSave` API return value (0 = DONE, else error facility).
+    fn run_savedata_op(&mut self) -> Result<u32, Error> {
+        // AutoSave2/AutoLoad2 ABI: r3=version, r4=dirName, r5=errDialog,
+        // r6=bufSettings, r7=statCb OPD, r8=fileCb OPD, r9=container,
+        // r10=userdata.
+        let dir_ptr = self.ppu.gpr[4] as u32;
+        let stat_cb = self.ppu.gpr[7] as u32;
+        let file_cb = self.ppu.gpr[8] as u32;
+        let userdata = self.ppu.gpr[10] as u32;
+        let dir_name = self.read_guest_cstr(dir_ptr, 32);
+
+        // Map the scratch page (idempotent: errors if a prior savedata call
+        // already mapped it — the struct regions are re-zeroed each use below).
+        let _ = self.mem.alloc_at(
+            SAVEDATA_SCRATCH_VADDR,
+            0x1000,
+            PageFlags::READABLE | PageFlags::WRITABLE,
+        );
+        let result_ptr = SAVEDATA_SCRATCH_VADDR + SD_RESULT_OFF;
+        let statset_ptr = SAVEDATA_SCRATCH_VADDR + SD_STATSET_OFF;
+        let fileget_ptr = SAVEDATA_SCRATCH_VADDR + SD_FILEGET_OFF;
+        let fileset_ptr = SAVEDATA_SCRATCH_VADDR + SD_FILESET_OFF;
+        let statget_ptr = SAVEDATA_SCRATCH_VADDR + SD_STATGET_OFF;
+
+        // --- funcStat (called once) ---
+        // Zero statGet + statSet; seed a plausible status (a minimal callback
+        // ignores these, but a real game reads free space / isNew).
+        self.mem.write(statget_ptr, &[0u8; SD_STATGET_LEN])?;
+        self.mem.write(statset_ptr, &[0u8; 12])?;
+        self.write_be_u32(statget_ptr, 0x4000_0000)?; // freeSpaceKB (~1 TiB)
+        self.write_be_u32(statget_ptr + 4, 1)?; // isNew = 1
+        // result: zero [0..userdata), carry userdata @16 (cellSaveData.cpp:1619).
+        self.mem.write(result_ptr, &[0u8; 16])?;
+        self.write_be_u32(result_ptr + 16, userdata)?;
+        self.call_guest_function(
+            stat_cb,
+            &[
+                u64::from(result_ptr),
+                u64::from(statget_ptr),
+                u64::from(statset_ptr),
+            ],
+        )?;
+        let stat_res = self.read_be_u32(result_ptr)? as i32;
+        if stat_res != SD_CBRESULT_OK_NEXT {
+            // OK_LAST on funcStat = "done, no files" → success (cpp:1630).
+            if stat_res == SD_CBRESULT_OK_LAST {
+                return Ok(SD_RETURN_DONE);
+            }
+            return Ok(SD_RETURN_ERROR_CALLBACK);
+        }
+
+        // --- funcFile loop ---
+        let dir_path = format!("/dev_hdd0/home/00000001/savedata/{dir_name}");
+        let mut prev_size: u32 = 0;
+        loop {
+            // Zero fileSet (48 B), fileGet.reserved[64] (@4), result[0..16);
+            // carry prevOpResultSize in fileGet @0 (cellSaveData.cpp:1841-1843).
+            self.mem.write(fileset_ptr, &[0u8; 48])?;
+            self.mem.write(fileget_ptr + 4, &[0u8; 64])?;
+            self.write_be_u32(fileget_ptr, prev_size)?;
+            self.mem.write(result_ptr, &[0u8; 16])?;
+            self.call_guest_function(
+                file_cb,
+                &[
+                    u64::from(result_ptr),
+                    u64::from(fileget_ptr),
+                    u64::from(fileset_ptr),
+                ],
+            )?;
+            let res = self.read_be_u32(result_ptr)? as i32;
+            if res != SD_CBRESULT_OK_NEXT {
+                if res == SD_CBRESULT_OK_LAST || res == SD_CBRESULT_OK_LAST_NOCONFIRM {
+                    break; // last callback performs NO op (cpp:1850)
+                }
+                return Ok(SD_RETURN_ERROR_CALLBACK);
+            }
+
+            // OK_NEXT → read fileSet + perform the op.
+            let file_op = self.read_be_u32(fileset_ptr)?;
+            let file_type = self.read_be_u32(fileset_ptr + 8)?;
+            let name_ptr = self.read_be_u32(fileset_ptr + 28)?;
+            let offset = self.read_be_u32(fileset_ptr + 32)? as usize;
+            let size = self.read_be_u32(fileset_ptr + 36)? as usize;
+            let buf_size = self.read_be_u32(fileset_ptr + 40)?;
+            let buf_ptr = self.read_be_u32(fileset_ptr + 44)?;
+
+            // Resolve the file name: STANDARD(1)/PROTECTED(0) → fileName ptr;
+            // CONTENT_* → fixed names (cellSaveData.cpp:1915-1934).
+            let file_name = match file_type {
+                0 | 1 => self.read_guest_cstr(name_ptr, 13),
+                2 => "ICON0.PNG".to_string(),
+                3 => "ICON1.PAM".to_string(),
+                4 => "PIC1.PNG".to_string(),
+                5 => "SND0.AT3".to_string(),
+                _ => return Ok(SD_RETURN_ERROR_INVALID_ARG),
+            };
+            let path = format!("{dir_path}/{file_name}");
+
+            // Common param checks for read/write ops (cpp:1981-1993).
+            let check_buf = || -> Option<u32> {
+                if (buf_size as usize) < size || (buf_ptr == 0 && buf_size != 0) {
+                    Some(SD_RETURN_ERROR_INVALID_ARG)
+                } else {
+                    None
+                }
+            };
+
+            match file_op {
+                // READ (0): VFS → guest buffer (cpp:1979).
+                0 => {
+                    if let Some(e) = check_buf() {
+                        return Ok(e);
+                    }
+                    let data = self.vfs.read_file(&path).unwrap_or_default();
+                    let avail = data.len().saturating_sub(offset);
+                    let n = avail.min(size);
+                    if n > 0 {
+                        let slice = data[offset..offset + n].to_vec();
+                        self.mem.write(buf_ptr, &slice)?;
+                    }
+                    prev_size = n as u32;
+                }
+                // WRITE (1): guest buffer → VFS, truncate to offset+size (cpp:2011).
+                1 => {
+                    if let Some(e) = check_buf() {
+                        return Ok(e);
+                    }
+                    let mut payload = vec![0u8; size];
+                    if size > 0 {
+                        self.mem.read(buf_ptr, &mut payload)?;
+                    }
+                    let mut file = vec![0u8; offset];
+                    file.extend_from_slice(&payload);
+                    self.vfs.add_file(&path, file);
+                    prev_size = size as u32;
+                }
+                // DELETE (2): (cpp:2045).
+                2 => {
+                    let _ = self.vfs.remove_file(&path);
+                    prev_size = 0;
+                }
+                // WRITE_NOTRUNC (3): guest buffer → VFS, keep existing tail (cpp:2063).
+                3 => {
+                    if let Some(e) = check_buf() {
+                        return Ok(e);
+                    }
+                    let mut payload = vec![0u8; size];
+                    if size > 0 {
+                        self.mem.read(buf_ptr, &mut payload)?;
+                    }
+                    let mut file = self.vfs.read_file(&path).unwrap_or_default();
+                    if file.len() < offset + payload.len() {
+                        file.resize(offset + payload.len(), 0);
+                    }
+                    file[offset..offset + payload.len()].copy_from_slice(&payload);
+                    self.vfs.add_file(&path, file);
+                    prev_size = size as u32;
+                }
+                _ => return Ok(SD_RETURN_ERROR_INVALID_ARG),
+            }
+        }
+
+        Ok(SD_RETURN_DONE)
     }
 
     /// Dispatch the syscall that just triggered. The syscall number
@@ -2452,6 +2664,18 @@ impl EmuCore {
                                     self.ppu.gpr[3] = u64::from(u32::from(e));
                                 }
                             }
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // R16 — cellSaveData::cellSaveDataAutoSave2 (0x8b7ed64b)
+                        // and cellSaveDataAutoLoad2 (0xfbd5c856). Identical
+                        // signature; `run_savedata_op` drives the status + file
+                        // callbacks (R14 guest re-entry) and the file
+                        // callback's fileOperation field decides save vs load.
+                        // The first callback-DRIVEN file I/O family in the port.
+                        0x8b7ed64b | 0xfbd5c856 => {
+                            let ret = self.run_savedata_op()?;
+                            self.ppu.gpr[3] = u64::from(ret);
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }

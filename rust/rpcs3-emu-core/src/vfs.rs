@@ -76,6 +76,20 @@ impl MemVfs {
         Ok(())
     }
 
+    /// Read a whole file's bytes by path (clone). Used by the savedata bridge's
+    /// READ file-op to copy VFS content back into a guest buffer; returns `None`
+    /// when the path is absent.
+    #[must_use]
+    pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
+        self.files.get(path).cloned()
+    }
+
+    /// Remove a file by path, returning whether it existed. Used by the savedata
+    /// bridge's DELETE file-op.
+    pub fn remove_file(&mut self, path: &str) -> bool {
+        self.files.remove(path).is_some()
+    }
+
     /// Stat an open file by its `FileObject` handle — the `fstat` path. The lv2
     /// `sys_fs_fstat` is generic and has no path; resolve the handle to its
     /// source path here (kept in the open-file table) and stat that.
