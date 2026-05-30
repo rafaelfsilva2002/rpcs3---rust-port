@@ -76,6 +76,89 @@ pub fn execute_clear(state: &RsxState, mem: &mut [u8]) -> usize {
     count
 }
 
+// =====================================================================
+// Triangle rasterization (deterministic software reference)
+// =====================================================================
+
+/// A vertex already in screen space (pixel coordinates). The RSX viewport
+/// transform + vertex program that produce these are a later slice; this
+/// rasterizer takes screen-space vertices directly.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScreenVertex {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl ScreenVertex {
+    #[must_use]
+    pub fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
+}
+
+/// Twice the signed area of triangle (a, b, p) — the edge function. Sign tells
+/// which side of edge a→b the point p is on.
+#[inline]
+fn edge(a: ScreenVertex, b: ScreenVertex, px: f32, py: f32) -> f32 {
+    (px - a.x) * (b.y - a.y) - (py - a.y) * (b.x - a.x)
+}
+
+/// Rasterize a flat-colored triangle into a 32-bit (A8R8G8B8) framebuffer using
+/// the standard edge-function coverage test, sampling pixel centers at
+/// `(x+0.5, y+0.5)`, over the triangle's framebuffer-clamped bounding box.
+/// Winding-agnostic (orients by the signed area). Returns the number of pixels
+/// written.
+///
+/// This is a DETERMINISTIC software reference — not byte-exact vs RPCS3's GPU
+/// rasterizer (which differs at sub-pixel edges per the driver). The golden is
+/// the coverage the edge-function rule produces, hand-verifiable for simple
+/// triangles. (Shared-edge double-coverage between adjacent triangles — the
+/// top-left fill rule — is a refinement for the strip/mesh slice.)
+pub fn rasterize_triangle_flat(
+    verts: [ScreenVertex; 3],
+    color: u32,
+    fb: &mut [u8],
+    width: u32,
+    height: u32,
+    pitch: u32,
+) -> usize {
+    let [v0, v1, v2] = verts;
+    let area = edge(v0, v1, v2.x, v2.y);
+    if area == 0.0 {
+        return 0; // degenerate
+    }
+    let ccw = area > 0.0;
+    let clampx = |v: f32| (v as i64).clamp(0, i64::from(width)) as u32;
+    let clampy = |v: f32| (v as i64).clamp(0, i64::from(height)) as u32;
+    let min_x = clampx(v0.x.min(v1.x).min(v2.x).floor());
+    let max_x = clampx(v0.x.max(v1.x).max(v2.x).ceil());
+    let min_y = clampy(v0.y.min(v1.y).min(v2.y).floor());
+    let max_y = clampy(v0.y.max(v1.y).max(v2.y).ceil());
+    let px = color.to_be_bytes();
+    let mut count = 0;
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            let (cx, cy) = (f64::from(x) as f32 + 0.5, f64::from(y) as f32 + 0.5);
+            let w0 = edge(v1, v2, cx, cy);
+            let w1 = edge(v2, v0, cx, cy);
+            let w2 = edge(v0, v1, cx, cy);
+            let inside = if ccw {
+                w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0
+            } else {
+                w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0
+            };
+            if inside {
+                let off = (y * pitch + x * 4) as usize;
+                if off + 4 <= fb.len() {
+                    fb[off..off + 4].copy_from_slice(&px);
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +208,57 @@ mod tests {
         // Row 0: 16 bytes of color, then 8 zero padding bytes.
         assert_eq!(&mem[0..4], [0x01, 0x02, 0x03, 0x04]);
         assert_eq!(&mem[16..24], [0u8; 8]);
+    }
+
+    fn px(fb: &[u8], x: u32, y: u32, pitch: u32) -> u32 {
+        let o = (y * pitch + x * 4) as usize;
+        u32::from_be_bytes([fb[o], fb[o + 1], fb[o + 2], fb[o + 3]])
+    }
+
+    #[test]
+    fn rasterize_right_triangle_coverage() {
+        // 8x8 A8R8G8B8 fb (pitch 32). Right triangle (1,1)-(7,1)-(1,7), hypotenuse
+        // x+y=8; pixel center (cx,cy) inside iff cx>=1, cy>=1, cx+cy<=8.
+        let mut fb = vec![0u8; 8 * 32];
+        let tri = [
+            ScreenVertex::new(1.0, 1.0),
+            ScreenVertex::new(7.0, 1.0),
+            ScreenVertex::new(1.0, 7.0),
+        ];
+        let n = rasterize_triangle_flat(tri, 0xFF00_FF00, &mut fb, 8, 8, 32);
+        // Interior pixel filled; far-corner outside the hypotenuse not filled.
+        assert_eq!(px(&fb, 2, 2, 32), 0xFF00_FF00, "(2,2) interior");
+        assert_eq!(px(&fb, 1, 1, 32), 0xFF00_FF00, "(1,1) near v0");
+        assert_eq!(px(&fb, 6, 6, 32), 0, "(6,6) beyond hypotenuse");
+        assert_eq!(px(&fb, 0, 0, 32), 0, "(0,0) outside (left/top of v0)");
+        // Hand count of centers (cx=x+.5, cy=y+.5) with cx>=1, cy>=1, cx+cy<=8:
+        //   y=1: x=1..6 within cx+cy<=8 -> 6; y=2:5; y=3:4; y=4:3; y=5:2; y=6:1 = 21.
+        assert_eq!(n, 21, "covered pixel count");
+    }
+
+    #[test]
+    fn rasterize_degenerate_triangle_is_noop() {
+        let mut fb = vec![0u8; 8 * 32];
+        let line = [
+            ScreenVertex::new(0.0, 0.0),
+            ScreenVertex::new(4.0, 0.0),
+            ScreenVertex::new(8.0, 0.0), // collinear
+        ];
+        assert_eq!(rasterize_triangle_flat(line, 0xFFFF_FFFF, &mut fb, 8, 8, 32), 0);
+        assert!(fb.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn rasterize_clamps_to_framebuffer() {
+        // A big triangle covering the whole 4x4 fb fills all 16 pixels (no OOB).
+        let mut fb = vec![0u8; 4 * 16];
+        let tri = [
+            ScreenVertex::new(-10.0, -10.0),
+            ScreenVertex::new(50.0, -10.0),
+            ScreenVertex::new(-10.0, 50.0),
+        ];
+        let n = rasterize_triangle_flat(tri, 0xFFAB_CDEF, &mut fb, 4, 4, 16);
+        assert_eq!(n, 16);
+        assert!(fb.chunks_exact(4).all(|p| p == [0xFF, 0xAB, 0xCD, 0xEF]));
     }
 }
