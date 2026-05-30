@@ -5,7 +5,39 @@ port from a fresh session (e.g., new terminal session, new model).
 Read this top-to-bottom — it's the minimum context to start the
 next slice without re-discovering things.
 
-## LATEST — R18: cellFont byte-exact glyph metrics LANDED (2026-05-30)
+## LATEST — R20: cellFont rasterization LANDED — cellFont COMPLETE (2026-05-30)
+
+The cellFont rendering path is closed. Commits: R19 horizontal layout
+(`28d451a4c`) + R20 rasterization (`7ac7282be`), both pushed.
+
+**cellFont is now complete on its behavior-freezable surface:** R17 init/end +
+R18 open-font/glyph-metrics + R19 horizontal layout + R20 rasterization. The
+remaining cellFont functions (vertical layout, kerning, generateCharGlyph,
+vertical metrics, effects) are RPCS3 TODO stubs (zero + return OK) — nothing to
+freeze.
+
+**R19** (horizontal layout): `cellFontGetHorizontalLayout` (`0x1387c45c`) —
+baseLineY/lineHeight/effectHeight from the font v-metrics, byte-exact
+(cellFont.cpp:536). Added to single_font_metrics_v1.
+
+**R20** (rasterization): the Rust `stb_truetype` crate has NO rasterizer, so
+byte-exact glyph bitmaps need the real C `stbtt_GetCodepointBitmap`. User-approved
+decision: **vendor `cbits/stb_truetype.h`** (public domain) + a shim, compiled via
+`cc` behind cargo feature **`cellfont-raster` (DEFAULT OFF)** — first C dep,
+isolated so the default build stays pure-Rust. NIDs: cellFontCreateRenderer
+(`0x042e74e3`), cellFontBindRenderer (`0x66a23100`), cellFontRenderSurfaceInit
+(`0x90b9465e`), cellFontRenderCharGlyphImage (`0x88be4799`, x/y in FPRs f1/f2).
+`StbttFont::render_into` (the byte-exact blit, cellFont.cpp:726-740) is shared by
+the emu-core arm AND the calibration test. Fixture single_font_render_v1 renders
+'A' → 64x64 surface checksum 73114 → 0xC0DE.
+
+**Gate: default `cargo test --workspace --tests --release` = 6053/0 (pure-Rust,
+unchanged); `--features cellfont-raster` = all green** (render oracle + raster
+calibration). IMPORTANT: the raster oracle is feature-gated, so CI must run
+`--features cellfont-raster` to cover it. Design doc:
+`.planning/CELLFONT_RENDER_DESIGN.md`.
+
+## R18: cellFont byte-exact glyph metrics LANDED (2026-05-30)
 
 The first cellFont **rendering** slice — glyph METRICS, byte-exact. Commit
 `9e1dc187f` (pushed). RPCS3 cellFont links `stb_truetype.h`; the Rust port uses
