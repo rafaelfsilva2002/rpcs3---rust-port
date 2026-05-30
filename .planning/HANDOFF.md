@@ -5,7 +5,20 @@ port from a fresh session (e.g., new terminal session, new model).
 Read this top-to-bottom — it's the minimum context to start the
 next slice without re-discovering things.
 
-## LATEST — GPU backend foundation: RSX render + ClearSurface (2026-05-30)
+## LATEST — GPU backend: clear render wired to REAL libgcm capture (2026-05-30)
+
+Commit `2eb4d3a23`. The clear path is now a full behavior-freeze oracle: fixture
+single_gcm_clearsurf_v1 (real librsx surface+clear) → captured NV4097 stream →
+`replay_gcm_state` (new: returns the final RsxState) → `execute_clear` → the 16×16
+framebuffer is byte-exact 0xAABBCCDD. First GPU oracle going real-homebrew →
+captured stream → decode → render → verified pixels. Gate **6067/0**.
+
+Next GPU slice: **triangle rasterization** (vertex fetch via rpcs3-rsx-vertex-data
+→ transform → primitive assembly → solid-color raster → framebuffer; deterministic
+software reference, golden from the coverage math). Then texture sampling, then
+fragment-shader execution.
+
+## GPU backend foundation: RSX render + ClearSurface (2026-05-30)
 
 First pixel-producing RSX slice. Commit `285dbfb6e`. New crate
 **`rpcs3-rsx-render`**: `execute_clear(state, mem)` fills the slot-A color buffer
