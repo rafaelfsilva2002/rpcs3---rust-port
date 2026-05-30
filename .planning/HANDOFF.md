@@ -5,7 +5,38 @@ port from a fresh session (e.g., new terminal session, new model).
 Read this top-to-bottom — it's the minimum context to start the
 next slice without re-discovering things.
 
-## LATEST — R16: cellSaveData callback bridge LANDED (2026-05-29)
+## LATEST — R17: cellFont init lifecycle LANDED (2026-05-29)
+
+The cellFont **entry path**, behavior-frozen WITHOUT glyph rendering. Commit
+`8f39037ee` (pushed). Two NIDs captured at runtime under module `cellFont`:
+`cellFontInitializeWithRevision` (`0xf03dcc29`, r3=revisionFlags r4=config) +
+`cellFontEnd` (`0x7ab47f7e`).
+
+`cellFontInitializeWithRevision` validates the file-cache size exactly as RPCS3
+(cellFont.cpp:54): `config->fc_size` (offset 4, BE) `< 24` → `0x80540002`
+(CELL_FONT_ERROR_INVALID_PARAMETER), else CELL_OK. `cellFontEnd` → CELL_OK.
+PSL1GHT inline `fontInit` calls the local `fontGetStubRevisionFlags` (no NID —
+matches the earlier dead-end probe) then `cellFontInitializeWithRevision`;
+`fontEnd` is `cellFontEnd`. CellFontConfig layout = PSL1GHT `fontConfig` exactly
+(fc_buffer@0, fc_size@4, userFontEntryMax@8, userFontEntrys@12, flags@16) — note
+`fontConfig_initialize` leaves size=0, so a real homebrew MUST set
+`fileCache.size >= 24`.
+
+Fixture `single_font_init_v1` is a self-contained oracle: drives the fc_size>=24
+invariant BOTH ways (size=0 rejected, size>=24 accepted) + cellFontEnd →
+**0xC0DE**. (Probe trick: wire the init arm first so the bad-config call is
+rejected, letting the flow reach cellFontEnd to capture its NID.) Gate **6049/0**.
+
+**DEFERRED — cellFont rendering tail (giant; strategic decision):** the path
+`cellFontOpenFontFile` / `cellFontGetCharGlyphMetrics` /
+`cellFontRenderCharGlyphImage` needs real TrueType parsing + rasterization
+(RPCS3 uses stb_truetype; PSL1GHT also ships libfontFT = FreeType). A Rust port
+would vendor stb_truetype or use a crate (ttf-parser/fontdue) + model the
+CellFont/fontGlyph structs + likely guest-malloc callbacks for FreeType — NOT a
+thin behavior-freeze slice. Analogous to the RSX GPU-backend deferral. This is
+the next strategic checkpoint for the user.
+
+## R16: cellSaveData callback bridge LANDED (2026-05-29)
 
 **The first callback-DRIVEN HLE family** — where the *system* calls back INTO
 guest code (vs prior HLE where the syscall just returns a value). Commit
