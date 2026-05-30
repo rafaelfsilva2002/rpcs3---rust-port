@@ -341,6 +341,50 @@ impl PngDec {
         Ok(info)
     }
 
+    /// Parse a PNG header byte-exact to what RPCS3 `cellPngDecReadHeader` reports
+    /// (cellPngDec.cpp:558-564 `pngSetHeader`): the values libpng's
+    /// `png_get_image_*` return come straight from the IHDR chunk. Layout: 8-byte
+    /// signature, then `[len=13][="IHDR"][width@16][height@20][bitDepth@24]
+    /// [colorType@25][compress@26][filter@27][interlace@28]`. numComponents +
+    /// colorSpace are derived from colorType (getPngDecColourType / png_get_channels).
+    /// `chunk_information` (an ancillary-chunk bitmask in RPCS3) is left 0 — not
+    /// part of the IHDR and not inspected by the header oracle.
+    pub fn parse_header(bytes: &[u8]) -> Result<Info, CellError> {
+        if bytes.len() < 29 || &bytes[..8] != MAGIC_PNG || &bytes[12..16] != b"IHDR" {
+            return Err(errors::HEADER);
+        }
+        let be = |o: usize| {
+            u32::from_be_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]])
+        };
+        let color_type = bytes[25];
+        // png_get_channels (color_type -> channels) + getPngDecColourType.
+        let (num_components, color_space) = match color_type {
+            0 => (1, CS_GRAYSCALE),
+            2 => (3, CS_RGB),
+            3 => (1, CS_PALETTE),
+            4 => (2, CS_GRAYSCALE_ALPHA),
+            6 => (4, CS_RGBA),
+            _ => return Err(errors::STREAM_FORMAT),
+        };
+        Ok(Info {
+            image_width: be(16),
+            image_height: be(20),
+            num_components,
+            color_space,
+            bit_depth: u32::from(bytes[24]),
+            interlace_method: i32::from(bytes[28]),
+            chunk_information: 0,
+        })
+    }
+
+    /// The (stream_ptr, stream_size) of an opened BUFFER-source handle — lets the
+    /// emu-core ReadHeader arm fetch the PNG bytes from guest memory.
+    #[must_use]
+    pub fn stream_window(&self, id: u32) -> Option<(u32, u32)> {
+        let h = self.handles.iter().find(|h| h.id == id)?;
+        Some((h.src.stream_ptr, h.src.stream_size))
+    }
+
     pub fn set_parameter(&mut self, id: u32, in_param: InParam) -> Result<OutParam, CellError> {
         let idx = self.handle_idx(id)?;
         if self.handles[idx].state != HandleState::HeaderRead {
@@ -855,5 +899,28 @@ mod tests {
         d.close(h).unwrap();
         assert_eq!(d.handle_count(), 0);
         d.destroy().unwrap();
+    }
+
+    #[test]
+    fn parse_header_extracts_ihdr() {
+        // 8-byte signature + IHDR(320x240, depth 8, RGB color_type 2).
+        let mut png = Vec::new();
+        png.extend_from_slice(MAGIC_PNG);
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&320u32.to_be_bytes());
+        png.extend_from_slice(&240u32.to_be_bytes());
+        png.extend_from_slice(&[8, 2, 0, 0, 0]); // depth, color_type=RGB, comp, filter, interlace
+        let info = PngDec::parse_header(&png).unwrap();
+        assert_eq!(info.image_width, 320);
+        assert_eq!(info.image_height, 240);
+        assert_eq!(info.num_components, 3);
+        assert_eq!(info.color_space, CS_RGB);
+        assert_eq!(info.bit_depth, 8);
+    }
+
+    #[test]
+    fn parse_header_rejects_non_png() {
+        assert_eq!(PngDec::parse_header(&[0u8; 40]), Err(errors::HEADER));
     }
 }

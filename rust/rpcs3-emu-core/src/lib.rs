@@ -583,6 +583,13 @@ pub struct EmuCore {
     /// HLE backlog — cellKb / cellMouse input state (headless = 0 connected).
     pub kb: rpcs3_hle_cellkb::KbManager,
     pub mouse: rpcs3_hle_cellmouse::MouseManager,
+    /// HLE backlog — cellPngDec decoder state (Create/Open/ReadHeader). Like
+    /// cellJpgDec: a subHandle id maps to the source window so ReadHeader can
+    /// fetch the PNG bytes. (cellPngDec is callback-driven in RPCS3 — Create/Open
+    /// invoke the guest cbCtrlMalloc; faithfully invoking it is DEFERRED, blocked
+    /// on .opd code-field relocation for struct-stored guest function pointers.
+    /// The header info — the behavior-freeze observable — is byte-exact regardless.)
+    pub pngdec: rpcs3_hle_cellpngdec::PngDec,
 }
 
 /// Headless pad backend — no host controller, so every port is disconnected.
@@ -638,6 +645,7 @@ impl EmuCore {
             pad: rpcs3_hle_cellpad::PadManager::default(),
             kb: rpcs3_hle_cellkb::KbManager::default(),
             mouse: rpcs3_hle_cellmouse::MouseManager::default(),
+            pngdec: rpcs3_hle_cellpngdec::PngDec::new(),
         }
     }
 
@@ -3159,6 +3167,89 @@ impl EmuCore {
                                     self.ppu.gpr[3] = u64::from(u32::from(e));
                                 }
                             }
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE backlog — cellPngDec::cellPngDecCreate (0x157d30c5).
+                        // r3=*handle (OUT), r4=threadInParam, r5=threadOutParam.
+                        // cellPngDec is callback-driven (RPCS3 invokes the guest
+                        // cbCtrlMalloc to allocate the handle in guest memory);
+                        // faithfully invoking it is DEFERRED (blocked on .opd
+                        // code-field relocation for struct-stored guest fn-ptrs —
+                        // the OPD reads back code=0). We use the cellJpgDec-style id
+                        // model instead: flip the crate gate, return a fixed handle
+                        // id + the codec version. The header info is byte-exact.
+                        0x157d30c5 => {
+                            let handle_pp = self.ppu.gpr[3] as u32;
+                            let out_ptr = self.ppu.gpr[5] as u32;
+                            let _ = self.pngdec.create(0x0010_0000);
+                            self.write_be_u32(handle_pp, 1)?; // opaque main handle
+                            self.write_be_u32(out_ptr, 0x0042_0000)?; // pngCodecVersion
+                            self.ppu.gpr[3] = 0;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE backlog — cellPngDec::cellPngDecOpen (0xd2bc5bfd).
+                        // r3=handle(ignored), r4=*subHandle (OUT), r5=*pngDecSource,
+                        // r6=openInfo. Records the BUFFER source window via the crate
+                        // (id from 1), writes *subHandle = id (cellPngDec.cpp:390).
+                        0xd2bc5bfd => {
+                            let sub_pp = self.ppu.gpr[4] as u32;
+                            let src_ptr = self.ppu.gpr[5] as u32;
+                            let src = rpcs3_hle_cellpngdec::Src {
+                                src_select: self.read_be_u32(src_ptr)? as i32,
+                                file_name: String::new(),
+                                file_offset: 0,
+                                file_size: self.read_be_u32(src_ptr + 16)?,
+                                stream_ptr: self.read_be_u32(src_ptr + 20)?,
+                                stream_size: self.read_be_u32(src_ptr + 24)?,
+                                spu_thread_enable: self.read_be_u32(src_ptr + 28)? as i32,
+                            };
+                            match self.pngdec.open(src) {
+                                Ok(id) => {
+                                    self.write_be_u32(sub_pp, id)?;
+                                    self.ppu.gpr[3] = 0;
+                                }
+                                Err(e) => {
+                                    self.ppu.gpr[3] = u64::from(u32::from(e));
+                                }
+                            }
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE backlog — cellPngDec::cellPngDecReadHeader (0x9ccdcc95).
+                        // r3=handle, r4=subHandle, r5=*pngDecInfo. Fetch the PNG bytes
+                        // from the stream's source window, parse the IHDR byte-exact
+                        // (PngDec::parse_header), write CellPngDecInfo (28 B) BE.
+                        0x9ccdcc95 => {
+                            let sub = self.ppu.gpr[4] as u32;
+                            let info_ptr = self.ppu.gpr[5] as u32;
+                            let Some((sp, ss)) = self.pngdec.stream_window(sub) else {
+                                self.ppu.gpr[3] = u64::from(0x8061_1206u32);
+                                self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                return Ok(None);
+                            };
+                            let n = (ss as usize).min(64 * 1024 * 1024);
+                            let mut buf = vec![0u8; n];
+                            if sp != 0 && n > 0 {
+                                self.mem.read(sp, &mut buf)?;
+                            }
+                            let info = match rpcs3_hle_cellpngdec::PngDec::parse_header(&buf) {
+                                Ok(i) => i,
+                                Err(e) => {
+                                    self.ppu.gpr[3] = u64::from(u32::from(e));
+                                    self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                    return Ok(None);
+                                }
+                            };
+                            self.write_be_u32(info_ptr, info.image_width)?;
+                            self.write_be_u32(info_ptr + 4, info.image_height)?;
+                            self.write_be_u32(info_ptr + 8, info.num_components)?;
+                            self.write_be_u32(info_ptr + 12, info.color_space as u32)?;
+                            self.write_be_u32(info_ptr + 16, info.bit_depth)?;
+                            self.write_be_u32(info_ptr + 20, info.interlace_method as u32)?;
+                            self.write_be_u32(info_ptr + 24, info.chunk_information)?;
+                            self.ppu.gpr[3] = 0;
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
                         }
