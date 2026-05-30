@@ -5,7 +5,27 @@ port from a fresh session (e.g., new terminal session, new model).
 Read this top-to-bottom — it's the minimum context to start the
 next slice without re-discovering things.
 
-## LATEST — HLE backlog: cellPngDec header (IHDR byte-exact) (2026-05-30)
+## LATEST — HLE backlog: image decode via vendored stb_image (2026-05-30)
+
+cellJpgDec + cellPngDec pixel decode. Commits `46eda84e5` (jpg) + `2e43bee1d`
+(png). New crate **`rpcs3-stb-image`** vendors `stb_image.h` (v2.30) + a shim
+compiled via `cc` behind feature `decode` (default OFF); `decode_rgba(bytes)`
+returns forced RGBA. emu-core feature `image-decode` enables it.
+
+- **jpgDec** (SetParameter 0xe08f3910 / DecodeData 0xaf8bb012): RPCS3 literally
+  uses stb_image → byte-exact. Fixture single_jpgdec_decode_v1 (16×16 JPEG) → RGBA
+  checksum 159529.
+- **pngDec** (SetParameter 0xe97c9bd4 / DecodeData 0x2310f155): RPCS3 uses libpng,
+  but a BASELINE PNG spec-decodes identically (inflate+unfilter is exact) →
+  byte-exact for baseline. Fixture single_pngdec_decode_v1 (16×16 RGB PNG) →
+  checksum 143104. Caveat: non-baseline PNGs (gamma/16-bit/interlace) may diverge.
+
+Golden checksums from the same vendored stb (feature-gated calibration tests).
+Gate default = **6063 / 0** (pure-Rust, unchanged); feature `image-decode` all
+green. The cellJpgDec + cellPngDec decode path (open → header → setparam → decode)
+is now byte-exact end-to-end. Both crates' Close/Destroy + Ext variants remain.
+
+## HLE backlog: cellPngDec header (IHDR byte-exact) (2026-05-30)
 
 cellPngDec Create/Open/ReadHeader (commit `ce16d3fb1`, gate **6062**). NIDs
 Create=0x157d30c5/Open=0xd2bc5bfd/ReadHeader=0x9ccdcc95. RPCS3 reads the header
