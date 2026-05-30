@@ -591,6 +591,9 @@ pub struct EmuCore {
     /// stream addr → (src buffer ptr, size) for ReadHeader to fetch the PNG.
     pngdec_handles: std::collections::BTreeMap<u32, PngHandleCbs>,
     pngdec_streams: std::collections::BTreeMap<u32, (u32, u32)>,
+    /// cellPngDec per-stream SetParameter result `(outputColorSpace, outputMode)`,
+    /// keyed by the stream address — read by DecodeData to format the output.
+    pngdec_setparam: std::collections::BTreeMap<u32, (u32, u32)>,
 }
 
 /// The guest allocator callbacks captured by `cellPngDecCreate` (OPD pointers +
@@ -660,6 +663,7 @@ impl EmuCore {
             mouse: rpcs3_hle_cellmouse::MouseManager::default(),
             pngdec_handles: std::collections::BTreeMap::new(),
             pngdec_streams: std::collections::BTreeMap::new(),
+            pngdec_setparam: std::collections::BTreeMap::new(),
         }
     }
 
@@ -3397,6 +3401,123 @@ impl EmuCore {
                             self.write_be_u32(info_ptr + 16, info.bit_depth)?;
                             self.write_be_u32(info_ptr + 20, info.interlace_method as u32)?;
                             self.write_be_u32(info_ptr + 24, info.chunk_information)?;
+                            self.ppu.gpr[3] = 0;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE backlog — cellPngDec::cellPngDecSetParameter (0xe97c9bd4).
+                        // r3=handle, r4=subHandle(stream addr), r5=*pngDecInParam,
+                        // r6=*pngDecOutParam. Computes the output layout
+                        // (cellPngDec.cpp:652-664) from the IHDR + requested color
+                        // space; writes the 36-byte OutParam BE. Stores (cs, mode)
+                        // for DecodeData.
+                        0xe97c9bd4 => {
+                            let sub = self.ppu.gpr[4] as u32;
+                            let in_ptr = self.ppu.gpr[5] as u32;
+                            let out_ptr = self.ppu.gpr[6] as u32;
+                            let Some((sp, ss)) = self.pngdec_streams.get(&sub).copied() else {
+                                self.ppu.gpr[3] = u64::from(0x8061_1206u32); // FATAL
+                                self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                return Ok(None);
+                            };
+                            let n = (ss as usize).min(64 * 1024 * 1024);
+                            let mut buf = vec![0u8; n];
+                            if sp != 0 && n > 0 {
+                                self.mem.read(sp, &mut buf)?;
+                            }
+                            let info = match rpcs3_hle_cellpngdec::PngDec::parse_header(&buf) {
+                                Ok(i) => i,
+                                Err(e) => {
+                                    self.ppu.gpr[3] = u64::from(u32::from(e));
+                                    self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                    return Ok(None);
+                                }
+                            };
+                            let output_mode = self.read_be_u32(in_ptr + 4)?;
+                            let cs = self.read_be_u32(in_ptr + 8)?;
+                            let bit_depth = self.read_be_u32(in_ptr + 12)?;
+                            // png_get_channels for the output color space.
+                            let out_comp: u32 = match cs {
+                                1 => 1,            // GRAYSCALE
+                                2 => 3,            // RGB
+                                9 => 2,            // GRAYSCALE_ALPHA
+                                10 | 20 => 4,      // RGBA / ARGB
+                                _ => 3,
+                            };
+                            let bpp = out_comp * if bit_depth == 16 { 2 } else { 1 };
+                            let width_byte = u64::from(info.image_width) * u64::from(bpp);
+                            self.write_be_u32(out_ptr, (width_byte >> 32) as u32)?;
+                            self.write_be_u32(out_ptr + 4, width_byte as u32)?;
+                            self.write_be_u32(out_ptr + 8, info.image_width)?;
+                            self.write_be_u32(out_ptr + 12, info.image_height)?;
+                            self.write_be_u32(out_ptr + 16, out_comp)?;
+                            self.write_be_u32(out_ptr + 20, bit_depth)?;
+                            self.write_be_u32(out_ptr + 24, output_mode)?;
+                            self.write_be_u32(out_ptr + 28, cs)?;
+                            self.write_be_u32(out_ptr + 32, 0)?; // useMemorySpace
+                            self.pngdec_setparam.insert(sub, (cs, output_mode));
+                            self.ppu.gpr[3] = 0;
+                            self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                            return Ok(None);
+                        }
+                        // HLE backlog — cellPngDec::cellPngDecDecodeData (0x2310f155).
+                        // r3=handle, r4=subHandle, r5=data (OUT), r6=*dataCtrlParam,
+                        // r7=*dataOutInfo. Decode via stb_image (baseline PNG == RPCS3
+                        // libpng), reformat to the SetParameter color space, write
+                        // rows per outputBytesPerLine (cellPngDec.cpp:696/778).
+                        0x2310f155 => {
+                            let sub = self.ppu.gpr[4] as u32;
+                            let data_ptr = self.ppu.gpr[5] as u32;
+                            let dcp_ptr = self.ppu.gpr[6] as u32;
+                            let dout_ptr = self.ppu.gpr[7] as u32;
+                            self.write_be_u32(dout_ptr + 12, 1)?; // status = DEC_STATUS_STOP
+                            let (Some((sp, ss)), Some((cs, _mode))) = (
+                                self.pngdec_streams.get(&sub).copied(),
+                                self.pngdec_setparam.get(&sub).copied(),
+                            ) else {
+                                self.ppu.gpr[3] = u64::from(0x8061_1206u32); // FATAL
+                                self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                return Ok(None);
+                            };
+                            let n = (ss as usize).min(64 * 1024 * 1024);
+                            let mut png = vec![0u8; n];
+                            if sp != 0 && n > 0 {
+                                self.mem.read(sp, &mut png)?;
+                            }
+                            let Some((w, h, rgba)) = rpcs3_stb_image::decode_rgba(&png) else {
+                                self.ppu.gpr[3] = u64::from(0x8061_1102u32); // STREAM_FORMAT
+                                self.ppu.cia = (self.ppu.lr as u32) & !0x3;
+                                return Ok(None);
+                            };
+                            let (w, h) = (w as usize, h as usize);
+                            let bpl = ((u64::from(self.read_be_u32(dcp_ptr)?) << 32)
+                                | u64::from(self.read_be_u32(dcp_ptr + 4)?))
+                                as usize;
+                            // Reformat the forced-RGBA buffer to the output color space.
+                            let pixels: Vec<u8> = match cs {
+                                10 => rgba, // RGBA — direct
+                                2 => rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect(), // RGB
+                                20 => rgba // ARGB
+                                    .chunks_exact(4)
+                                    .flat_map(|p| [p[3], p[0], p[1], p[2]])
+                                    .collect(),
+                                _ => rgba,
+                            };
+                            let ncomp = match cs {
+                                2 => 3,
+                                _ => 4,
+                            };
+                            let row = w * ncomp;
+                            // Write rows (cellPngDec.cpp:778 writes line -> bpl-strided).
+                            for i in 0..h {
+                                let dst = i * bpl;
+                                let src = i * row;
+                                let len = bpl.min(row);
+                                if src + len <= pixels.len() {
+                                    self.mem.write(data_ptr + dst as u32, &pixels[src..src + len])?;
+                                }
+                            }
+                            self.write_be_u32(dout_ptr + 12, 0)?; // status = DEC_STATUS_FINISH
                             self.ppu.gpr[3] = 0;
                             self.ppu.cia = (self.ppu.lr as u32) & !0x3;
                             return Ok(None);
