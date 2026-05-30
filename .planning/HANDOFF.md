@@ -5,7 +5,26 @@ port from a fresh session (e.g., new terminal session, new model).
 Read this top-to-bottom — it's the minimum context to start the
 next slice without re-discovering things.
 
-## LATEST — HLE backlog: image decode via vendored stb_image (2026-05-30)
+## LATEST — GPU backend foundation: RSX render + ClearSurface (2026-05-30)
+
+First pixel-producing RSX slice. Commit `285dbfb6e`. New crate
+**`rpcs3-rsx-render`**: `execute_clear(state, mem)` fills the slot-A color buffer
+from the surface descriptor (format/offset/pitch/clip) + clear value/mask. 3
+deterministic unit tests; gate **6066/0**.
+
+**METHODOLOGY (important):** unlike the HLE/decode work (byte-exact vs RPCS3's
+deterministic CPU logic), RPCS3's GPU output is Vulkan/driver-dependent and NOT
+byte-reproducible. So the RSX render layer is a deterministic CPU software
+reference, validated against computed expectations — EXCEPT the clear path, which
+IS byte-exact vs RPCS3 (a clear fills a constant color).
+
+RSX infra already present: rpcs3-rsx-{fifo,state,gcm,surface-store,vertex-data,
+texture-cache-types} + shader decompilers (gl/vk, RSX→GLSL). ROADMAP (each a major
+slice, multi-session): (1) wire execute_clear to a captured libgcm clear stream
+(behavior-freeze oracle), (2) triangle rasterization (solid color), (3) texture
+sampling, (4) fragment-shader execution.
+
+## HLE backlog: image decode via vendored stb_image (2026-05-30)
 
 cellJpgDec + cellPngDec pixel decode. Commits `46eda84e5` (jpg) + `2e43bee1d`
 (png). New crate **`rpcs3-stb-image`** vendors `stb_image.h` (v2.30) + a shim
